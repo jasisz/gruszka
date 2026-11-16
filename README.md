@@ -35,7 +35,7 @@ comes from [Pestka](https://github.com/jasisz/pestka), a substitution-based
 kernel that paid for that knowledge first: Pestka's knowledge, NbE's speed,
 and Susz for food.
 
-It checks **all of mathlib** (702,040 declarations) in about ten seconds on
+It checks **all of mathlib** (702,040 declarations) in under nine seconds on
 eight cores, in under 3 GB. [How fast →](#how-fast)
 
 *Gruszka* is Polish for a pear. Dried pears are a classic *susz*, a pear has
@@ -214,19 +214,23 @@ with the PGO build:
 
 | Workers | Time | Peak memory | Instructions |
 | ---: | ---: | ---: | ---: |
-| 1 | TODO s | TODO GB | TODO G |
-| 4 | TODO s | TODO GB | TODO G |
-| 8 | TODO s | TODO GB | TODO G |
+| 1 | 44 s | 2.0 GB | 369 G |
+| 4 | 13.6 s | 2.4 GB | 372 G |
+| 8 | 8.4 s | 2.8 GB | 375 G |
 
 The full Fermat's Last Theorem environment (1.71 M declarations), four
-workers: TODO s, TODO GB, TODO G instructions. This is the whole FLT
-project with its dependencies, every declaration in the build, not just
-the cone of the two final theorems.
+workers: 3 min 55 s (229 and 240 s in two runs), 11 to 12 GB, 6600 G
+instructions. This is the whole FLT project with its dependencies, every
+declaration in the build, not just the cone of the two final theorems.
 
 <!-- milestone 32, PGO build (scripts/build-pgo.sh, Init at 1 worker), M2 Pro. -->
 
-Converting the ndjson export to Susz with `susz pack` adds TODO s and TODO G
-instructions on TODO threads.
+Converting the ndjson export to Susz with `susz pack` adds 1.9 s and 35 G
+instructions on all twelve cores for mathlib, and 37 s for the FLT export.
+
+On the [Lean Kernel Arena](https://arena.lean-lang.org)'s x86 runner, with
+the conversion included and four workers, mathlib takes 25.7 s, 2.47 GB
+and 445 G instructions.
 
 ## Working on Gruszka
 
