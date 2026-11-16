@@ -1,0 +1,53 @@
+{"meta":{"exporter":{"name":"lean4export","version":"3.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"x","version":"4.34.1"}}}
+{"sort": 0, "ie": 0}
+{"in": 1, "str": {"pre": 0, "str": "False"}}
+{"axiom": {"name": 1, "type": 0, "levelParams": [], "isUnsafe": false}}
+{"il": 1, "succ": 0}
+{"sort": 1, "ie": 1}
+{"in": 2, "str": {"pre": 0, "str": "N"}}
+{"axiom": {"name": 2, "type": 1, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 2, "us": []}, "ie": 2}
+{"in": 3, "str": {"pre": 0, "str": "n1"}}
+{"axiom": {"name": 3, "type": 2, "levelParams": [], "isUnsafe": false}}
+{"in": 4, "str": {"pre": 0, "str": "n2"}}
+{"axiom": {"name": 4, "type": 2, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 3, "us": []}, "ie": 3}
+{"const": {"name": 4, "us": []}, "ie": 4}
+{"in": 5, "str": {"pre": 0, "str": "P"}}
+{"sort": 0, "ie": 5}
+{"axiom": {"name": 5, "type": 5, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 5, "us": []}, "ie": 6}
+{"in": 6, "str": {"pre": 0, "str": "p1"}}
+{"axiom": {"name": 6, "type": 6, "levelParams": [], "isUnsafe": false}}
+{"in": 7, "str": {"pre": 0, "str": "p2"}}
+{"axiom": {"name": 7, "type": 6, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 6, "us": []}, "ie": 7}
+{"const": {"name": 7, "us": []}, "ie": 8}
+{"in": 8, "str": {"pre": 0, "str": "x"}}
+{"in": 9, "str": {"pre": 0, "str": "\u03b3"}}
+{"in": 10, "str": {"pre": 0, "str": "h"}}
+{"in": 11, "str": {"pre": 0, "str": "u"}}
+{"il": 2, "param": 11}
+{"in": 12, "str": {"pre": 0, "str": "idf"}}
+{"sort": 2, "ie": 9}
+{"bvar": 0, "ie": 10}
+{"bvar": 1, "ie": 11}
+{"forallE": {"name": 8, "type": 10, "body": 11, "binderInfo": "default"}, "ie": 12}
+{"forallE": {"name": 9, "type": 9, "body": 12, "binderInfo": "implicit"}, "ie": 13}
+{"axiom": {"name": 12, "type": 13, "levelParams": [11], "isUnsafe": false}}
+{"const": {"name": 12, "us": [0]}, "ie": 14}
+{"in": 13, "str": {"pre": 0, "str": "Q"}}
+{"forallE": {"name": 8, "type": 6, "body": 0, "binderInfo": "default"}, "ie": 15}
+{"axiom": {"name": 13, "type": 15, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 13, "us": []}, "ie": 16}
+{"app": {"fn": 14, "arg": 6}, "ie": 17}
+{"app": {"fn": 17, "arg": 7}, "ie": 18}
+{"app": {"fn": 16, "arg": 18}, "ie": 19}
+{"app": {"fn": 14, "arg": 6}, "ie": 20}
+{"app": {"fn": 20, "arg": 8}, "ie": 21}
+{"app": {"fn": 16, "arg": 21}, "ie": 22}
+{"in": 14, "str": {"pre": 0, "str": "t"}}
+{"forallE": {"name": 10, "type": 19, "body": 22, "binderInfo": "default"}, "ie": 23}
+{"bvar": 0, "ie": 24}
+{"lam": {"name": 10, "type": 19, "body": 24, "binderInfo": "default"}, "ie": 25}
+{"thm": {"name": 14, "type": 23, "value": 25, "levelParams": [], "all": [14]}}

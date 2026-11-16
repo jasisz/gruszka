@@ -1,0 +1,13 @@
+{"meta":{"exporter":{"name":"lean4export","version":"3.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"x","version":"4.34.1"}}}
+{"sort": 0, "ie": 0}
+{"in": 1, "str": {"pre": 0, "str": "False"}}
+{"axiom": {"name": 1, "type": 0, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 1, "us": []}, "ie": 1}
+{"in": 2, "str": {"pre": 0, "str": "A"}}
+{"in": 3, "str": {"pre": 0, "str": "A2"}}
+{"in": 4, "str": {"pre": 0, "str": "B"}}
+{"const": {"name": 4, "us": []}, "ie": 2}
+{"const": {"name": 2, "us": []}, "ie": 3}
+{"thm": {"name": 2, "type": 1, "value": 2, "levelParams": [], "all": [2]}}
+{"thm": {"name": 3, "type": 1, "value": 2, "levelParams": [], "all": [3]}}
+{"thm": {"name": 4, "type": 1, "value": 3, "levelParams": [], "all": [4]}}

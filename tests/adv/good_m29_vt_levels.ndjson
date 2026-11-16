@@ -1,0 +1,108 @@
+{"meta":{"exporter":{"name":"lean4export","version":"3.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"x","version":"4.34.1"}}}
+{"sort": 0, "ie": 0}
+{"il": 1, "succ": 0}
+{"sort": 1, "ie": 1}
+{"in": 1, "str": {"pre": 0, "str": "u"}}
+{"il": 2, "param": 1}
+{"il": 3, "succ": 0}
+{"in": 2, "str": {"pre": 0, "str": "A"}}
+{"axiom": {"name": 2, "type": 1, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 2, "us": []}, "ie": 2}
+{"in": 3, "str": {"pre": 0, "str": "x"}}
+{"in": 4, "str": {"pre": 0, "str": "k"}}
+{"in": 5, "str": {"pre": 0, "str": "a"}}
+{"in": 6, "str": {"pre": 0, "str": "h"}}
+{"in": 7, "str": {"pre": 0, "str": "f"}}
+{"in": 8, "str": {"pre": 0, "str": "z"}}
+{"in": 9, "str": {"pre": 0, "str": "W"}}
+{"forallE": {"name": 3, "type": 1, "body": 1, "binderInfo": "default"}, "ie": 3}
+{"axiom": {"name": 9, "type": 3, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 9, "us": []}, "ie": 4}
+{"in": 10, "str": {"pre": 0, "str": "K"}}
+{"forallE": {"name": 3, "type": 2, "body": 1, "binderInfo": "default"}, "ie": 5}
+{"axiom": {"name": 10, "type": 5, "levelParams": [1], "isUnsafe": false}}
+{"in": 11, "str": {"pre": 0, "str": "S"}}
+{"forallE": {"name": 3, "type": 2, "body": 2, "binderInfo": "default"}, "ie": 6}
+{"axiom": {"name": 11, "type": 6, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 11, "us": []}, "ie": 7}
+{"bvar": 0, "ie": 8}
+{"app": {"fn": 7, "arg": 8}, "ie": 9}
+{"app": {"fn": 7, "arg": 9}, "ie": 10}
+{"app": {"fn": 7, "arg": 10}, "ie": 11}
+{"app": {"fn": 7, "arg": 11}, "ie": 12}
+{"app": {"fn": 7, "arg": 12}, "ie": 13}
+{"app": {"fn": 7, "arg": 13}, "ie": 14}
+{"app": {"fn": 7, "arg": 14}, "ie": 15}
+{"app": {"fn": 7, "arg": 15}, "ie": 16}
+{"app": {"fn": 7, "arg": 16}, "ie": 17}
+{"app": {"fn": 7, "arg": 17}, "ie": 18}
+{"app": {"fn": 7, "arg": 18}, "ie": 19}
+{"app": {"fn": 7, "arg": 19}, "ie": 20}
+{"app": {"fn": 7, "arg": 20}, "ie": 21}
+{"app": {"fn": 7, "arg": 21}, "ie": 22}
+{"app": {"fn": 7, "arg": 22}, "ie": 23}
+{"app": {"fn": 7, "arg": 23}, "ie": 24}
+{"app": {"fn": 7, "arg": 24}, "ie": 25}
+{"app": {"fn": 7, "arg": 25}, "ie": 26}
+{"app": {"fn": 7, "arg": 26}, "ie": 27}
+{"app": {"fn": 7, "arg": 27}, "ie": 28}
+{"forallE": {"name": 3, "type": 2, "body": 1, "binderInfo": "default"}, "ie": 29}
+{"forallE": {"name": 8, "type": 1, "body": 1, "binderInfo": "default"}, "ie": 30}
+{"in": 12, "str": {"pre": 0, "str": "E"}}
+{"forallE": {"name": 7, "type": 30, "body": 29, "binderInfo": "default"}, "ie": 31}
+{"bvar": 1, "ie": 32}
+{"const": {"name": 10, "us": [2]}, "ie": 33}
+{"app": {"fn": 33, "arg": 28}, "ie": 34}
+{"app": {"fn": 32, "arg": 34}, "ie": 35}
+{"app": {"fn": 4, "arg": 35}, "ie": 36}
+{"lam": {"name": 3, "type": 2, "body": 36, "binderInfo": "default"}, "ie": 37}
+{"lam": {"name": 7, "type": 30, "body": 37, "binderInfo": "default"}, "ie": 38}
+{"def": {"name": 12, "type": 31, "value": 38, "levelParams": [1], "all": [12], "hints": {"regular": 1}, "safety": "safe"}}
+{"in": 13, "str": {"pre": 0, "str": "G"}}
+{"forallE": {"name": 4, "type": 29, "body": 29, "binderInfo": "default"}, "ie": 39}
+{"forallE": {"name": 7, "type": 30, "body": 39, "binderInfo": "default"}, "ie": 40}
+{"bvar": 2, "ie": 41}
+{"bvar": 1, "ie": 42}
+{"app": {"fn": 42, "arg": 28}, "ie": 43}
+{"app": {"fn": 41, "arg": 43}, "ie": 44}
+{"app": {"fn": 4, "arg": 44}, "ie": 45}
+{"lam": {"name": 3, "type": 2, "body": 45, "binderInfo": "default"}, "ie": 46}
+{"lam": {"name": 4, "type": 29, "body": 46, "binderInfo": "default"}, "ie": 47}
+{"lam": {"name": 7, "type": 30, "body": 47, "binderInfo": "default"}, "ie": 48}
+{"def": {"name": 13, "type": 40, "value": 48, "levelParams": [], "all": [13], "hints": {"regular": 2}, "safety": "safe"}}
+{"bvar": 0, "ie": 49}
+{"lam": {"name": 8, "type": 1, "body": 49, "binderInfo": "default"}, "ie": 50}
+{"const": {"name": 13, "us": []}, "ie": 51}
+{"app": {"fn": 51, "arg": 50}, "ie": 52}
+{"const": {"name": 10, "us": [0]}, "ie": 53}
+{"app": {"fn": 52, "arg": 53}, "ie": 54}
+{"bvar": 0, "ie": 55}
+{"app": {"fn": 54, "arg": 55}, "ie": 56}
+{"const": {"name": 12, "us": [0]}, "ie": 57}
+{"app": {"fn": 57, "arg": 50}, "ie": 58}
+{"bvar": 1, "ie": 59}
+{"app": {"fn": 58, "arg": 59}, "ie": 60}
+{"forallE": {"name": 6, "type": 56, "body": 60, "binderInfo": "default"}, "ie": 61}
+{"forallE": {"name": 5, "type": 2, "body": 61, "binderInfo": "default"}, "ie": 62}
+{"bvar": 0, "ie": 63}
+{"lam": {"name": 6, "type": 56, "body": 63, "binderInfo": "default"}, "ie": 64}
+{"lam": {"name": 5, "type": 2, "body": 64, "binderInfo": "default"}, "ie": 65}
+{"in": 14, "str": {"pre": 0, "str": "c1"}}
+{"def": {"name": 14, "type": 62, "value": 65, "levelParams": [], "all": [14], "hints": {"regular": 3}, "safety": "safe"}}
+{"const": {"name": 13, "us": []}, "ie": 66}
+{"app": {"fn": 66, "arg": 50}, "ie": 67}
+{"const": {"name": 10, "us": [0]}, "ie": 68}
+{"app": {"fn": 67, "arg": 68}, "ie": 69}
+{"bvar": 0, "ie": 70}
+{"app": {"fn": 69, "arg": 70}, "ie": 71}
+{"const": {"name": 12, "us": [0]}, "ie": 72}
+{"app": {"fn": 72, "arg": 50}, "ie": 73}
+{"bvar": 1, "ie": 74}
+{"app": {"fn": 73, "arg": 74}, "ie": 75}
+{"forallE": {"name": 6, "type": 71, "body": 75, "binderInfo": "default"}, "ie": 76}
+{"forallE": {"name": 5, "type": 2, "body": 76, "binderInfo": "default"}, "ie": 77}
+{"bvar": 0, "ie": 78}
+{"lam": {"name": 6, "type": 71, "body": 78, "binderInfo": "default"}, "ie": 79}
+{"lam": {"name": 5, "type": 2, "body": 79, "binderInfo": "default"}, "ie": 80}
+{"in": 15, "str": {"pre": 0, "str": "c2"}}
+{"def": {"name": 15, "type": 77, "value": 80, "levelParams": [], "all": [15], "hints": {"regular": 3}, "safety": "safe"}}

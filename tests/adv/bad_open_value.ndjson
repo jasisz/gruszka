@@ -1,0 +1,7 @@
+{"meta":{"exporter":{"name":"lean4export","version":"3.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"x","version":"4.34.1"}}}
+{"sort": 0, "ie": 0}
+{"in": 1, "str": {"pre": 0, "str": "False"}}
+{"axiom": {"name": 1, "type": 0, "levelParams": [], "isUnsafe": false}}
+{"in": 2, "str": {"pre": 0, "str": "open"}}
+{"bvar": 0, "ie": 1}
+{"def": {"name": 2, "type": 0, "value": 1, "levelParams": [], "all": [2], "hints": "opaque", "safety": "safe"}}

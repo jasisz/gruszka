@@ -1,0 +1,624 @@
+//! gruszka: a Lean 4 kernel built around Susz.
+//!
+//!   gruszka FILE [WORKERS]
+//!
+//! WORKERS defaults to the number of cores (`available_parallelism`); an
+//! `.ndjson` file is packed on that many threads too.
+//! FILE is a `.susz` file (or a lean4export `.ndjson`, packed in-process).
+//! Prints `accepted`, `rejected: <decl>: <why>` or `declined: <why>` and
+//! exits 0, 1 or 2.
+//!
+//!   gruszka --only NAME[,NAME...] FILE.susz [WORKERS]
+//!
+//! (milestone 26, Pestka's subset check) checks the named declarations,
+//! found through the file's INDEX, against the environment of everything
+//! before them; prints `checked: NAMES (subset; N earlier declarations
+//! admitted unchecked)` (0), `rejected: ...` (1), `declined: ...` (2) or
+//! `index invalid: ...` (2), never `accepted`. README, "Checking part of a
+//! file".
+
+mod env;
+mod induct;
+mod level;
+mod quot;
+mod tc;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::time::Instant;
+use tc::{Stop, Worker};
+
+const ST_OK: u8 = 1;
+const ST_REJECT: u8 = 2;
+const ST_DECLINE: u8 = 3;
+const ST_CANCEL: u8 = 4;
+
+#[cfg(target_os = "macos")]
+fn instr_now() -> u64 {
+    // this thread's instructions (thread_selfcounts, as thread_counts): the
+    // process-wide proc_pid_rusage summed the other workers in and cost
+    // more per call than a small declaration
+    thread_counts().0
+}
+#[cfg(not(target_os = "macos"))]
+fn instr_now() -> u64 {
+    0
+}
+
+/// Maps the file again over its own mapping (same address, same bytes):
+/// the pages read so far stop counting as this process's resident memory
+/// (the system keeps them in its file cache). Readers in other threads see
+/// the same bytes before and after.
+#[cfg(unix)]
+fn remap(bytes: &[u8], path: &str) -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
+    }
+    #[cfg(target_os = "macos")]
+    const MAP_FIXED: i32 = 0x10;
+    #[cfg(not(target_os = "macos"))]
+    const MAP_FIXED: i32 = 0x10;
+    const PROT_READ: i32 = 1;
+    const MAP_SHARED: i32 = 1;
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    match f.metadata() {
+        Ok(m) if m.len() as usize == bytes.len() => {}
+        _ => return false,
+    }
+    let p = bytes.as_ptr() as *mut u8;
+    let r = unsafe { mmap(p, bytes.len(), PROT_READ, MAP_SHARED | MAP_FIXED, f.as_raw_fd(), 0) };
+    r == p
+}
+#[cfg(not(unix))]
+fn remap(_bytes: &[u8], _path: &str) -> bool {
+    false
+}
+
+/// Milestone 24: this thread's (instructions, cycles) retired so far
+/// (macOS `thread_selfcounts`), and its CPU time in ns; zeros elsewhere.
+#[cfg(target_os = "macos")]
+fn thread_counts() -> (u64, u64, u64) {
+    unsafe extern "C" {
+        fn thread_selfcounts(kind: i32, buf: *mut u64, n: usize) -> i32;
+        fn clock_gettime_nsec_np(clock: u32) -> u64;
+    }
+    let mut b = [0u64; 2];
+    unsafe {
+        thread_selfcounts(1, b.as_mut_ptr(), 16);
+        (b[0], b[1], clock_gettime_nsec_np(16))
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn thread_counts() -> (u64, u64, u64) {
+    (0, 0, 0)
+}
+
+fn finish(code: i32, msg: &str) -> ! {
+    println!("{msg}");
+    std::process::exit(code)
+}
+
+/// Declarations grouped by namespace (see `main`), from the canonical
+/// name chains (milestone 24); the order only steers cache reuse, any
+/// order is sound.
+fn ns_order_fast(env: &env::Env) -> Vec<u32> {
+    use susz::canon::Part;
+    let nd = env.decl_rows.len();
+    let cn = &env.st.canon;
+    let src = env.bytes;
+    // a component as a key: string bytes, or a number (tagged apart)
+    #[derive(Hash, PartialEq, Eq, Clone, Copy)]
+    enum K<'a> {
+        S(&'a [u8]),
+        N(u64),
+    }
+    let key_of = |c: u32| -> K { match cn.part(src, c) { Part::Str(b) => K::S(b), Part::Num(k) => K::N(k) } };
+    let mut groups: rustc_hash::FxHashMap<(K, Option<K>), u32> = Default::default();
+    let mut gid: Vec<u32> = Vec::with_capacity(nd);
+    let mut chain: Vec<u32> = Vec::new();
+    let mut pcs: Vec<K> = Vec::new();
+    for d in 0..nd {
+        let (first, _) = env.decl_rows[d];
+        let raw = env.consts[first as usize].name;
+        chain.clear();
+        if (raw as usize) < env.st.name_canon.len() {
+            let mut x = env.st.name_canon[raw as usize];
+            while x != susz::canon::ANON {
+                chain.push(x);
+                x = cn.pre[x as usize];
+            }
+        }
+        // the dotted form's pieces: string components split at '.' too
+        pcs.clear();
+        for &c in chain.iter().rev() {
+            match key_of(c) {
+                K::S(b) => pcs.extend(b.split(|&ch| ch == b'.').map(K::S)),
+                k => pcs.push(k),
+            }
+        }
+        if pcs.is_empty() {
+            pcs.push(K::S(b"[anonymous]"));
+        }
+        let mut comps: &[K] = &pcs;
+        if comps.len() >= 2 && comps[0] == K::S(b"_private") {
+            // `_private.<module>.0.<name>`: the name after the first lone 0
+            let rest = &comps[1..];
+            let z = (1..rest.len().saturating_sub(1)).find(|&i| matches!(rest[i], K::N(0) | K::S(b"0")));
+            comps = match z { Some(i) => &rest[i + 1..], None => rest };
+        }
+        let ns = if comps.len() > 1 { &comps[..comps.len() - 1] } else { comps };
+        let k = match ns.len() {
+            0 => (K::S(b""), None),
+            1 => (ns[0], None),
+            _ => (ns[0], Some(ns[1])),
+        };
+        let n = groups.len() as u32;
+        gid.push(*groups.entry(k).or_insert(n));
+    }
+    // stable counting sort by group (groups in order of first appearance)
+    let ng = groups.len();
+    let mut start = vec![0u32; ng + 1];
+    for &g in &gid {
+        start[g as usize + 1] += 1;
+    }
+    for i in 0..ng {
+        start[i + 1] += start[i];
+    }
+    let mut out = vec![0u32; nd];
+    for (d, &g) in gid.iter().enumerate() {
+        out[start[g as usize] as usize] = d as u32;
+        start[g as usize] += 1;
+    }
+    out
+}
+
+/// Milestone 26: the names after `--only`, split at commas, empty ones
+/// dropped; `None` without the flag, no names when it ends the arguments
+/// (Pestka's `onlyOf`).
+fn only_of(args: &[String]) -> Option<Vec<String>> {
+    let i = args.iter().position(|a| a == "--only")?;
+    Some(match args.get(i + 1) {
+        None => Vec::new(),
+        Some(n) => n.split(',').filter(|s| !s.is_empty()).map(String::from).collect(),
+    })
+}
+
+/// The arguments without `--only` and the names after it (Pestka's
+/// `withoutOnly`).
+fn without_only(args: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--only" {
+            i += 2;
+        } else {
+            out.push(args[i].clone());
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Milestone 26: what a subset check asks for, found in INDEX (decoded
+/// whole and checked by the susz crate: sizes, front coding, strictly
+/// increasing keys, declarations in range). `Foo.*` asks for every name
+/// under `Foo` (a longer key starting with Foo's: components delimit
+/// themselves). The targets in increasing order, and what MAIN is to be
+/// held to; Err is the verdict line and exit code.
+fn plan_of(bytes: &[u8], path: &str, names: &[String]) -> Result<(env::Part, Vec<u32>), (i32, String)> {
+    let file = susz::read::File::open(bytes).map_err(|f| {
+        if f.class.declines() { (2, format!("declined: {f}")) } else { (1, format!("rejected: {f}")) }
+    })?;
+    let at = file.section(susz::format::SEC_INDEX).map_or(0, |s| s.offset);
+    let ix = match susz::index::parse(&file) {
+        Ok(ix) => ix,
+        Err(susz::index::IndexError::Absent) => {
+            return Err((2, format!("declined: {path} has no INDEX section, which checking part of a file needs: pack it without --no-index")))
+        }
+        Err(susz::index::IndexError::Invalid(m)) => return Err((2, format!("index invalid: INDEX @ {at}: {m}"))),
+        Err(e) => return Err((2, format!("index invalid: INDEX @ {at}: {e}"))),
+    };
+    // (text, key, under)
+    let asks: Vec<(&str, Vec<u8>, bool)> = names
+        .iter()
+        .map(|n| match n.strip_suffix(".*") {
+            Some(p) => (n.as_str(), susz::index::key_of_dotted(p), true),
+            None => (n.as_str(), susz::index::key_of_dotted(n), false),
+        })
+        .collect();
+    let mut hit = vec![false; asks.len()];
+    let mut by_decl: rustc_hash::FxHashMap<u32, Vec<Vec<u8>>> = Default::default();
+    let _ = ix.try_for_each(|k, d| -> Result<(), ()> {
+        let mut any = false;
+        for (j, (_, key, under)) in asks.iter().enumerate() {
+            let yes = if *under { k.len() > key.len() && k.starts_with(key) } else { k == key.as_slice() };
+            if yes {
+                hit[j] = true;
+                any = true;
+            }
+        }
+        if any {
+            by_decl.entry(d).or_default().push(k.to_vec());
+        }
+        Ok(())
+    });
+    let miss: Vec<&str> = asks.iter().zip(&hit).filter(|(_, h)| !**h).map(|(a, _)| a.0).collect();
+    if !miss.is_empty() {
+        return Err((2, format!("declined: not found: {}: the file's INDEX declares no such name", miss.join(", "))));
+    }
+    let mut targets: Vec<u32> = by_decl.keys().copied().collect();
+    targets.sort_unstable();
+    let up_to = targets.last().map_or(0, |&t| t + 1);
+    let marks = by_decl.into_iter().map(|(d, keys)| (d, (ix.entries[d as usize], keys))).collect();
+    Ok((env::Part { up_to, marks, index_at: at }, targets))
+}
+
+/// Unsafe or partial: Gruszka keeps it out of the logical environment.
+fn unsafe_or_partial(c: &env::ConstInfo) -> bool {
+    match &c.kind {
+        env::CKind::Defn { safety, .. } => *safety != 0,
+        _ => c.is_unsafe(),
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    // milestone 26: `--only NAME[,NAME...]` anywhere, as Pestka takes it
+    let only_names: Option<Vec<String>> = only_of(&args[1..]);
+    let args: Vec<String> = match &only_names {
+        Some(_) => std::iter::once(args[0].clone()).chain(without_only(&args[1..])).collect(),
+        None => args,
+    };
+    if only_names.is_some() && !(2..=3).contains(&args.len()) {
+        finish(2, "declined: usage: gruszka --only NAME[,NAME...] FILE.susz [WORKERS]; NAME may be Foo.* for every name under Foo");
+    }
+    if args.len() < 2 {
+        eprintln!("usage: gruszka FILE [WORKERS] | gruszka --only NAME[,NAME...] FILE.susz [WORKERS]");
+        std::process::exit(2);
+    }
+    let path = &args[1];
+    if only_names.as_ref().is_some_and(|n| n.is_empty()) {
+        finish(2, "declined: --only needs at least one name");
+    }
+    // milestone 24 (owner's decision): all cores by default; an explicit
+    // WORKERS argument wins
+    let workers: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+        .max(1);
+    // SK_DECL_INSTR=1: per declaration, this thread's instructions retired
+    // and nanoseconds, on stderr:
+    // DI<TAB>index<TAB>name<TAB>instructions<TAB>ns<TAB>counters
+    let decl_instr = std::env::var("SK_DECL_INSTR").is_ok();
+    let mut mapped = false;
+    const NOT_SUSZ: &str =
+        "declined: --only checks part of a Susz file, by its INDEX: pack the export first (susz pack FILE.ndjson FILE.susz)";
+    if only_names.is_some() && path.ends_with(".ndjson") {
+        finish(2, NOT_SUSZ);
+    }
+    let bytes: &'static [u8] = if path.ends_with(".ndjson") {
+        // milestone 24: packed on as many threads as there are workers
+        let opts = susz::pack::Options { index: false, threads: workers };
+        match susz::pack::pack_to_vec(path, &opts) {
+            Ok((v, _)) => Box::leak(v.into_boxed_slice()),
+            Err(e) => match e.fault {
+                susz::pack::Fault::Invalid => finish(1, &format!("rejected: not a valid export: {}", e.msg)),
+                susz::pack::Fault::Cannot => finish(2, &format!("declined: cannot pack: {}", e.msg)),
+            },
+        }
+    } else {
+        match unsafe { susz::open_mmap(path) } {
+            Ok(m) => {
+                let m: &'static susz::Mapped = Box::leak(Box::new(m));
+                mapped = m.is_mapped();
+                m
+            }
+            Err(e) => finish(2, &format!("declined: cannot open {path}: {e}")),
+        }
+    };
+    env::LOAD_THREADS.store(workers, Ordering::Relaxed);
+    // milestone 26: a subset check finds its targets in INDEX first
+    let part: Option<(env::Part, Vec<u32>)> = only_names.as_ref().map(|names| {
+        if !bytes.starts_with(&susz::format::MAGIC) {
+            finish(2, NOT_SUSZ);
+        }
+        match plan_of(bytes, path, names) {
+            Ok(p) => p,
+            Err((code, m)) => finish(code, &m),
+        }
+    });
+    let env = match env::load_part(bytes, part.as_ref().map(|p| &p.0)) {
+        Ok(e) => e,
+        Err(env::LoadError::Reject(m)) => finish(1, &format!("rejected: {m}")),
+        Err(env::LoadError::Decline(m)) => finish(2, &format!("declined: {m}")),
+        Err(env::LoadError::IndexInvalid(m)) => finish(2, &format!("index invalid: {m}")),
+    };
+    let env: &'static env::Env<'static> = Box::leak(Box::new(env));
+    // milestone 18: block arenas after MAIN in the term range, two per worker
+    if let Err(m) = env::region().layout(env.main.len(), 2 * workers) {
+        finish(2, &format!("declined: {m}"));
+    }
+    // the MAIN pages were copied into columns: let them go
+    let remap_on = mapped;
+    if remap_on && !remap(bytes, path) {
+        eprintln!("note: could not map the file again");
+    }
+    let nd = env.decl_rows.len();
+    let shared: &'static tc::Shared = Box::leak(Box::new(tc::Shared::new(env.main.len())));
+    let first_fail: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(u32::MAX)));
+    let status: Vec<AtomicU8> = (0..nd).map(|_| AtomicU8::new(0)).collect();
+    let msgs: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
+    // the order declarations are handed out in: by default grouped by
+    // namespace (first two components of the namespace; a declaration goes
+    // with the names under it), groups in order of first appearance, file
+    // order inside a group (milestone 16; SK_ORDER=ns names it too); with
+    // SK_ORDER=file in file order. The kept caches are stamped with
+    // declaration indices, so any order is sound.
+    let order: Vec<u32> = match std::env::var("SK_ORDER").as_deref() {
+        Ok("file") => (0..nd as u32).collect(),
+        Ok("ns") | Err(_) => ns_order_fast(env),
+        Ok(o) => { eprintln!("SK_ORDER={o}: expected file or ns"); std::process::exit(2) }
+    };
+    // milestone 26: a subset check checks the targets, and before the last
+    // of them the inductive blocks and the quotient package (reduction
+    // relies on the rules they add). Every other declaration read is
+    // admitted as stated (type and value unchecked, a theorem's proof not
+    // decoded unless a check unfolds it); unsafe and partial ones are
+    // skipped. Universe parameters must still be distinct; names are new
+    // by the reader.
+    let mut unchecked = 0usize;
+    let order: Vec<u32> = match &part {
+        None => order,
+        Some((_, targets)) => {
+            println!("subset: {} declarations asked for; the first {nd} declarations of the file read", targets.len());
+            for &t in targets {
+                let c = &env.consts[env.decl_rows[t as usize].0 as usize];
+                if unsafe_or_partial(c) {
+                    finish(2, &format!("declined: {} is unsafe or partial, which Gruszka does not check", env.name_str(c.name)));
+                }
+            }
+            let mut sel = vec![false; nd];
+            for &t in targets {
+                sel[t as usize] = true;
+            }
+            for d in 0..nd {
+                if sel[d] {
+                    continue;
+                }
+                let c = &env.consts[env.decl_rows[d].0 as usize];
+                let skipped = unsafe_or_partial(c);
+                if !skipped && matches!(c.kind, env::CKind::Quot { .. } | env::CKind::Induct { .. }) {
+                    sel[d] = true;
+                    continue;
+                }
+                // admitted (counted) or skipped (unsafe, partial: not counted)
+                unchecked += !skipped as usize;
+                if env.decl_dup_params[d] {
+                    status[d].store(ST_REJECT, Ordering::Relaxed);
+                    msgs.lock().unwrap().push((d as u32, "universe parameters named twice".into()));
+                    first_fail.fetch_min(d as u32, Ordering::Relaxed);
+                } else {
+                    status[d].store(ST_OK, Ordering::Relaxed);
+                }
+            }
+            order.into_iter().filter(|&d| sel[d as usize]).collect()
+        }
+    };
+    let no = order.len();
+    const CHUNK: usize = 32;
+    // milestone 24: each worker starts on its own contiguous part of the
+    // order and takes chunks from its front; a worker whose part is empty
+    // takes the back half of the largest part left (neighbours in namespace
+    // order share lemmas: mathlib w8 -5% instructions against chunks dealt
+    // round robin)
+    let parts: Mutex<Vec<(usize, usize)>> =
+        Mutex::new((0..workers).map(|i| (no * i / workers, no * (i + 1) / workers)).collect());
+    let take = |wi: usize| -> Option<(usize, usize)> {
+        let mut p = parts.lock().unwrap();
+        if p[wi].0 >= p[wi].1 {
+            let (mut best, mut len) = (usize::MAX, 0);
+            for (i, &(lo, hi)) in p.iter().enumerate() {
+                if hi - lo > len {
+                    (best, len) = (i, hi - lo);
+                }
+            }
+            if best == usize::MAX {
+                return None;
+            }
+            let (lo, hi) = p[best];
+            let mid = if len <= CHUNK { lo } else { lo + len / 2 };
+            p[best].1 = mid;
+            p[wi] = (mid, hi);
+        }
+        let (lo, hi) = p[wi];
+        let e = (lo + CHUNK).min(hi);
+        p[wi].0 = e;
+        Some((lo, e))
+    };
+    // milestone 16: a declaration that runs longer than this hands the rest
+    // of its chunk to the other workers (`spill`), so a few heavy
+    // declarations next to each other (reachability's `decide` proofs) do
+    // not run one after another on one worker
+    const SPILL_MS: u128 = 20;
+    let spill: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+    const STACK: usize = 1 << 30;
+    // per worker: declaration being checked (u32::MAX: none)
+    let running: Vec<AtomicU32> = (0..workers).map(|_| AtomicU32::new(u32::MAX)).collect();
+    let all_done = std::sync::atomic::AtomicBool::new(false);
+
+    std::thread::scope(|s| {
+        let mut remap_thread = None;
+        if remap_on {
+            // proof blocks are read from the mapping as declarations need
+            // them: map it again once a second, so pages read once do not
+            // stay resident for the rest of the run
+            // (milestone 24: parked, and woken when the workers are done,
+            // instead of polling every 50 ms: the run ended up to 50 ms late)
+            let all_done = &all_done;
+            remap_thread = Some(s.spawn(move || {
+                let mut last = Instant::now();
+                while !all_done.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(std::time::Duration::from_millis(1000).saturating_sub(last.elapsed()));
+                    if !all_done.load(Ordering::Relaxed) && last.elapsed().as_millis() >= 1000 {
+                        remap(bytes, path);
+                        last = Instant::now();
+                    }
+                }
+            }));
+        }
+        let mut handles = Vec::new();
+        for wi in 0..workers {
+            let (status, msgs, running, order, spill, take) = (&status, &msgs, &running, &order, &spill, &take);
+            let h = std::thread::Builder::new()
+                .stack_size(STACK)
+                .spawn_scoped(s, move || {
+                    let mut w = Worker::new(env, shared, first_fail, STACK - (64 << 20));
+                    let mut batch: Vec<u32> = Vec::with_capacity(CHUNK);
+                    loop {
+                        // spilled declarations first (one at a time), then a new chunk
+                        batch.clear();
+                        if let Some(d) = spill.lock().unwrap().pop() {
+                            batch.push(d);
+                        } else {
+                            let Some((start, end)) = take(wi) else {
+                                // others may still spill: wait while any worker runs
+                                if running.iter().all(|r| r.load(Ordering::Relaxed) == u32::MAX) && spill.lock().unwrap().is_empty() {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(1));
+                                continue;
+                            };
+                            batch.extend_from_slice(&order[start..end]);
+                        }
+                        let mut bi = 0;
+                        while bi < batch.len() {
+                            let d32 = batch[bi];
+                            bi += 1;
+                            let d = d32 as usize;
+                            if d32 > first_fail.load(Ordering::Relaxed) {
+                                status[d].store(ST_CANCEL, Ordering::Relaxed);
+                                continue;
+                            }
+                            running[wi].store(d32, Ordering::Relaxed);
+                            let t0 = Instant::now();
+                            let st0 = if decl_instr { Some((w.stats.clone(), w.ticks)) } else { None };
+                            let i0 = if decl_instr { instr_now() } else { 0 };
+                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.check_decl(d32)));
+                            if decl_instr {
+                                let i1 = instr_now();
+                                let (first, _) = env.decl_rows[d];
+                                let (a, tk0) = st0.unwrap();
+                                let b = &w.stats;
+                                eprintln!(
+                                    "DI\t{d}\t{}\t{}\t{}\tticks {}\twhnf {}\tunfold {}\tdeq {}\tdeq_hit {}\tinfer {}\tinfer_calls {}\teval {}\tvals {}\tinterns {}",
+                                    env.name_str(env.consts[first as usize].name),
+                                    i1.wrapping_sub(i0),
+                                    t0.elapsed().as_nanos(),
+                                    w.ticks.wrapping_sub(tk0),
+                                    b.whnf_misses - a.whnf_misses,
+                                    b.unfolds - a.unfolds,
+                                    b.defeq_calls - a.defeq_calls,
+                                    b.defeq_cache_hits - a.defeq_cache_hits,
+                                    b.infer_misses - a.infer_misses,
+                                    b.infer_calls - a.infer_calls,
+                                    b.evals - a.evals,
+                                    w.vals.len(),
+                                    b.interns - a.interns
+                                );
+                            }
+                            let (st, msg) = match r {
+                                Ok(Ok(())) => (ST_OK, None),
+                                Ok(Err(Stop::Reject)) => (ST_REJECT, Some(tc::stop_msg())),
+                                Ok(Err(Stop::Decline)) => (ST_DECLINE, Some(tc::stop_msg())),
+                                Ok(Err(Stop::Cancel)) => (ST_CANCEL, None),
+                                Ok(Err(Stop::Budget)) => (ST_DECLINE, Some("probe budget escaped".into())),
+                                Err(p) => {
+                                    w.after_panic();
+                                    let m = p
+                                        .downcast_ref::<String>()
+                                        .cloned()
+                                        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                                        .unwrap_or_default();
+                                    (ST_DECLINE, Some(format!("internal error: {m}")))
+                                }
+                            };
+                            if st == ST_REJECT || st == ST_DECLINE {
+                                first_fail.fetch_min(d32, Ordering::Relaxed);
+                                msgs.lock().unwrap().push((d32, msg.unwrap()));
+                            }
+                            status[d].store(st, Ordering::Relaxed);
+                            if t0.elapsed().as_millis() > SPILL_MS && bi < batch.len() {
+                                // hand the rest over before this worker says it is idle
+                                spill.lock().unwrap().extend(batch[bi..].iter().rev());
+                                bi = batch.len();
+                            }
+                            running[wi].store(u32::MAX, Ordering::Relaxed);
+                        }
+                    }
+                    // milestone 24: the process exits after the verdict; freeing
+                    // a worker's tables here only delayed it
+                    std::mem::forget(w);
+                })
+                .expect("spawn");
+            handles.push(h);
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        all_done.store(true, Ordering::Relaxed);
+        if let Some(h) = &remap_thread {
+            h.thread().unpark();
+        }
+    });
+    #[cfg(feature = "cnt")]
+    if decl_instr {
+        for (i, c) in tc::THUNK_KINDS.iter().enumerate().take(1024) {
+            let c = c.load(Ordering::Relaxed);
+            if c > 0 {
+                eprintln!("TK term kind {} head kind {} head val {} count {c}", i / 64, (i % 64) / 5, (i % 64) % 5);
+            }
+        }
+        let made = tc::THUNK_KINDS[tc::P_MADE].load(Ordering::Relaxed).max(1);
+        let mut tot = 0u64;
+        for (k, name) in tc::P_NAMES_LIST.iter().enumerate() {
+            let c = tc::THUNK_KINDS[tc::P_BASE + k].load(Ordering::Relaxed);
+            if c > 0 {
+                if tc::P_BASE + k != tc::P_MADE && tc::P_BASE + k != tc::P_INTERN_CALLS {
+                    tot += c;
+                }
+                eprintln!("PR {:<20} {:>12} {:>7.3} per value", name, c, c as f64 / made as f64);
+            }
+        }
+        eprintln!("PR {:<20} {:>12} {:>7.3} per value (values made {})", "TOTAL probes", tot, tot as f64 / made as f64, made);
+    }
+    let msgs = msgs.into_inner().unwrap();
+    for d in 0..nd {
+        match status[d].load(Ordering::Relaxed) {
+            ST_OK => continue,
+            ST_REJECT | ST_DECLINE => {
+                let m = msgs.iter().find(|x| x.0 == d as u32).map(|x| x.1.clone()).unwrap_or_default();
+                let (first, _) = env.decl_rows[d];
+                let name = env.name_str(env.consts[first as usize].name);
+                if status[d].load(Ordering::Relaxed) == ST_REJECT {
+                    finish(1, &format!("rejected: {name}: {m}"));
+                } else {
+                    finish(2, &format!("declined: {name}: {m}"));
+                }
+            }
+            _ => finish(2, &format!("declined: declaration {d} was not checked (internal)")),
+        }
+    }
+    // milestone 26: a subset check never says accepted
+    if let (Some(names), Some((_, targets))) = (&only_names, &part) {
+        let n = targets.len();
+        let many = if n == 1 { String::new() } else { format!("{n} declarations; ") };
+        finish(0, &format!("checked: {} ({many}subset; {unchecked} earlier declarations admitted unchecked)", names.join(",")));
+    }
+    finish(0, "accepted");
+}

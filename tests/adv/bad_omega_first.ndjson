@@ -1,0 +1,16 @@
+{"meta":{"exporter":{"name":"lean4export","version":"3.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"x","version":"4.34.1"}}}
+{"sort": 0, "ie": 0}
+{"in": 1, "str": {"pre": 0, "str": "False"}}
+{"axiom": {"name": 1, "type": 0, "levelParams": [], "isUnsafe": false}}
+{"in": 2, "str": {"pre": 0, "str": "x"}}
+{"bvar": 0, "ie": 1}
+{"bvar": 0, "ie": 2}
+{"app": {"fn": 1, "arg": 2}, "ie": 3}
+{"lam": {"name": 2, "type": 0, "body": 3, "binderInfo": "default"}, "ie": 4}
+{"app": {"fn": 4, "arg": 4}, "ie": 5}
+{"in": 3, "str": {"pre": 0, "str": "omega"}}
+{"def": {"name": 3, "type": 0, "value": 5, "levelParams": [], "all": [3], "hints": {"regular": 1}, "safety": "safe"}}
+{"in": 4, "str": {"pre": 0, "str": "useOmega"}}
+{"const": {"name": 3, "us": []}, "ie": 6}
+{"const": {"name": 1, "us": []}, "ie": 7}
+{"thm": {"name": 4, "type": 6, "value": 7, "levelParams": [], "all": [4]}}

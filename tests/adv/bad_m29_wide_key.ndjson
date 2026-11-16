@@ -1,0 +1,164 @@
+{"meta":{"exporter":{"name":"lean4export","version":"3.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"x","version":"4.34.1"}}}
+{"sort": 0, "ie": 0}
+{"il": 1, "succ": 0}
+{"sort": 1, "ie": 1}
+{"in": 1, "str": {"pre": 0, "str": "P"}}
+{"axiom": {"name": 1, "type": 1, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 1, "us": []}, "ie": 2}
+{"in": 2, "str": {"pre": 0, "str": "Q"}}
+{"axiom": {"name": 2, "type": 1, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 2, "us": []}, "ie": 3}
+{"in": 3, "str": {"pre": 0, "str": "D"}}
+{"axiom": {"name": 3, "type": 1, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 3, "us": []}, "ie": 4}
+{"in": 4, "str": {"pre": 0, "str": "R"}}
+{"axiom": {"name": 4, "type": 1, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 4, "us": []}, "ie": 5}
+{"in": 5, "str": {"pre": 0, "str": "x"}}
+{"in": 6, "str": {"pre": 0, "str": "d"}}
+{"in": 7, "str": {"pre": 0, "str": "p"}}
+{"in": 8, "str": {"pre": 0, "str": "g"}}
+{"forallE": {"name": 5, "type": 2, "body": 5, "binderInfo": "default"}, "ie": 6}
+{"axiom": {"name": 8, "type": 6, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 8, "us": []}, "ie": 7}
+{"in": 9, "str": {"pre": 0, "str": "C"}}
+{"forallE": {"name": 5, "type": 5, "body": 1, "binderInfo": "default"}, "ie": 8}
+{"axiom": {"name": 9, "type": 8, "levelParams": [], "isUnsafe": false}}
+{"const": {"name": 9, "us": []}, "ie": 9}
+{"bvar": 64, "ie": 10}
+{"app": {"fn": 7, "arg": 10}, "ie": 11}
+{"app": {"fn": 9, "arg": 11}, "ie": 12}
+{"in": 10, "str": {"pre": 0, "str": "ax1"}}
+{"forallE": {"name": 6, "type": 4, "body": 12, "binderInfo": "default"}, "ie": 13}
+{"forallE": {"name": 6, "type": 4, "body": 13, "binderInfo": "default"}, "ie": 14}
+{"forallE": {"name": 6, "type": 4, "body": 14, "binderInfo": "default"}, "ie": 15}
+{"forallE": {"name": 6, "type": 4, "body": 15, "binderInfo": "default"}, "ie": 16}
+{"forallE": {"name": 6, "type": 4, "body": 16, "binderInfo": "default"}, "ie": 17}
+{"forallE": {"name": 6, "type": 4, "body": 17, "binderInfo": "default"}, "ie": 18}
+{"forallE": {"name": 6, "type": 4, "body": 18, "binderInfo": "default"}, "ie": 19}
+{"forallE": {"name": 6, "type": 4, "body": 19, "binderInfo": "default"}, "ie": 20}
+{"forallE": {"name": 6, "type": 4, "body": 20, "binderInfo": "default"}, "ie": 21}
+{"forallE": {"name": 6, "type": 4, "body": 21, "binderInfo": "default"}, "ie": 22}
+{"forallE": {"name": 6, "type": 4, "body": 22, "binderInfo": "default"}, "ie": 23}
+{"forallE": {"name": 6, "type": 4, "body": 23, "binderInfo": "default"}, "ie": 24}
+{"forallE": {"name": 6, "type": 4, "body": 24, "binderInfo": "default"}, "ie": 25}
+{"forallE": {"name": 6, "type": 4, "body": 25, "binderInfo": "default"}, "ie": 26}
+{"forallE": {"name": 6, "type": 4, "body": 26, "binderInfo": "default"}, "ie": 27}
+{"forallE": {"name": 6, "type": 4, "body": 27, "binderInfo": "default"}, "ie": 28}
+{"forallE": {"name": 6, "type": 4, "body": 28, "binderInfo": "default"}, "ie": 29}
+{"forallE": {"name": 6, "type": 4, "body": 29, "binderInfo": "default"}, "ie": 30}
+{"forallE": {"name": 6, "type": 4, "body": 30, "binderInfo": "default"}, "ie": 31}
+{"forallE": {"name": 6, "type": 4, "body": 31, "binderInfo": "default"}, "ie": 32}
+{"forallE": {"name": 6, "type": 4, "body": 32, "binderInfo": "default"}, "ie": 33}
+{"forallE": {"name": 6, "type": 4, "body": 33, "binderInfo": "default"}, "ie": 34}
+{"forallE": {"name": 6, "type": 4, "body": 34, "binderInfo": "default"}, "ie": 35}
+{"forallE": {"name": 6, "type": 4, "body": 35, "binderInfo": "default"}, "ie": 36}
+{"forallE": {"name": 6, "type": 4, "body": 36, "binderInfo": "default"}, "ie": 37}
+{"forallE": {"name": 6, "type": 4, "body": 37, "binderInfo": "default"}, "ie": 38}
+{"forallE": {"name": 6, "type": 4, "body": 38, "binderInfo": "default"}, "ie": 39}
+{"forallE": {"name": 6, "type": 4, "body": 39, "binderInfo": "default"}, "ie": 40}
+{"forallE": {"name": 6, "type": 4, "body": 40, "binderInfo": "default"}, "ie": 41}
+{"forallE": {"name": 6, "type": 4, "body": 41, "binderInfo": "default"}, "ie": 42}
+{"forallE": {"name": 6, "type": 4, "body": 42, "binderInfo": "default"}, "ie": 43}
+{"forallE": {"name": 6, "type": 4, "body": 43, "binderInfo": "default"}, "ie": 44}
+{"forallE": {"name": 6, "type": 4, "body": 44, "binderInfo": "default"}, "ie": 45}
+{"forallE": {"name": 6, "type": 4, "body": 45, "binderInfo": "default"}, "ie": 46}
+{"forallE": {"name": 6, "type": 4, "body": 46, "binderInfo": "default"}, "ie": 47}
+{"forallE": {"name": 6, "type": 4, "body": 47, "binderInfo": "default"}, "ie": 48}
+{"forallE": {"name": 6, "type": 4, "body": 48, "binderInfo": "default"}, "ie": 49}
+{"forallE": {"name": 6, "type": 4, "body": 49, "binderInfo": "default"}, "ie": 50}
+{"forallE": {"name": 6, "type": 4, "body": 50, "binderInfo": "default"}, "ie": 51}
+{"forallE": {"name": 6, "type": 4, "body": 51, "binderInfo": "default"}, "ie": 52}
+{"forallE": {"name": 6, "type": 4, "body": 52, "binderInfo": "default"}, "ie": 53}
+{"forallE": {"name": 6, "type": 4, "body": 53, "binderInfo": "default"}, "ie": 54}
+{"forallE": {"name": 6, "type": 4, "body": 54, "binderInfo": "default"}, "ie": 55}
+{"forallE": {"name": 6, "type": 4, "body": 55, "binderInfo": "default"}, "ie": 56}
+{"forallE": {"name": 6, "type": 4, "body": 56, "binderInfo": "default"}, "ie": 57}
+{"forallE": {"name": 6, "type": 4, "body": 57, "binderInfo": "default"}, "ie": 58}
+{"forallE": {"name": 6, "type": 4, "body": 58, "binderInfo": "default"}, "ie": 59}
+{"forallE": {"name": 6, "type": 4, "body": 59, "binderInfo": "default"}, "ie": 60}
+{"forallE": {"name": 6, "type": 4, "body": 60, "binderInfo": "default"}, "ie": 61}
+{"forallE": {"name": 6, "type": 4, "body": 61, "binderInfo": "default"}, "ie": 62}
+{"forallE": {"name": 6, "type": 4, "body": 62, "binderInfo": "default"}, "ie": 63}
+{"forallE": {"name": 6, "type": 4, "body": 63, "binderInfo": "default"}, "ie": 64}
+{"forallE": {"name": 6, "type": 4, "body": 64, "binderInfo": "default"}, "ie": 65}
+{"forallE": {"name": 6, "type": 4, "body": 65, "binderInfo": "default"}, "ie": 66}
+{"forallE": {"name": 6, "type": 4, "body": 66, "binderInfo": "default"}, "ie": 67}
+{"forallE": {"name": 6, "type": 4, "body": 67, "binderInfo": "default"}, "ie": 68}
+{"forallE": {"name": 6, "type": 4, "body": 68, "binderInfo": "default"}, "ie": 69}
+{"forallE": {"name": 6, "type": 4, "body": 69, "binderInfo": "default"}, "ie": 70}
+{"forallE": {"name": 6, "type": 4, "body": 70, "binderInfo": "default"}, "ie": 71}
+{"forallE": {"name": 6, "type": 4, "body": 71, "binderInfo": "default"}, "ie": 72}
+{"forallE": {"name": 6, "type": 4, "body": 72, "binderInfo": "default"}, "ie": 73}
+{"forallE": {"name": 6, "type": 4, "body": 73, "binderInfo": "default"}, "ie": 74}
+{"forallE": {"name": 6, "type": 4, "body": 74, "binderInfo": "default"}, "ie": 75}
+{"forallE": {"name": 6, "type": 4, "body": 75, "binderInfo": "default"}, "ie": 76}
+{"forallE": {"name": 7, "type": 2, "body": 76, "binderInfo": "default"}, "ie": 77}
+{"axiom": {"name": 10, "type": 77, "levelParams": [], "isUnsafe": false}}
+{"in": 11, "str": {"pre": 0, "str": "ax2"}}
+{"forallE": {"name": 6, "type": 4, "body": 12, "binderInfo": "default"}, "ie": 78}
+{"forallE": {"name": 6, "type": 4, "body": 78, "binderInfo": "default"}, "ie": 79}
+{"forallE": {"name": 6, "type": 4, "body": 79, "binderInfo": "default"}, "ie": 80}
+{"forallE": {"name": 6, "type": 4, "body": 80, "binderInfo": "default"}, "ie": 81}
+{"forallE": {"name": 6, "type": 4, "body": 81, "binderInfo": "default"}, "ie": 82}
+{"forallE": {"name": 6, "type": 4, "body": 82, "binderInfo": "default"}, "ie": 83}
+{"forallE": {"name": 6, "type": 4, "body": 83, "binderInfo": "default"}, "ie": 84}
+{"forallE": {"name": 6, "type": 4, "body": 84, "binderInfo": "default"}, "ie": 85}
+{"forallE": {"name": 6, "type": 4, "body": 85, "binderInfo": "default"}, "ie": 86}
+{"forallE": {"name": 6, "type": 4, "body": 86, "binderInfo": "default"}, "ie": 87}
+{"forallE": {"name": 6, "type": 4, "body": 87, "binderInfo": "default"}, "ie": 88}
+{"forallE": {"name": 6, "type": 4, "body": 88, "binderInfo": "default"}, "ie": 89}
+{"forallE": {"name": 6, "type": 4, "body": 89, "binderInfo": "default"}, "ie": 90}
+{"forallE": {"name": 6, "type": 4, "body": 90, "binderInfo": "default"}, "ie": 91}
+{"forallE": {"name": 6, "type": 4, "body": 91, "binderInfo": "default"}, "ie": 92}
+{"forallE": {"name": 6, "type": 4, "body": 92, "binderInfo": "default"}, "ie": 93}
+{"forallE": {"name": 6, "type": 4, "body": 93, "binderInfo": "default"}, "ie": 94}
+{"forallE": {"name": 6, "type": 4, "body": 94, "binderInfo": "default"}, "ie": 95}
+{"forallE": {"name": 6, "type": 4, "body": 95, "binderInfo": "default"}, "ie": 96}
+{"forallE": {"name": 6, "type": 4, "body": 96, "binderInfo": "default"}, "ie": 97}
+{"forallE": {"name": 6, "type": 4, "body": 97, "binderInfo": "default"}, "ie": 98}
+{"forallE": {"name": 6, "type": 4, "body": 98, "binderInfo": "default"}, "ie": 99}
+{"forallE": {"name": 6, "type": 4, "body": 99, "binderInfo": "default"}, "ie": 100}
+{"forallE": {"name": 6, "type": 4, "body": 100, "binderInfo": "default"}, "ie": 101}
+{"forallE": {"name": 6, "type": 4, "body": 101, "binderInfo": "default"}, "ie": 102}
+{"forallE": {"name": 6, "type": 4, "body": 102, "binderInfo": "default"}, "ie": 103}
+{"forallE": {"name": 6, "type": 4, "body": 103, "binderInfo": "default"}, "ie": 104}
+{"forallE": {"name": 6, "type": 4, "body": 104, "binderInfo": "default"}, "ie": 105}
+{"forallE": {"name": 6, "type": 4, "body": 105, "binderInfo": "default"}, "ie": 106}
+{"forallE": {"name": 6, "type": 4, "body": 106, "binderInfo": "default"}, "ie": 107}
+{"forallE": {"name": 6, "type": 4, "body": 107, "binderInfo": "default"}, "ie": 108}
+{"forallE": {"name": 6, "type": 4, "body": 108, "binderInfo": "default"}, "ie": 109}
+{"forallE": {"name": 6, "type": 4, "body": 109, "binderInfo": "default"}, "ie": 110}
+{"forallE": {"name": 6, "type": 4, "body": 110, "binderInfo": "default"}, "ie": 111}
+{"forallE": {"name": 6, "type": 4, "body": 111, "binderInfo": "default"}, "ie": 112}
+{"forallE": {"name": 6, "type": 4, "body": 112, "binderInfo": "default"}, "ie": 113}
+{"forallE": {"name": 6, "type": 4, "body": 113, "binderInfo": "default"}, "ie": 114}
+{"forallE": {"name": 6, "type": 4, "body": 114, "binderInfo": "default"}, "ie": 115}
+{"forallE": {"name": 6, "type": 4, "body": 115, "binderInfo": "default"}, "ie": 116}
+{"forallE": {"name": 6, "type": 4, "body": 116, "binderInfo": "default"}, "ie": 117}
+{"forallE": {"name": 6, "type": 4, "body": 117, "binderInfo": "default"}, "ie": 118}
+{"forallE": {"name": 6, "type": 4, "body": 118, "binderInfo": "default"}, "ie": 119}
+{"forallE": {"name": 6, "type": 4, "body": 119, "binderInfo": "default"}, "ie": 120}
+{"forallE": {"name": 6, "type": 4, "body": 120, "binderInfo": "default"}, "ie": 121}
+{"forallE": {"name": 6, "type": 4, "body": 121, "binderInfo": "default"}, "ie": 122}
+{"forallE": {"name": 6, "type": 4, "body": 122, "binderInfo": "default"}, "ie": 123}
+{"forallE": {"name": 6, "type": 4, "body": 123, "binderInfo": "default"}, "ie": 124}
+{"forallE": {"name": 6, "type": 4, "body": 124, "binderInfo": "default"}, "ie": 125}
+{"forallE": {"name": 6, "type": 4, "body": 125, "binderInfo": "default"}, "ie": 126}
+{"forallE": {"name": 6, "type": 4, "body": 126, "binderInfo": "default"}, "ie": 127}
+{"forallE": {"name": 6, "type": 4, "body": 127, "binderInfo": "default"}, "ie": 128}
+{"forallE": {"name": 6, "type": 4, "body": 128, "binderInfo": "default"}, "ie": 129}
+{"forallE": {"name": 6, "type": 4, "body": 129, "binderInfo": "default"}, "ie": 130}
+{"forallE": {"name": 6, "type": 4, "body": 130, "binderInfo": "default"}, "ie": 131}
+{"forallE": {"name": 6, "type": 4, "body": 131, "binderInfo": "default"}, "ie": 132}
+{"forallE": {"name": 6, "type": 4, "body": 132, "binderInfo": "default"}, "ie": 133}
+{"forallE": {"name": 6, "type": 4, "body": 133, "binderInfo": "default"}, "ie": 134}
+{"forallE": {"name": 6, "type": 4, "body": 134, "binderInfo": "default"}, "ie": 135}
+{"forallE": {"name": 6, "type": 4, "body": 135, "binderInfo": "default"}, "ie": 136}
+{"forallE": {"name": 6, "type": 4, "body": 136, "binderInfo": "default"}, "ie": 137}
+{"forallE": {"name": 6, "type": 4, "body": 137, "binderInfo": "default"}, "ie": 138}
+{"forallE": {"name": 6, "type": 4, "body": 138, "binderInfo": "default"}, "ie": 139}
+{"forallE": {"name": 6, "type": 4, "body": 139, "binderInfo": "default"}, "ie": 140}
+{"forallE": {"name": 6, "type": 4, "body": 140, "binderInfo": "default"}, "ie": 141}
+{"forallE": {"name": 7, "type": 3, "body": 141, "binderInfo": "default"}, "ie": 142}
+{"axiom": {"name": 11, "type": 142, "levelParams": [], "isUnsafe": false}}

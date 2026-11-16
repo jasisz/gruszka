@@ -1,0 +1,25 @@
+{"meta":{"exporter":{"name":"lean4export","version":"3.1.0"},"format":{"version":"3.1.0"},"lean":{"githash":"x","version":"4.34.1"}}}
+{"sort": 0, "ie": 0}
+{"in": 1, "str": {"pre": 0, "str": "u"}}
+{"il": 1, "param": 1}
+{"il": 2, "succ": 0}
+{"in": 2, "str": {"pre": 0, "str": "T"}}
+{"axiom": {"name": 2, "type": 0, "levelParams": [1], "isUnsafe": false}}
+{"in": 3, "str": {"pre": 0, "str": "D"}}
+{"const": {"name": 2, "us": [1]}, "ie": 1}
+{"def": {"name": 3, "type": 0, "value": 1, "levelParams": [1], "all": [3], "hints": {"regular": 1}, "safety": "safe"}}
+{"in": 4, "str": {"pre": 0, "str": "h"}}
+{"const": {"name": 3, "us": [0]}, "ie": 2}
+{"const": {"name": 2, "us": [0]}, "ie": 3}
+{"in": 5, "str": {"pre": 0, "str": "a"}}
+{"forallE": {"name": 4, "type": 2, "body": 3, "binderInfo": "default"}, "ie": 4}
+{"bvar": 0, "ie": 5}
+{"lam": {"name": 4, "type": 2, "body": 5, "binderInfo": "default"}, "ie": 6}
+{"thm": {"name": 5, "type": 4, "value": 6, "levelParams": [], "all": [5]}}
+{"const": {"name": 3, "us": [2]}, "ie": 7}
+{"const": {"name": 2, "us": [0]}, "ie": 8}
+{"in": 6, "str": {"pre": 0, "str": "b"}}
+{"forallE": {"name": 4, "type": 7, "body": 8, "binderInfo": "default"}, "ie": 9}
+{"bvar": 0, "ie": 10}
+{"lam": {"name": 4, "type": 7, "body": 10, "binderInfo": "default"}, "ie": 11}
+{"thm": {"name": 6, "type": 9, "value": 11, "levelParams": [], "all": [6]}}
