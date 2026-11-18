@@ -1,4 +1,5 @@
 #!/bin/bash
+CAP=${CAP:-$(cd "$(dirname "$0")" && pwd)/capped}
 # Measures gruszka on a .susz file: verdict, instructions, cycles, wall,
 # max RSS, peak footprint. Takes the shared measure.lock (mkdir; waits while
 # another holds it; releases after the batch). Usage:
@@ -15,7 +16,7 @@ echo "# $(date '+%F %T') $(pmset -g batt | head -1 | sed "s/Now drawing from //"
 cat $F > /dev/null
 for w in $WS; do
   for r in $(seq 1 $RUNS); do
-    out=$( { ~/PycharmProjects/pestka/bin/capped $MB $SECS /usr/bin/time -l $BIN $ARGS $F $w; } 2>&1 )
+    out=$( { "$CAP" $MB $SECS /usr/bin/time -l $BIN $ARGS $F $w; } 2>&1 )
     v=$(echo "$out" | grep -E "^(accepted|rejected|declined|checked|index invalid)" | head -1 | cut -c1-${VW:-60})
     echo "$out" | awk -v w=$w -v v="$v" '
       /real/ {wall=$1} /maximum resident/ {rss=$1/1048576} /instructions retired/ {ins=$1/1e9}

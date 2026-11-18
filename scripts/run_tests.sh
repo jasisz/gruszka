@@ -1,4 +1,5 @@
 #!/bin/bash
+CAP=${CAP:-$(cd "$(dirname "$0")" && pwd)/capped}
 # Runs every Arena small test (ndjson, packed in-process) and tabulates
 # good/bad x accepted/rejected/declined. Usage: run_tests.sh [BIN] [OUT]
 X=${ARENA_TESTS:?set ARENA_TESTS to the Arena tests directory}
@@ -8,7 +9,7 @@ OUT=${2:-/dev/stdout}
 cd $X
 for f in $(find good bad -name '*.ndjson' | grep -v /perf/ | sort); do
   exp=${f%%/*}
-  r=$(~/PycharmProjects/pestka/bin/capped 4000 60 $BIN $f 1 2>/dev/null | tail -1)
+  r=$("$CAP" 4000 60 $BIN $f 1 2>/dev/null | tail -1)
   code=$?
   case "$r" in accepted*) v=accepted;; rejected*) v=rejected;; declined*) v=declined;; *) v="crash($code)";; esac
   echo "$exp $v $f :: $r" >> /tmp/sk-res.$$

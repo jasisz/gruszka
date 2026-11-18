@@ -1,4 +1,5 @@
 #!/bin/bash
+CAP=${CAP:-$(cd "$(dirname "$0")" && pwd)/capped}
 # Every gate of a kept step: small tests (default order, plain and poisoned;
 # plain in file order) and vectors (plain and SK_POISON=1;
 # vectors in file and namespace order), Init and con-leche poisoned at 4
@@ -22,7 +23,7 @@ grep -A100 "== good not" /tmp/sk-ga.$$ | grep -B100 "== bad declined" | grep -q 
 grep -q ' crash(' /tmp/sk-ga.$$ && { echo "FILE ORDER: small tests crashed"; bad=1; }
 rm -f /tmp/sk-ga.$$
 run() { # ORDER WORKERS CORPUS
-  r=$(SK_ORDER=$1 SK_POISON=1 ~/PycharmProjects/pestka/bin/capped 6000 900 $BIN $S/sz/$3.susz $2 2>/dev/null | tail -1)
+  r=$(SK_ORDER=$1 SK_POISON=1 "$CAP" 6000 900 $BIN $S/sz/$3.susz $2 2>/dev/null | tail -1)
   echo "poison $1 w$2 $3: $r"; case "$r" in accepted*) ;; *) bad=1;; esac
 }
 run ns 4 init; run ns 4 con-leche; run file 4 init; run ns 8 init

@@ -29,8 +29,8 @@ S=${GRUSZKA_WORK:-${TMPDIR:-/tmp}/gruszka-work}
 BIN=${1:-$D/target/release/gruszka}
 case "$BIN" in /*) ;; *) BIN=$PWD/$BIN;; esac
 SUSZ=${SUSZ:-$(command -v susz || echo $S/m26/susz-0.1.2)}
-P=$HOME/PycharmProjects/pestka
-CAP=$P/bin/capped
+P=${PESTKA:-$D/../pestka}  # a pestka checkout, for its test files
+CAP=$D/scripts/capped
 IB=$D/tests/only/indexbad.py
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT

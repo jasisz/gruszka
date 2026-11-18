@@ -1,4 +1,5 @@
 #!/bin/bash
+CAP=${CAP:-$(cd "$(dirname "$0")" && pwd)/capped}
 # Soundness gates: all small tests, adversarial vectors (bad_* must be
 # rejected, good_* accepted). Prints a summary; exit 1 on a wrong verdict.
 D=${GRUSZKA_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
@@ -16,7 +17,7 @@ for f in $D/tests/adv/*.ndjson; do
   # f*: level tables flushed after every declaration (milestone 19)
   for w in 1 4 ns1 ns4 s1 s4 f1; do
     o=file; sd=0; lf=4194304; case $w in ns*) o=ns; w=${w#ns};; s*) sd=2; w=${w#s};; f*) lf=0; w=${w#f};; esac
-    r=$(SK_LVL_FLUSH=$lf SK_SESSION_DECLS=$sd SK_ORDER=$o ~/PycharmProjects/pestka/bin/capped 2000 20 $BIN $f $w 2>/dev/null | tail -1)
+    r=$(SK_LVL_FLUSH=$lf SK_SESSION_DECLS=$sd SK_ORDER=$o "$CAP" 2000 20 $BIN $f $w 2>/dev/null | tail -1)
     case "$(basename $f)" in
       bad_*) case "$r" in rejected*) ;; *) echo "ADV WRONG w$w: $(basename $f): $r"; bad=1;; esac;;
       good_*) case "$r" in accepted*) ;; *) echo "adv good not accepted w$w: $(basename $f): $r";; esac;;
