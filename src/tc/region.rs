@@ -1223,7 +1223,7 @@ impl Worker {
         }
         if !ok {
             // a copy failed (an arena limit)
-            return decline("value arena limit (2^31 values per declaration)");
+            return decline(VALS_FULL);
         }
         // milestone 38: the next checkpoint waits for new work at least as
         // large as what this one copied, so copying the loop's state again

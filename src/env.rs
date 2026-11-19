@@ -210,12 +210,15 @@ impl Region {
 /// per-session arrays (values, environments, spines). Unlike a `Vec` it
 /// never moves: no reallocation copy (whose old block the allocator purges
 /// lazily, and macOS still counts in max RSS) and a base that stays put.
-/// Pages past the keep size go back at a session end (`shrink`). A push
-/// past `cap` panics (the worker declines the declaration and starts a new
-/// session); `cap` is far past what the memory limits let a run reach.
+/// Pages past the keep size go back at a session end (`shrink`).
+/// Milestone 47: past `soft` (seven eighths of `cap`) the worker's next
+/// slow tick declines (`over_soft`); a push past `cap` itself still panics
+/// (the worker declines the declaration and starts a new session). CFSG's
+/// archiveGiantBytes filled the value table (2^28) and panicked.
 pub struct Slab<T: Copy> {
     p: *mut T,
     len: usize,
+    soft: usize,
     cap: usize,
     /// largest length since pages were last given back
     hw: usize,
@@ -225,7 +228,7 @@ unsafe impl<T: Copy> Sync for Slab<T> {}
 
 impl<T: Copy> Default for Slab<T> {
     fn default() -> Slab<T> {
-        Slab { p: std::ptr::NonNull::dangling().as_ptr(), len: 0, cap: 0, hw: 0 }
+        Slab { p: std::ptr::NonNull::dangling().as_ptr(), len: 0, soft: 0, cap: 0, hw: 0 }
     }
 }
 
@@ -233,12 +236,18 @@ impl<T: Copy> Slab<T> {
     pub fn new(cap: usize) -> Slab<T> {
         let p = vm::reserve(cap * std::mem::size_of::<T>()) as *mut T;
         assert!(!p.is_null(), "cannot reserve a worker table's address range");
-        Slab { p, len: 0, cap, hw: 0 }
+        Slab { p, len: 0, soft: cap - cap / 8, cap, hw: 0 }
     }
     #[cold]
     #[inline(never)]
     fn full(&self) -> ! {
         panic!("a worker table is full ({} entries)", self.cap)
+    }
+    /// Past seven eighths of the room (read at the worker's slow tick, not
+    /// at every push: a check in `push` cost 0.5% instructions on Init)
+    #[inline(always)]
+    pub fn over_soft(&self) -> bool {
+        self.len > self.soft
     }
     #[inline(always)]
     pub fn push(&mut self, x: T) {
@@ -300,6 +309,11 @@ impl<T: Copy> Slab<T> {
                 self.hw = keep / sz;
             }
         }
+    }
+    /// The entries the table can hold at all.
+    #[inline(always)]
+    pub fn cap(&self) -> usize {
+        self.cap
     }
     /// Elements whose pages may be held.
     pub fn capacity(&self) -> usize {

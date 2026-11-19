@@ -64,6 +64,10 @@ impl Spines {
         unsafe { *self.d.get_unchecked(s as usize) }
     }
     #[inline(always)]
+    /// milestone 47: the spine table past seven eighths of its room
+    pub fn over_soft(&self) -> bool {
+        self.d.over_soft()
+    }
     pub fn len(&self, s: u32) -> usize {
         if s == EMPTY { 0 } else { (self.head_word(s) & LEN_MASK) as usize }
     }

@@ -268,6 +268,7 @@ pub(crate) fn dstack_pop() {
     });
 }
 const VALS_CAP: usize = 1 << 28;
+const VALS_FULL: &str = "value arena limit (2^28 values per declaration)";
 const ENVS_CAP: usize = 1 << 28;
 const SLOTS_CAP: usize = 1 << 31;
 /// Milestone 36: regions (region.rs) open once a session's arena holds
@@ -361,6 +362,23 @@ fn lit_key(n: &BigUint) -> u64 {
     let mid = n.iter_u64_digits().nth(len / 2).unwrap_or(0);
     let (a, b) = (d.next().unwrap_or(0), d.next_back().unwrap_or(0));
     hmix(hmix(hmix(hmix(n.bits(), len as u64), a), b), mid)
+}
+/// Milestone 47: Lean's bound on the Nat numerals the kernel takes in or
+/// computes (`LEAN_NAT_MAX_SIZE`, default 128 MiB, kernel v4.34 on): past
+/// it the declaration is refused (a kernel exception), the operation is
+/// not unfolded from its definition.
+const NAT_MAX_BYTES: u64 = 128 << 20;
+const NAT_SIZE_MSG: &str = "the kernel refused a `Nat` numeral because its size exceeds the maximum; increase the LEAN_NAT_MAX_SIZE environment variable to allow it";
+/// The size of `n` as Lean counts it: whole 64-bit limbs, one at least.
+fn nat_bytes(n: &BigUint) -> u64 {
+    n.bits().div_ceil(64).max(1) * 8
+}
+fn nat_sized(n: BigUint) -> Result<BigUint, &'static str> {
+    if nat_bytes(&n) > NAT_MAX_BYTES {
+        Err(NAT_SIZE_MSG)
+    } else {
+        Ok(n)
+    }
 }
 /// Milestone 37: `x * y` skipping the zero 64-bit digits of the shorter
 /// operand (CFSG's bit-sliced tables multiply a long, mostly zero number
@@ -1951,6 +1969,11 @@ impl Worker {
             self.tick_alarm = self.ticks.wrapping_add(1);
             return decline("recursion too deep (stack limit)");
         }
+        // milestone 47: a worker table near its room declines here, before
+        // a push past the room panics
+        if self.vals.over_soft() || self.eloc.over_soft() || self.eslots.over_soft() || self.sp.over_soft() {
+            return decline("a worker table is full");
+        }
         let t = self.ticks;
         if self.probe_on && t == self.probe_end {
             self.probe_end = t.wrapping_add(1);
@@ -2237,8 +2260,10 @@ impl Worker {
     #[inline(always)]
     pub fn mk(&mut self, v: Val) -> R<V> {
         let id = self.vals.len();
-        if id >= (PROJ_BIT - 1) as usize {
-            return decline("value arena limit (2^31 values per declaration)");
+        // milestone 47: the slab's own room (2^28), not 2^31: past it the
+        // slab panicked ("a worker table is full", CFSG's archiveGiantBytes)
+        if id >= self.vals.cap() {
+            return decline(VALS_FULL);
         }
         cn!(P_MADE);
         self.vals.push(Rec { v, m: Memo::NEW });
@@ -2319,8 +2344,8 @@ impl Worker {
                 Ok(*e.get())
             }
             std::collections::hash_map::Entry::Vacant(e) => {
-                if n >= (PROJ_BIT - 1) as usize {
-                    return decline("value arena limit (2^31 values per declaration)");
+                if n >= self.vals.cap() {
+                    return decline(VALS_FULL);
                 }
                 e.insert(n as u32);
                 cn!(P_MADE);
@@ -2559,8 +2584,8 @@ impl Worker {
                 Ok(v)
             }
             Err(slot) => {
-                if self.vals.len() >= (PROJ_BIT - 1) as usize {
-                    return decline("value arena limit (2^31 values per declaration)");
+                if self.vals.len() >= self.vals.cap() {
+                    return decline(VALS_FULL);
                 }
                 let s = self.sp.make(base, extra);
                 let v = self.mk(Val::Neu { head, spine: s })?;
@@ -4017,7 +4042,10 @@ impl Worker {
                 let a = self.whnf(args[0])?;
                 let Some(n) = self.nat_of(a) else { return Ok(None) };
                 let r = if c == k.nat_succ {
-                    n + 1u32
+                    match nat_sized(n + 1u32) {
+                        Ok(r) => r,
+                        Err(why) => return reject(why),
+                    }
                 } else if n.is_zero() {
                     BigUint::zero()
                 } else {
@@ -4040,55 +4068,10 @@ impl Worker {
         // two copies of up to tens of KB per operation on CFSG's bit-sliced
         // tables)
         let (Some(x), Some(y)) = (self.nat_ref(a), self.nat_ref(b)) else { return Ok(None) };
-        let r = match NAT_OPS[op] {
-            "add" => x + y,
-            "sub" => {
-                if x >= y {
-                    x - y
-                } else {
-                    BigUint::zero()
-                }
-            }
-            "mul" => nat_mul(x, y),
-            "div" => {
-                if y.is_zero() {
-                    BigUint::zero()
-                } else {
-                    x / y
-                }
-            }
-            "mod" => {
-                if y.is_zero() {
-                    x.clone()
-                } else {
-                    x % y
-                }
-            }
-            "gcd" => num_integer::Integer::gcd(x, y),
-            "beq" => {
-                let e = x == y;
-                return self.mk_bool(e);
-            }
-            "ble" => {
-                let e = x <= y;
-                return self.mk_bool(e);
-            }
-            "land" => x & y,
-            "lor" => x | y,
-            "xor" => x ^ y,
-            "shiftLeft" => match y.to_u32() {
-                Some(s) if s <= (1 << 24) => x << s,
-                _ => return Ok(None),
-            },
-            "shiftRight" => match y.to_u64() {
-                Some(s) => x >> s,
-                None => BigUint::zero(),
-            },
-            "pow" => match y.to_u32() {
-                Some(e) if e <= (1 << 24) => x.pow(e),
-                _ => return Ok(None),
-            },
-            _ => return Ok(None),
+        let r = match ground::nat_fold(op, x, y) {
+            Ok(ground::NatR::N(r)) => r,
+            Ok(ground::NatR::B(e)) => return self.mk_bool(e),
+            Err(why) => return reject(why),
         };
         Ok(Some(self.mk_nat(r)?))
     }
@@ -5534,7 +5517,15 @@ impl Worker {
                 self.let_skip = self.let_skip.min(n0);
                 r
             }
-            NAT | STR => self.lit_type(k == NAT),
+            NAT | STR => {
+                // Lean's infer_lit: literals entering the kernel are bounded too
+                if let LitVal::Nat(n) = self.lit(self.tp(t)) {
+                    if nat_bytes(n) > NAT_MAX_BYTES {
+                        return reject(NAT_SIZE_MSG);
+                    }
+                }
+                self.lit_type(k == NAT)
+            }
             PROJ => {
                 let s = self.ta(t);
                 let st = self.infer(s, env, ls, check)?;

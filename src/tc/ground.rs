@@ -597,15 +597,17 @@ fn top_app(m: &Gm) -> bool {
     m.el.len() > m.base && matches!(m.el.last(), Some(El::App(_)))
 }
 
-/// The kernel's Nat operation `op` (index into NAT_OPS) on literals:
-/// None where the kernel does not compute it (it unfolds the definition).
+/// The kernel's Nat operation `op` (index into NAT_OPS) on literals, or
+/// the reason Lean's kernel refuses it (milestone 47, Lean's rule from
+/// v4.34: a count past 32 bits, or a result past `NAT_MAX_BYTES`, is a
+/// kernel exception; the operation is never unfolded from its definition).
 pub(super) enum NatR {
     N(BigUint),
     B(bool),
 }
-pub(super) fn nat_fold(op: usize, x: &BigUint, y: &BigUint) -> Option<NatR> {
-    Some(NatR::N(match NAT_OPS[op] {
-        "add" => x + y,
+pub(super) fn nat_fold(op: usize, x: &BigUint, y: &BigUint) -> Result<NatR, &'static str> {
+    Ok(NatR::N(match NAT_OPS[op] {
+        "add" => nat_sized(x + y)?,
         "sub" => {
             if x >= y {
                 x - y
@@ -613,7 +615,14 @@ pub(super) fn nat_fold(op: usize, x: &BigUint, y: &BigUint) -> Option<NatR> {
                 BigUint::zero()
             }
         }
-        "mul" => nat_mul(x, y),
+        "mul" => {
+            // the product has at least bits(x) + bits(y) - 1 bits: past
+            // the bound it is refused before it is made
+            if !x.is_zero() && !y.is_zero() && (x.bits() + y.bits() - 1).div_ceil(8) > NAT_MAX_BYTES {
+                return Err(NAT_SIZE_MSG);
+            }
+            nat_sized(nat_mul(x, y))?
+        }
         "div" => {
             if y.is_zero() {
                 BigUint::zero()
@@ -629,24 +638,41 @@ pub(super) fn nat_fold(op: usize, x: &BigUint, y: &BigUint) -> Option<NatR> {
             }
         }
         "gcd" => num_integer::Integer::gcd(x, y),
-        "beq" => return Some(NatR::B(x == y)),
-        "ble" => return Some(NatR::B(x <= y)),
+        "beq" => return Ok(NatR::B(x == y)),
+        "ble" => return Ok(NatR::B(x <= y)),
         "land" => x & y,
         "lor" => x | y,
         "xor" => x ^ y,
-        "shiftLeft" => match y.to_u32() {
-            Some(s) if s <= (1 << 24) => x << s,
-            _ => return None,
-        },
+        "shiftLeft" => {
+            if x.is_zero() {
+                // Lean reads no count for 0 <<< _
+                BigUint::zero()
+            } else {
+                let Some(k) = y.to_u32() else {
+                    return Err("the kernel refused to evaluate `Nat.shiftLeft` because its second argument does not fit in a 32-bit unsigned integer");
+                };
+                // Lean's estimate: size(x) + k/8 + 1 bytes
+                if nat_bytes(x) + k as u64 / 8 + 1 > NAT_MAX_BYTES {
+                    return Err(NAT_SIZE_MSG);
+                }
+                x << k
+            }
+        }
         "shiftRight" => match y.to_u64() {
             Some(s) => x >> s,
             None => BigUint::zero(),
         },
-        "pow" => match y.to_u32() {
-            Some(e) if e <= (1 << 24) => x.pow(e),
-            _ => return None,
-        },
-        _ => return None,
+        "pow" => {
+            let Some(k) = y.to_u32() else {
+                return Err("the kernel refused to evaluate `Nat.pow` because its second argument does not fit in a 32-bit unsigned integer");
+            };
+            // Lean's estimate: size(x) * k bytes, compared by division
+            if k != 0 && *x > BigUint::from(1u32) && nat_bytes(x) > NAT_MAX_BYTES / k as u64 {
+                return Err("the kernel refused to evaluate `Nat.pow` because the result would exceed the maximum numeral size; increase the LEAN_NAT_MAX_SIZE environment variable to allow it");
+            }
+            x.pow(k)
+        }
+        _ => unreachable!("NAT_OPS"),
     }))
 }
 
@@ -1941,7 +1967,10 @@ impl Worker {
             Fr::Nat1 { row, llr, op, x, base } => {
                 m.base = base;
                 match (&*w, op) {
-                    (Obj::Nat(n), SUCC) => C::Ob(mk(Obj::Nat(n + 1u32))),
+                    (Obj::Nat(n), SUCC) => match nat_sized(n + 1u32) {
+                        Ok(r) => C::Ob(mk(Obj::Nat(r))),
+                        Err(why) => return gstop(why),
+                    },
                     (Obj::Nat(n), _) => C::Ob(mk(Obj::Nat(if n.is_zero() { BigUint::zero() } else { BigUint::from(n.bits() - 1) }))),
                     (_, SUCC) => C::Ob(mk(Obj::Con { row, llr, args: vec![x], ctor: true, part: false })),
                     _ => {
@@ -1964,7 +1993,11 @@ impl Worker {
             Fr::NatB { row, llr, op, a, x, y, base } => {
                 m.base = base;
                 let r = match (&*a, &*w) {
-                    (Obj::Nat(p), Obj::Nat(q)) => nat_fold(op as usize, p, q),
+                    (Obj::Nat(p), Obj::Nat(q)) => match nat_fold(op as usize, p, q) {
+                        Ok(r) => Some(r),
+                        // refused by Lean's rule: the kernel decides
+                        Err(why) => return gstop(why),
+                    },
                     _ => None,
                 };
                 match r {
