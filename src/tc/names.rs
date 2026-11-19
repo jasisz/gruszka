@@ -37,9 +37,9 @@ const T_VAL: u8 = 14;
 pub struct Names {
     nodes: FxHashMap<(u8, u32, u32), u32>,
     /// value -> name (NONE: over budget once; not retried)
-    of_val: FxHashMap<V, u32>,
+    pub(super) of_val: FxHashMap<V, u32>,
     /// (term, env, ls, depth) -> name
-    of_term: FxHashMap<(u64, u64), u32>,
+    pub(super) of_term: FxHashMap<(u64, u64), u32>,
     pub whnf: FxHashMap<u32, V>,
     pub core: FxHashMap<u64, V>,
     pub unfold: FxHashMap<u32, V>,
@@ -79,6 +79,16 @@ pub struct Names {
 }
 
 impl Names {
+    /// Milestone 37: bytes held by the tables (room included)
+    pub fn held_bytes(&self) -> usize {
+        fn h<K, W>(m: &FxHashMap<K, W>) -> usize {
+            m.capacity() * (std::mem::size_of::<(K, W)>() + 1)
+        }
+        h(&self.nodes) + h(&self.of_val) + h(&self.of_term) + h(&self.whnf) + h(&self.core) + h(&self.unfold)
+            + h(&self.infer) + h(&self.eq) + self.flags.capacity() + h(&self.peq)
+            + self.peq_heads.capacity() * 9 + h(&self.plits_n) + h(&self.plits_s)
+            + self.plits_n.keys().map(|n| (n.bits() / 8) as usize).sum::<usize>()
+    }
     /// Empties the tables for the next declaration. Their room is kept (a
     /// heavy declaration tends to follow another) up to `KEEP` entries each.
     pub fn reset(&mut self) {
@@ -92,7 +102,7 @@ impl Names {
                 m.clear();
             }
         }
-        if self.nodes.len() > PNAMES_CAP {
+        if self.nodes.len() > super::capped(PNAMES_CAP) {
             self.flush_persistent();
         }
         clr(&mut self.of_val);
@@ -199,7 +209,9 @@ impl Worker {
         let n = match self.val(v) {
             Val::Thunk { term, env, ls } => self.nt(term, env, ls, 0),
             Val::Clo { term, env, ls } => self.nt(term, env, ls, 0),
-            Val::CloI { .. } => self.nm_node(T_VAL, v, 0),
+            // milestone 36: with the rollback epoch (a value id is reused
+            // after a region's rollback)
+            Val::CloI { .. } => self.nm_node(T_VAL, v, self.reg_epoch),
             Val::Sort(l) => self.nm_node(T_SORT, l, 0),
             Val::Lit(i) => self.nm_lit(i),
             Val::Neu { head, spine } => {
@@ -233,6 +245,7 @@ impl Worker {
         };
         if n != NONE {
             self.nm.of_val.insert(v, n);
+            self.ulog(Undo::NmOfVal(v));
             self.nm.made += 1;
         }
         n
@@ -337,6 +350,7 @@ impl Worker {
                 self.nm.term_flushes += 1;
             }
             self.nm.of_term.insert(key, n);
+            self.ulog(Undo::NmOfTerm(key));
         }
         n
     }

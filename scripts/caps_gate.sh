@@ -4,7 +4,8 @@ CAP=${CAP:-$(cd "$(dirname "$0")" && pwd)/capped}
 # A block arena of SK_SLAB_IDS ids and worker slabs of SK_TABLE_CAP entries
 # must make a declaration decline (never crash, never accept a bad file):
 # Init at 1 and 4 workers with each cap declines with the expected
-# message, and the bad vectors are still rejected or declined.
+# message (SK_SLAB_IDS caps the overflow arenas too), and the bad vectors
+# are still rejected or declined.
 # Usage: caps_gate.sh KNOBS_BIN; prints CAPSDONE bad=N.
 D=${GRUSZKA_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
 S=${GRUSZKA_WORK:-${TMPDIR:-/tmp}/gruszka-work}
@@ -21,6 +22,19 @@ done
 for w in 4 8; do
   r=$(SK_POISON=1 SK_SLAB_IDS=131072 "$CAP" 4000 120 $BIN $S/sz/init.susz $w 2>/dev/null | tail -1)
   echo "slab ids 131072 poison w$w: $r"; case "$r" in accepted*) ;; *) bad=1;; esac
+done
+# milestone 35: a declaration whose blocks do not fit its worker's arena
+# runs again in the overflow arenas, so the verdict does not depend on the
+# arena size (FLT at 192 workers declined): slabs of 8192 ids with the
+# overflow arenas at their default size, Init and con-leche accepted
+# poisoned at 4 and 8 workers, and declarations ran there
+for c in init con-leche; do
+  for w in 4 8; do
+    o=$(SK_POISON=1 SK_SLAB_IDS=8192 SK_BIG_IDS=0 "$CAP" 6000 600 $BIN $S/sz/$c.susz $w 2>&1)
+    r=$(echo "$o" | tail -1); n=$(echo "$o" | awk '/^note: worker .* overflow/ {n += $4} END {print n + 0}')
+    echo "slab ids 8192, overflow default, poison $c w$w: $r ($n overflow runs)"
+    case "$r" in accepted*) [ "$n" -gt 0 ] || bad=1;; *) bad=1;; esac
+  done
 done
 for f in $D/tests/adv/bad_*.ndjson; do
   for env in SK_SLAB_IDS=8192 SK_TABLE_CAP=64; do

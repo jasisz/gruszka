@@ -3,7 +3,8 @@ CAP=${CAP:-$(cd "$(dirname "$0")" && pwd)/capped}
 # Every gate of a kept step: small tests (default order, plain and poisoned;
 # plain in file order) and vectors (plain and SK_POISON=1;
 # vectors in file and namespace order), Init and con-leche poisoned at 4
-# workers in the default (namespace) order, Init poisoned in file order at
+# workers in the default (namespace) order (Init also with sessions of 2
+# declarations), Init poisoned in file order at
 # 4 workers and in namespace order at 8, verdict parity with Pestka on six
 # corpora in both orders.
 # Usage: gates_all.sh [BIN] > OUT; prints GATESDONE, exit 1 on a wrong verdict.
@@ -27,6 +28,10 @@ run() { # ORDER WORKERS CORPUS
   echo "poison $1 w$2 $3: $r"; case "$r" in accepted*) ;; *) bad=1;; esac
 }
 run ns 4 init; run ns 4 con-leche; run file 4 init; run ns 8 init
+# milestone 35: sessions cut every 2 declarations (a table stamped with an
+# old session's ids is read in the next one: mutant dm_gen)
+r=$(SK_SESSION_DECLS=2 SK_ORDER=ns SK_POISON=1 "$CAP" 6000 900 $BIN $S/sz/init.susz 4 2>/dev/null | tail -1)
+echo "poison ns w4 init, sessions of 2: $r"; case "$r" in accepted*) ;; *) bad=1;; esac
 SK_ORDER=ns $D/scripts/parity.sh $BIN || bad=1
 SK_ORDER=file $D/scripts/parity.sh $BIN || bad=1
 echo "GATESDONE bad=$bad"

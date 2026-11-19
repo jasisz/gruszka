@@ -83,6 +83,13 @@ pub struct IndMemo {
     /// steps walked unmemoized; u32::MAX: memo disabled
     n: u32,
 }
+impl IndMemo {
+    /// Milestone 37: bytes held (room included)
+    pub fn held_bytes(&self) -> usize {
+        self.occ.capacity() * 14 + self.occv.capacity() * 6 + self.scan.capacity() * 17
+            + self.eq.capacity() * (std::mem::size_of::<(Sx, Sx)>() + 1)
+    }
+}
 /// release-da memoizes from the first step, so the gates (small blocks)
 /// run the memoized walks too
 const IND_MEMO_AFTER: u32 = if cfg!(debug_assertions) { 0 } else { 4096 };

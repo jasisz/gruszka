@@ -28,6 +28,9 @@ pub struct Spines {
     tab: Vec<(u32, u32)>,
     n: usize,
     bits: u32,
+    /// milestone 36: growths of `tab` (a region's slots are undone only
+    /// when it did not grow since the region opened)
+    pub grows: u32,
 }
 
 #[inline(always)]
@@ -92,6 +95,10 @@ impl Spines {
     pub fn bytes(&self) -> usize {
         self.d.len() * 4 + self.n * 16
     }
+    /// milestone 37: bytes held (room included)
+    pub fn held_bytes(&self) -> usize {
+        self.d.held_bytes() + self.tab.capacity() * 8
+    }
 
     /// Empties the table, keeping at most `keep` bytes of room for each part.
     pub fn clear(&mut self, keep: usize) {
@@ -128,6 +135,7 @@ impl Spines {
     }
 
     fn grow(&mut self, vals: &[super::Rec]) {
+        self.grows = self.grows.wrapping_add(1);
         let old = std::mem::take(&mut self.tab);
         let len = (old.len() * 2).max(1 << 10);
         self.tab = vec![FREE; len];
@@ -214,9 +222,94 @@ impl Spines {
         id as u32
     }
 
-    /// Records the new neutral value `v` at the slot `find` returned.
-    pub fn add(&mut self, slot: Slot, v: V) {
+    /// Records the new neutral value `v` at the slot `find` returned
+    /// (returned: milestone 36 logs it).
+    pub fn add(&mut self, slot: Slot, v: V) -> usize {
         self.tab[slot.0] = (slot.1, v);
         self.n += 1;
+        slot.0
+    }
+
+    /// Milestone 36 (checks): the values in the table.
+    pub fn entries(&self) -> impl Iterator<Item = u32> + '_ {
+        self.tab.iter().filter(|e| e.1 != EMPTY).map(|e| e.1)
+    }
+    /// Milestone 36: words of the spine arena (a region's mark).
+    pub fn words(&self) -> usize {
+        self.d.len()
+    }
+    /// Milestone 36: the spines past word `n` go (a region's rollback; the
+    /// table no longer holds their values: `unadd` or `rebuild_below`).
+    pub fn truncate(&mut self, n: usize) {
+        self.d.truncate(n);
+    }
+    /// Milestone 36: frees the slot `add` took. Undone in the reverse order
+    /// of the adds, with no growth in between, linear probing returns to
+    /// the exact table before them.
+    pub fn unadd(&mut self, slot: usize) {
+        debug_assert!(self.tab[slot].1 != EMPTY);
+        self.tab[slot] = FREE;
+        self.n -= 1;
+    }
+    /// Milestone 37: takes the neutral value `v` out of the table, if there
+    /// (backward-shift deletion: later entries of its probe run move up, so
+    /// the table is as if `v` had never been added). Moves slots: `grows`
+    /// is bumped, so open regions do not undo by slot any more.
+    pub fn remove_value(&mut self, vals: &[super::Rec], v: V) {
+        let Val::Neu { head, spine } = vals[v as usize].v else { return };
+        if self.tab.is_empty() {
+            return;
+        }
+        let mask = self.tab.len() - 1;
+        let h = self.hash(head, spine, &[]);
+        let mut i = (h >> (64 - self.bits)) as usize;
+        loop {
+            let e = self.tab[i].1;
+            if e == EMPTY {
+                return;
+            }
+            if e == v {
+                break;
+            }
+            i = (i + 1) & mask;
+        }
+        self.grows = self.grows.wrapping_add(1);
+        self.n -= 1;
+        let mut k = i;
+        loop {
+            k = (k + 1) & mask;
+            let (t, x) = self.tab[k];
+            if x == EMPTY {
+                self.tab[i] = FREE;
+                return;
+            }
+            let Val::Neu { head: hx, spine: sx } = vals[x as usize].v else { unreachable!() };
+            let home = (self.hash(hx, sx, &[]) >> (64 - self.bits)) as usize;
+            // x may move to i unless its home lies cyclically in (i, k]
+            if (k.wrapping_sub(home) & mask) >= (k.wrapping_sub(i) & mask) {
+                self.tab[i] = (t, x);
+                i = k;
+            }
+        }
+    }
+    /// Milestone 36: the table with only the values below `vm` (after a
+    /// growth inside a region: its slots moved).
+    pub fn rebuild_below(&mut self, vals: &[super::Rec], vm: u32) {
+        let old = std::mem::take(&mut self.tab);
+        let len = old.len().max(1 << 10);
+        self.tab = vec![FREE; len];
+        self.bits = len.trailing_zeros();
+        self.n = 0;
+        let mask = len - 1;
+        for &(_, v) in old.iter().filter(|e| e.1 != EMPTY && e.1 < vm) {
+            let Val::Neu { head, spine } = vals[v as usize].v else { unreachable!() };
+            let h = self.hash(head, spine, &[]);
+            let mut j = (h >> (64 - self.bits)) as usize;
+            while self.tab[j].1 != EMPTY {
+                j = (j + 1) & mask;
+            }
+            self.tab[j] = (h as u32, v);
+            self.n += 1;
+        }
     }
 }

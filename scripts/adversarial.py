@@ -1545,3 +1545,39 @@ for good in (True, False):
     w.defn(w.name("t"), w.app(w.app(w.app(w.const(Pr), iu), iv), qq), val, lp=(uu, vv), h={"regular": 1})
     w.save(f"{out}/{'good' if good else 'bad'}_m31_infer_name_levels.ndjson")
 print("milestone 31 inference name level vectors written")
+# ---- milestone 34: a lambda's type at an argument from the type its body
+# got under the lambda's own variable, when that type does not mention the
+# variable (bind_body, lam_type_at). Q : N -> Prop, q : (x : N) -> Q x,
+# I : (p : Prop) -> p -> p := fun p h => h, G : N -> N -> N.
+# - good_m34_lam_type_ladder: def t : N := (fun x => (fun y => G x y) n1) n2
+#   (the body types are N: from the cache);
+# - good_m34_lam_type_dep: def t : Q n1 := (fun x => q x) n1 (the body's
+#   type Q x mentions x: inferred again at n1);
+# - bad_m34_lam_type_escape: def L : (x : N) -> Q x := T, T = fun x => q x
+#   (checking T gives its variable y and the body's type Q y), then
+#   theorem t : (m : N) -> Q m := fun m => I (Q m) (T n1): m opens the same
+#   variable y (out of scope again); T n1 has type Q n1, not Q m. Taking the
+#   cached Q y without the mention test accepts it.
+def m34_base():
+    w, prop, f = base()
+    one, cN, c1, c2 = nat_like(w)
+    x = w.name("x"); y = w.name("y"); p = w.name("p"); h = w.name("h"); m = w.name("m")
+    Q = w.name("Q"); w.axiom(Q, w.pi(x, cN, prop))
+    q = w.name("q"); w.axiom(q, w.pi(x, cN, w.app(w.const(Q), w.bvar(0))))
+    I = w.name("I"); w.defn(I, w.pi(p, prop, w.pi(h, w.bvar(0), w.bvar(1))), w.lam(p, prop, w.lam(h, w.bvar(0), w.bvar(0))), h={"regular": 1})
+    G = w.name("G"); w.axiom(G, w.pi(x, cN, w.pi(y, cN, cN)))
+    return w, prop, cN, c1, c2, Q, q, I, G, x, y, m
+w, prop, cN, c1, c2, Q, q, I, G, x, y, m = m34_base()
+inner = w.app(w.lam(y, cN, w.app(w.app(w.const(G), w.bvar(1)), w.bvar(0))), c1)
+w.defn(w.name("t"), cN, w.app(w.lam(x, cN, inner), c2), h={"regular": 1})
+w.save(f"{out}/good_m34_lam_type_ladder.ndjson")
+w, prop, cN, c1, c2, Q, q, I, G, x, y, m = m34_base()
+w.defn(w.name("t"), w.app(w.const(Q), c1), w.app(w.lam(x, cN, w.app(w.const(q), w.bvar(0))), c1), h={"regular": 1})
+w.save(f"{out}/good_m34_lam_type_dep.ndjson")
+w, prop, cN, c1, c2, Q, q, I, G, x, y, m = m34_base()
+T = w.lam(x, cN, w.app(w.const(q), w.bvar(0)))
+w.defn(w.name("L"), w.pi(x, cN, w.app(w.const(Q), w.bvar(0))), T, h={"regular": 1})
+body = w.app(w.app(w.const(I), w.app(w.const(Q), w.bvar(0))), w.app(T, c1))
+w.thm(w.name("t"), w.pi(m, cN, w.app(w.const(Q), w.bvar(0))), w.lam(m, cN, body))
+w.save(f"{out}/bad_m34_lam_type_escape.ndjson")
+print("milestone 34 lambda type vectors written")

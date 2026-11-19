@@ -28,8 +28,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 mod frames;
+mod ground;
 mod names;
+mod region;
 mod spines;
+use region::Undo;
 use spines::Spines;
 
 /// Facts shared by all workers (kept across declarations, stamped with
@@ -45,14 +48,40 @@ pub struct Shared {
     checked: Vec<AtomicU64>,
     /// level parameter lists (sorted canonical names), interned
     lps: Mutex<(Vec<Box<[u32]>>, FxHashMap<Box<[u32]>, u32>)>,
+    /// Milestone 37: properties of the file per constant row, found by
+    /// whichever worker asks first (each was a per-worker array: 26 bytes
+    /// per constant and worker, `unused` written in full at start):
+    /// a definition's leading lambdas + 1 (0 unknown, 255 none) and the
+    /// positions its body never reads (`unused_args`);
+    unused_l: Vec<std::sync::atomic::AtomicU8>,
+    unused_m: Vec<AtomicU64>,
+    /// the explicit-binder mask of the type (`explicit_mask`, 0 unknown);
+    explicit: Vec<AtomicU64>,
+    /// `abbr_shape_of` (0 unknown); the SH_* bits of `cases_shape` and
+    /// `match_shape`
+    abbr: Vec<std::sync::atomic::AtomicU8>,
+    shape: Vec<std::sync::atomic::AtomicU8>,
+}
+
+/// A vector of zeroed atomics from zeroed memory (pages mapped when first
+/// written).
+fn zeroed<A, T: Copy + Default>(n: usize) -> Vec<A> {
+    assert_eq!(std::mem::size_of::<A>(), std::mem::size_of::<T>());
+    let mut v = std::mem::ManuallyDrop::new(vec![T::default(); n]);
+    unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut A, v.len(), v.capacity()) }
 }
 
 impl Shared {
-    pub fn new(main_len: usize) -> Shared {
-        // zeroed memory from the allocator: pages are mapped when first written
-        let mut v = std::mem::ManuallyDrop::new(vec![0u64; main_len]);
-        let checked = unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut AtomicU64, v.len(), v.capacity()) };
-        Shared { checked, lps: Mutex::new((Vec::new(), FxHashMap::default())) }
+    pub fn new(main_len: usize, consts: usize) -> Shared {
+        Shared {
+            checked: zeroed::<AtomicU64, u64>(main_len),
+            lps: Mutex::new((Vec::new(), FxHashMap::default())),
+            unused_l: zeroed::<std::sync::atomic::AtomicU8, u8>(consts),
+            unused_m: zeroed::<AtomicU64, u64>(consts),
+            explicit: zeroed::<AtomicU64, u64>(consts),
+            abbr: zeroed::<std::sync::atomic::AtomicU8, u8>(consts),
+            shape: zeroed::<std::sync::atomic::AtomicU8, u8>(consts),
+        }
     }
 }
 
@@ -67,6 +96,12 @@ pub enum Stop {
     /// milestone 17: an argument probe ran out of its step budget (caught
     /// by the probe; never leaves it)
     Budget,
+    /// milestone 38: a whnf too deeply nested in other whnfs, handed up to
+    /// the outermost (`deep_v`; caught there, never leaves it)
+    Deep,
+    /// milestone 39: the ground machine gives a comparison or a whnf back
+    /// to the kernel (caught where the run began; never leaves it)
+    Ground,
 }
 pub type R<T> = Result<T, Stop>;
 
@@ -94,11 +129,46 @@ pub fn decline<T>(s: impl Into<String>) -> R<T> {
 }
 
 /// Per-declaration tables keep their room for the next declaration, up to
-/// this many bytes each (16 MiB): past it a worker that
-/// met one heavy declaration would hold its memory to the end of the run.
-const KEEP_BYTES: usize = 16 << 20;
+/// this many bytes each: past it a worker that met one heavy declaration
+/// would hold its memory to the end of the run. Milestone 37: 4 MiB (half
+/// a session, `SESSION_MIB`), was 16 MiB; mathlib w4 (knobs) 16 / 4 / 1 /
+/// 0.25 MiB: 419.5 / 419.4 / 421.5 / 434.0 G.
+const KEEP_BYTES: usize = 4 << 20;
 fn keep_bytes() -> usize {
-    KEEP_BYTES
+    static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *K.get_or_init(|| {
+        let k = if KNOBS {
+            std::env::var("SK_KEEP_KIB").ok().and_then(|s| s.parse::<usize>().ok()).map_or(KEEP_BYTES, |k| k << 10)
+        } else {
+            KEEP_BYTES
+        };
+        // not divided by `capped`: room is not kept knowledge, and a
+        // worker's tables grew again at every session (mathlib w4 with the
+        // caps of 64 workers: +3.5% with this room divided, +1.4% without)
+        k
+    })
+}
+
+/// Milestone 37: the worker count the caps of per-worker tables were set
+/// at. With more workers each worker's caps are divided by `workers /
+/// CAP_WORKERS`, so the memory all workers keep across declarations does
+/// not grow past what CAP_WORKERS workers keep (FLT on AWS: 28.7 GB at 16
+/// workers, 73.8 GB at 192); never below 1/64 of a cap.
+const CAP_WORKERS: usize = 4;
+static CAP_DIV: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+/// Called once before the workers start.
+pub fn set_workers(n: usize) {
+    let mut d = n.div_ceil(CAP_WORKERS).clamp(1, 64);
+    if KNOBS {
+        if let Some(x) = std::env::var("SK_CAP_DIV").ok().and_then(|s| s.parse::<usize>().ok()) {
+            d = x.clamp(1, 64);
+        }
+    }
+    CAP_DIV.store(d, Ordering::Relaxed);
+}
+/// A per-worker cap, divided as `set_workers` says.
+fn capped(c: usize) -> usize {
+    c / CAP_DIV.load(Ordering::Relaxed)
 }
 
 /// A per-declaration table that can be emptied and shrunk.
@@ -166,9 +236,70 @@ fn clear_slab<T: Copy>(v: &mut Slab<T>) {
 /// Room of a worker's value arena (10 GiB of address space at 40 bytes a
 /// value), environments (2 GiB each for runs and masks) and environment
 /// slots (8 GiB); far past what the memory limits let one session reach.
+thread_local! {
+    /// knobs, SK_UNFOLD_HIST=1: unfoldings per constant row (diagnostics)
+    pub static UHIST: std::cell::RefCell<Option<FxHashMap<u32, u64>>> = std::cell::RefCell::new(
+        if KNOBS && std::env::var_os("SK_UNFOLD_HIST").is_some() { Some(FxHashMap::default()) } else { None });
+    static TRACE: std::cell::Cell<u32> = std::cell::Cell::new(std::env::var("SK_TRACE").ok().and_then(|s| s.parse().ok()).unwrap_or(0));
+    static TDEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// milestone 41, knobs SK_DSTACK=1: the conversions and whnfs in
+    /// progress (kind, sides, ticks at entry), printed with SK_DIAG_SECS
+    pub(crate) static DSTACK_ON: bool = std::env::var_os("SK_DSTACK").is_some();
+    pub(crate) static DSTACK: std::cell::RefCell<Vec<(u8, V, V, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+#[inline(always)]
+pub(crate) fn dstack_on() -> bool {
+    KNOBS && DSTACK_ON.with(|x| *x)
+}
+pub(crate) fn dstack_push(k: u8, a: V, b: V, t: u32) {
+    DSTACK.with(|d| d.borrow_mut().push((k, a, b, t)));
+}
+pub(crate) fn dstack_pop() {
+    DSTACK.with(|d| {
+        d.borrow_mut().pop();
+    });
+}
 const VALS_CAP: usize = 1 << 28;
 const ENVS_CAP: usize = 1 << 28;
 const SLOTS_CAP: usize = 1 << 31;
+/// Milestone 36: regions (region.rs) open once a session's arena holds
+/// this many values, and roll back only past `REGION_MIN` values made.
+const REGION_AT: usize = 1 << 22;
+const REGION_MIN: usize = 1 << 8;
+const REGION_REACH8: usize = 2;
+const REGION_LIT_KEEP: usize = 512;
+const REGION_LIT_AT: usize = 64;
+/// milestone 37: see `reg_fwd`
+const REGION_FWD: u8 = 1;
+const REGION_FRONT: u8 = 0;
+const REGION_PIN: bool = true;
+/// milestone 29/37: entries of the per-worker memos of MAIN terms'
+/// variables (`wide_main`, `uses_main`) before they start over
+const WIDE_CAP: usize = 1 << 20;
+const REGION_LOGK: usize = 0;
+const REGION_GROW: usize = 2;
+/// Milestone 38: a whnf miss nested in other whnfs past this fraction of
+/// the worker's stack is handed up to the outermost whnf (`whnf_outer`),
+/// which has the rest of the stack to work it out
+const DEEP_DIV: usize = 2;
+/// milestone 39: a ground machine run's first step budget (a declaration
+/// doubles it at every run that runs out)
+const GROUND_FUEL: u64 = 1 << 20;
+/// milestone 39: session values past which closed computations go to the
+/// ground machine (16 x REGION_AT)
+const GROUND_AT: usize = 1 << 26;
+/// milestone 40: what a memo lookup of the ground machine costs, in steps
+/// of the machine (a hash of the key and a probe, about the time of a few
+/// steps); a delayed term is looked up when its forcings save more
+const MEMO_COST: u64 = 4;
+
+const DEEP_WHNF: u32 = 8192;
+/// Milestone 38: ticks per level past which a handed-up attempt doubles the
+/// bound (a quarter of `GHOST_TICKS`, a rollback's own cost)
+const DEEP_TICKS: u32 = region::GHOST_TICKS / 4;
+/// milestone 36: `args_refuted` on, and its budget per argument pair
+const ARGS_REFUTE: bool = true;
+const REFUTE_TICKS: u32 = 256;
 /// knobs builds: SK_TABLE_CAP=n caps every slab at n entries (to test the
 /// full path: the declaration declines, the run goes on)
 fn slab_cap(c: usize) -> usize {
@@ -191,10 +322,61 @@ const LSUB_MASK: usize = (1 << 12) - 1;
 /// milestone 25: an argument a binder body never reads is not made a value
 const ARG_SKIP: bool = true;
 const PF_HOLE: bool = true;
+/// Milestone 34: values the walks through environments and spines
+/// (`over_let`, `mentions_fv`) visit before they give up.
+const MENTION_FUEL: u32 = 256;
+/// Milestone 34: ticks the arguments of a literal fold over a let value
+/// may take before the fold is skipped (`let_skip_fold`).
+const LET_PROBE: u32 = 1024;
+/// Milestone 41: the budget of CommonHeadFirst in ticks (a lazy delta loop
+/// past it tries a common head). Sweep (con-leche / Init w1, G): off
+/// 45.72 / 22.49, 256: 50.59 / 24.93, 1024: 46.47 / 22.57, 4096: 45.40 /
+/// 22.47, 16384: 45.47 / 22.48; CFSG's three walls pass at each.
+const HEAD_PROBE: u32 = 4096;
 const LS_IDENT: bool = true;
 const LS_CLASS: bool = true;
 
 pub type V = u32;
+static BIG_ZERO: BigUint = BigUint::ZERO;
+/// Milestone 37: `x * y` skipping the zero 64-bit digits of the shorter
+/// operand (CFSG's bit-sliced tables multiply a long, mostly zero number
+/// by a short one); num-bigint's product otherwise.
+fn nat_mul(x: &BigUint, y: &BigUint) -> BigUint {
+    let (l, s) = if x.bits() >= y.bits() { (x, y) } else { (y, x) };
+    let sd: Vec<u64> = s.iter_u64_digits().collect();
+    // only worth it for a short factor of a long one
+    if sd.len() > 4 || l.bits() < 64 * 32 {
+        return x * y;
+    }
+    let ld: Vec<u64> = l.iter_u64_digits().collect();
+    let mut out = vec![0u64; ld.len() + sd.len()];
+    for (j, &b) in sd.iter().enumerate() {
+        if b == 0 {
+            continue;
+        }
+        let mut carry = 0u128;
+        for (i, &a) in ld.iter().enumerate() {
+            if a == 0 && carry == 0 {
+                continue;
+            }
+            let t = a as u128 * b as u128 + out[i + j] as u128 + carry;
+            out[i + j] = t as u64;
+            carry = t >> 64;
+        }
+        let mut k = ld.len() + j;
+        while carry != 0 {
+            let t = out[k] as u128 + carry;
+            out[k] = t as u64;
+            carry = t >> 64;
+            k += 1;
+        }
+    }
+    let mut bytes = Vec::with_capacity(out.len() * 8);
+    for d in &out {
+        bytes.extend_from_slice(&d.to_le_bytes());
+    }
+    BigUint::from_bytes_le(&bytes)
+}
 /// Spines and argument lists on the stack while short (no allocation).
 pub type SpineVec = smallvec::SmallVec<[u32; 8]>;
 pub type ArgVec = smallvec::SmallVec<[V; 8]>;
@@ -459,10 +641,51 @@ pub struct Stats {
     /// built-in readings (Bool, Nat constructors) met before declared
     pub known_miss: u64,
     pub sess_resets: u64,
+    /// milestone 35: declarations run again in the overflow arenas
+    pub big_runs: u64,
     pub scratch_decls: u64,
     pub evals: u64,
     pub interns: u64,
     pub infer_calls: u64,
+    /// milestone 36: regions opened, rolled back, kept (the result reached
+    /// too much), values dropped by rollbacks, values copied out
+    pub reg: [u64; 5],
+    /// milestone 37: regions opened on work found done again; rollbacks
+    /// refused because pinned work did not fit
+    pub reg_redo: u64,
+    pub reg_pin_kept: u64,
+    /// milestone 37: attempts skipped (`reg_grow`)
+    pub reg_skip: u64,
+    /// milestone 38: whnfs handed up to the outermost (`Stop::Deep`)
+    pub deep_up: u64,
+    pub ckpts: u64,
+    pub late: u64,
+    pub late_ld: u64,
+    /// milestone 37: log entries read by attempts
+    pub reg_seg: u64,
+    /// milestone 39: ground machine runs, answered true, handed to the
+    /// kernel, steps handed to the kernel, machine steps, pairs compared by
+    /// the kernel, values imported, values exported
+    pub gr: [u64; 10],
+    /// milestone 41: pairs with a side that is a proof by its recursor's
+    /// motive, compared by their types before whnf_core (taken, equal)
+    pub pfirst: [u64; 2],
+    /// milestone 41, knobs (SK_KTRAP): K-like recursor checks on a closed
+    /// major whose type is not the constructor's syntactically (count,
+    /// kernel ticks spent in their comparisons)
+    pub ktrap: [u64; 2],
+    /// milestone 41: NatFoldWaits (same operation compared, equal by
+    /// operands, other side unfolded)
+    pub natwait: [u64; 3],
+    /// milestone 41: CommonHeadFirst (lazy delta past its budget, decided
+    /// by a common head)
+    pub headprobe: [u64; 6],
+}
+
+pub(crate) enum NatWait {
+    Fold,
+    Equal,
+    Next(V, V),
 }
 
 pub struct Worker {
@@ -508,6 +731,12 @@ pub struct Worker {
     pub fv_ty: Vec<V>,
     /// argument terms of the applications being evaluated (see `eval`)
     argstack: Vec<u32>,
+    /// milestone 34: values of the `let`s whose bodies are being inferred
+    /// (Lean's let variables in the local context; see `over_let`)
+    let_vals: Vec<V>,
+    /// milestone 34: `let_vals` below this index skip the fold without a
+    /// probe: one over them ran out of budget in their scope
+    let_skip: usize,
     /// free variables in scope (bound by a check or by a reuse below)
     fv_busy: Vec<bool>,
     /// the variable a lambda `(term, env, ls)` was checked under: comparing
@@ -537,6 +766,10 @@ pub struct Worker {
     uenv_map: CMap<smallvec::SmallVec<[u32; 8]>, u32, 4>,
     /// milestone 12: (used mask, environment) -> used-entries id, direct-mapped
     udm: Vec<[u32; 5]>,
+    /// milestone 34: lambdas' closed body types (`lam_type_record`),
+    /// direct-mapped: (lambda, environment, levels, generation, type,
+    /// variable)
+    lam_dm: Vec<[u32; 6]>,
     unfold_memo: CMap<V, V, 14>,
     /// both outcomes, keyed by the ordered pair of value ids (hash-consing
     /// makes a thunk's or closure's id stand for its (term, env, ls))
@@ -565,6 +798,9 @@ pub struct Worker {
     cgen: u32,
     proj_map: CMap<(u32, u32), u32, 18>,
     nat_map: CMap<u64, V, 19>,
+    /// milestone 37: big Nat literals by a hash of all their digits (equal
+    /// contents are one value: shared thunks and memos, one copy kept)
+    big_map: CMap<u64, V, 19>,
     ll_term_map: CMap<u32, u32, 9>,
     prop_ind: CMap<u32, bool, 27>,
     // context
@@ -584,10 +820,6 @@ pub struct Worker {
     /// an argument probe under a non-regular head is running; it ends at `probe_end`
     probe_on: bool,
     probe_end: u32,
-    /// per constant row: argument positions that are explicit binders in its
-    /// type (bit i), u64::MAX past 64 / unknown; computed on demand
-    explicit_pos: Vec<u64>,
-    abbr_shape: Vec<u8>,
     stack_base: usize,
     stack_limit: usize,
     pub stats: Stats,
@@ -602,12 +834,23 @@ pub struct Worker {
     lvl_epoch: u32,
     /// casesOn shapes by row (`cases_shape`); a property of the file
     cases: CMap<u32, Option<(u32, u32)>, 28>,
-    /// milestone 23: per row, SH_* bits of `cases_shape` and `match_shape`
-    shape_flags: Vec<u8>,
     /// milestone 23: `tele_not_proof` of constant heads by (row, arguments)
     /// (row, n, 0 empty / 1 false / 2 true); in cells, `surely_not_proof`
     /// takes &self
     tnp_dm: Vec<std::cell::Cell<[u32; 3]>>,
+    /// milestone 41: per recursor row, the level of the sort its motive
+    /// ends in (a term of the recursor's type), NONE when not read
+    rec_msort: FxHashMap<u32, u32>,
+    /// milestone 41: ProofsComparedBeforeReduced on (knobs SK_PFIRST=0:
+    /// off); SK_KTRAP=1 counts closed non-syntactic K checks, =2 aborts at
+    /// the first
+    pfirst: bool,
+    ktrap: u8,
+    /// milestone 41: NatFoldWaits on (knobs SK_NATWAIT=0: off)
+    nat_wait: bool,
+    /// milestone 41: CommonHeadFirst's budget in ticks, also NatFoldWaits'
+    /// congruence (HEAD_PROBE; knobs SK_HEAD_PROBE, 0: off / unbudgeted)
+    head_probe: u32,
     matchers: CMap<u32, Option<(u32, u32, u32)>, 29>,
     /// (type, k) -> the k-th variable of that type (`open_var`); per declaration
     var_slots: CMap<u64, V, 16>,
@@ -622,9 +865,6 @@ pub struct Worker {
     stab: Vec<u64>,
     /// milestone 28: the inductive check's walks, memoized for one block
     pub ind_memo: Box<crate::induct::IndMemo>,
-    /// per row: (leading lambdas of the value or 255 unknown/none, mask of
-    /// argument positions the body never uses); a property of the file
-    unused: Vec<(u8, u64)>,
     /// milestone 25: per row, the class of its parameter list + 1 (0 unknown)
     pclass: Vec<u32>,
     pclass_map: FxHashMap<Box<[u32]>, u32>,
@@ -679,6 +919,166 @@ pub struct Worker {
     /// the interned level-parameter list of the current declaration, part
     /// of the key of check-mode inference results
     cur_lp: u32,
+    /// milestone 35: the lambda term being inferred as the head of an
+    /// application (`lam_type_record` keeps only such lambdas' types)
+    lam_head: u32,
+    /// milestone 35: a type was kept in `lam_dm` in this session (else
+    /// `bind_body` does not look)
+    lam_any: bool,
+    /// milestone 35: a block of the current declaration did not fit the
+    /// arena (the declaration runs again in the overflow arenas)
+    pub arena_full: bool,
+    /// milestone 36 (region.rs): the innermost open region's value mark,
+    /// 0 when none is open
+    reg_vm: u32,
+    /// regions open once the arena holds this many values (SK_REGION_AT;
+    /// usize::MAX: never)
+    reg_at: usize,
+    /// a region rolls back only past this many values (SK_REGION_MIN)
+    reg_min: usize,
+    /// a rollback copies out at most `reg_reach8` eighths of the values the
+    /// region made (SK_REGION_REACH8)
+    reg_reach8: usize,
+    /// big-literal memos stop surviving rollbacks past this many bytes of
+    /// big literals in the session (SK_REGION_LIT_KEEP, MiB)
+    reg_lit_keep: usize,
+    /// SK_REGION_POISON=1 (knobs): dead ids are marked, not reused; =2
+    /// also checks after every rollback that no table names a dead id
+    reg_poison: bool,
+    reg_check: bool,
+    /// rollbacks so far (opaque name leaves carry it)
+    reg_epoch: u32,
+    /// writes of the open regions that may name their ids
+    undo: Vec<Undo>,
+    /// closed thunks a rollback keeps forced (thunk, forced value)
+    reg_pairs: Vec<(V, V)>,
+    /// SK_REGION_CLOSED=0 (knobs): no closed thunk kept
+    reg_closed: bool,
+    /// milestone 38: a whnf loop that began without a region opens one
+    /// once the session wants regions (SK_REGION_LATE=0: off; 1: only at
+    /// whnf's delta steps, not inside whnf_core's loop or lazy delta)
+    reg_late: bool,
+    reg_late2: bool,
+    reg_lategate: bool,
+    /// milestone 39: the ground machine (SK_GROUND=0: off), and whether a
+    /// run of it is in progress (the kernel's own steps inside it do not
+    /// start another)
+    ground: bool,
+    ground_busy: bool,
+    /// knobs, gates (SK_GROUND=2): every closed pair with a side that
+    /// reduces and every closed whnf goes to the ground machine
+    ground_all: bool,
+    /// milestone 39: machine steps a run may take before it gives the work
+    /// back to the kernel; doubles per declaration at every run that ran
+    /// out (`GROUND_FUEL`, SK_GROUND_FUEL)
+    ground_fuel: u64,
+    ground_fuel0: u64,
+    ground_at: usize,
+    /// ticks when a run last ran out: the next run waits until the kernel
+    /// has done as much work as that run's budget (the machine's waste
+    /// stays below the kernel's own work)
+    ground_out_at: Option<u64>,
+    /// milestone 40: the machine's heap kept from one run to the next
+    /// (a declaration's runs share what they import twice and the
+    /// constants they force), and the lowest marks of the rollbacks since
+    /// the last run ended (vals, environments, literals): a rollback below
+    /// what the heap may name drops it
+    gm: Option<Box<ground::Gm>>,
+    ground_cut: (u32, u32, u32),
+    /// milestone 40: memo of forced delayed terms in the machine
+    /// (SK_GROUND_MEMO=0: off), and what a lookup costs in machine steps
+    /// (`MEMO_COST`, SK_MEMO_COST)
+    ground_memo: bool,
+    memo_cost: u64,
+    /// milestone 38: whnf calls nested in this one (0: none running)
+    wdepth: u32,
+    /// past this many bytes of stack a nested whnf miss is handed up
+    /// (stack limit / SK_DEEP_DIV; 0: never)
+    deep_at: usize,
+    /// the value handed up with `Stop::Deep`
+    deep_v: V,
+    /// milestone 38: an outermost attempt that handed up is rolled back (SK_DEEP_ROLL=1)
+    deep_roll: bool,
+    /// milestone 38: past this many nested whnfs a miss is handed up (SK_DEEP_WHNF)
+    deep_n: u32,
+    /// the declaration's hand-up bound (doubles after costly hand-ups)
+    deep_cur: u32,
+    /// SK_DEEP_TICKS
+    deep_ticks: u32,
+    /// ticks when the running attempt first reached half the bound (0: not yet)
+    deep_half: u32,
+    /// milestone 38: a checkpoint's next region opens at its marks
+    /// (SK_REGION_CKSAME=0: after the copies, as in milestone 37)
+    reg_ckpt_same: bool,
+    pub(super) reg_ckpt_req: bool,
+    reg_ckpt_new: Option<region::Reg>,
+    /// milestone 37: a rollback keeps the forced values of the thunks
+    /// (whnf memos of the values) its copies reach (SK_REGION_FWD: 0 off,
+    /// 1 on, the region kept when one does not fit; 2 on, the memo dropped)
+    reg_fwd: u8,
+    /// milestone 37: values of a region made of older parts keep their
+    /// whnf memos (SK_REGION_FRONT: 0 off, 1 on and the region kept when
+    /// one does not fit, 2 on and the memo dropped)
+    reg_front: u8,
+    /// milestone 37: `uses_main` is dropped past this many entries
+    /// (SK_USES_CAP; WIDE_CAP by default)
+    uses_cap: usize,
+    /// milestone 37: `eqp` and `cll_memo`/`lsub_memo` caps (`capped`)
+    eqp_cap: usize,
+    memo_cap: usize,
+    /// milestone 37: checkpoints in whnf's loop (SK_REGION_CKPT=0 off)
+    reg_ckpt: bool,
+    /// a checkpoint after `reg_at / reg_ckdiv` values (SK_REGION_CKDIV)
+    reg_ckdiv: usize,
+    /// milestone 37: big Nat results shared by content (SK_BIG_SHARE=0 off)
+    big_share: bool,
+    /// SK_REGION_REBUILD=1 (knobs): milestone 36's rebuild of the spine
+    /// and frame tables after a growth instead of deletion by key
+    reg_rebuild: bool,
+    reg_delall: bool,
+    /// milestone 37: the largest region kept after an attempt inside the
+    /// innermost open region (values made); see `reg_grow`
+    reg_kmax: usize,
+    /// an attempt needs this many times `reg_kmax` values made
+    /// (SK_REGION_GROW; 0: always attempt)
+    reg_grow: usize,
+    /// milestone 37: a region whose log holds more than this many entries
+    /// per value it made is kept without an attempt (SK_REGION_LOGK; 0 off)
+    reg_logk: usize,
+    /// milestone 37 (region.rs, redone work): content keys of values and
+    /// environments (`mkey`), by id, 0 unknown; cut with the arena
+    mkv: Vec<u64>,
+    mke: Vec<u64>,
+    /// keys of the roots of rolled-back regions that cost at least
+    /// `GHOST_TICKS`; a region opened on a value with one of these keys is
+    /// work done again, and its key goes to `pinned`
+    ghost: FxHashSet<u64>,
+    pinned: FxHashSet<u64>,
+    ghost_shape: FxHashSet<u64>,
+    /// `GHOST_TICKS` (SK_GHOST_TICKS in knobs)
+    ghost_ticks: u32,
+    /// `KEY_FUEL` (SK_KEY_FUEL in knobs)
+    key_fuel: u32,
+    /// closed regions (root, cost in ticks) whose roots may die in an
+    /// enclosing rollback (then their keys go to `ghost`)
+    reg_done: Vec<(V, u32)>,
+    /// roots of pinned regions an enclosing rollback must keep, with their
+    /// whnf memos
+    pin_ids: Vec<V>,
+    /// SK_REGION_PIN (knobs): 0 off, 1 on (default)
+    reg_pin: bool,
+    /// milestone 36: `args_refuted` on (SK_ARGS_REFUTE=0 in knobs: off)
+    args_refute: bool,
+    /// regions open past this many bytes of big literals (SK_REGION_LIT_AT, MiB)
+    reg_lit_at: usize,
+    /// SK_REGION_MEMO_ALL=0 (knobs): memos of older values may be dropped
+    /// past a small budget (milestone 36's first policy)
+    reg_memo_all: bool,
+    /// SK_REGION_OLDENV=1 (knobs): also thunks over older environments
+    reg_oldenv: bool,
+    /// milestone 36: the next used-entries id (`uenv_map` entries leave
+    /// it at a rollback, so its length is no id)
+    uenv_next: u32,
 }
 
 /// The session's tables while a scratch declaration runs (and the scratch
@@ -712,16 +1112,20 @@ struct Stash {
     env_map: CMap<u64, u32, 1>,
     proj_map: CMap<(u32, u32), u32, 18>,
     nat_map: CMap<u64, V, 19>,
+    /// milestone 37: big Nat literals by a hash of all their digits (equal
+    /// contents are one value: shared thunks and memos, one copy kept)
+    big_map: CMap<u64, V, 19>,
     prop_ind: CMap<u32, bool, 27>,
     canon_memo: CMap<(u32, u32, u32), V, 24>,
     stab: Vec<u64>,
     ctab: Vec<u64>,
     wlit_bytes: usize,
+    uenv_next: u32,
 }
 
 macro_rules! sess_tables {
     ($m:ident) => {
-        $m!(blk, blk_side, wlits, vals, sp, projs, eloc, eslots, ftab, fv_ty, fv_busy, lam_var, var_slots, shash_memo, term_memo, infer_cache, infer_u, unfold_memo, uenv_map, eq_cache, fail_cache, uses0_memo, block_roots, vmap, env_map, proj_map, nat_map, prop_ind, canon_memo, stab, ctab, wlit_bytes)
+        $m!(blk, blk_side, wlits, vals, sp, projs, eloc, eslots, ftab, fv_ty, fv_busy, lam_var, var_slots, shash_memo, term_memo, infer_cache, infer_u, unfold_memo, uenv_map, eq_cache, fail_cache, uses0_memo, block_roots, vmap, env_map, proj_map, nat_map, big_map, prop_ind, canon_memo, stab, ctab, wlit_bytes, uenv_next)
     };
 }
 
@@ -759,10 +1163,13 @@ impl Worker {
             pbuf: Vec::new(),
             fv_ty: Vec::new(),
             argstack: Vec::new(),
+            let_vals: Vec::new(),
+            let_skip: 0,
             fv_busy: Vec::new(),
             lam_var: Default::default(),
+            lam_dm: vec![[0; 6]; LAM_DM_MASK + 1],
             shared,
-            lvl_flush: std::env::var("SK_LVL_FLUSH").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 22),
+            lvl_flush: capped(std::env::var("SK_LVL_FLUSH").ok().and_then(|s| s.parse().ok()).unwrap_or(1 << 22)),
             eqp: Default::default(),
             lp_lists: Vec::new(),
             lp_list_map: Default::default(),
@@ -789,6 +1196,7 @@ impl Worker {
             cgen: 1,
             proj_map: Default::default(),
             nat_map: Default::default(),
+            big_map: Default::default(),
             ll_term_map: Default::default(),
             prop_ind: Default::default(),
             cur_decl: 0,
@@ -802,8 +1210,6 @@ impl Worker {
             tick_alarm: 0x1000,
             probe_on: false,
             probe_end: 0,
-            explicit_pos: vec![0; env.consts.len()],
-            abbr_shape: vec![0; env.consts.len()],
             stack_base: &x as *const u8 as usize,
             stack_limit,
             stats: Stats::default(),
@@ -825,8 +1231,12 @@ impl Worker {
             lsub_dm: vec![[0; 4]; LSUB_MASK + 1],
             lvl_epoch: 1,
             cases: Default::default(),
-            shape_flags: Vec::new(),
             tnp_dm: vec![std::cell::Cell::new([0; 3]); TNP_MASK + 1],
+            rec_msort: FxHashMap::default(),
+            pfirst: !(KNOBS && std::env::var("SK_PFIRST").is_ok_and(|s| s == "0")),
+            head_probe: if KNOBS { std::env::var("SK_HEAD_PROBE").ok().and_then(|s| s.parse().ok()).unwrap_or(HEAD_PROBE) } else { HEAD_PROBE },
+            nat_wait: !(KNOBS && std::env::var("SK_NATWAIT").is_ok_and(|s| s == "0")),
+            ktrap: if KNOBS { std::env::var("SK_KTRAP").ok().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 },
             matchers: Default::default(),
             var_slots: Default::default(),
             walk_wasted: 0,
@@ -835,7 +1245,6 @@ impl Worker {
             vstack: Vec::new(),
             stab: Vec::new(),
             ind_memo: Default::default(),
-            unused: vec![(254, 0); env.consts.len()],
             pclass: vec![0; env.consts.len()],
             pclass_map: FxHashMap::default(),
             prop_pos: Default::default(),
@@ -844,6 +1253,9 @@ impl Worker {
             sess_len: 0,
             sess_last: u32::MAX,
             sess_end: true,
+            arena_full: false,
+            lam_head: NONE,
+            lam_any: false,
             scratch: false,
             kb_root: NONE,
             kb_tele: NONE,
@@ -861,6 +1273,81 @@ impl Worker {
             gen_top: 1,
             wlit_bytes: 0,
             cur_lp: 0,
+            reg_vm: 0,
+            reg_at: if KNOBS {
+                match std::env::var("SK_REGION_AT").ok().and_then(|s| s.parse::<usize>().ok()) {
+                    Some(0) => usize::MAX,
+                    Some(n) => n,
+                    None => REGION_AT,
+                }
+            } else {
+                REGION_AT
+            },
+            reg_lit_keep: (if KNOBS { std::env::var("SK_REGION_LIT_KEEP").ok().and_then(|s| s.parse().ok()).unwrap_or(REGION_LIT_KEEP) } else { REGION_LIT_KEEP }) << 20,
+            reg_reach8: if KNOBS { std::env::var("SK_REGION_REACH8").ok().and_then(|s| s.parse().ok()).unwrap_or(REGION_REACH8) } else { REGION_REACH8 },
+            reg_min: if KNOBS { std::env::var("SK_REGION_MIN").ok().and_then(|s| s.parse().ok()).unwrap_or(REGION_MIN) } else { REGION_MIN },
+            reg_poison: KNOBS && std::env::var("SK_REGION_POISON").is_ok_and(|s| s == "1" || s == "2"),
+            reg_check: KNOBS && std::env::var("SK_REGION_POISON").is_ok_and(|s| s == "2"),
+            reg_epoch: 0,
+            undo: Vec::new(),
+            reg_pairs: Vec::new(),
+            reg_oldenv: KNOBS && std::env::var("SK_REGION_OLDENV").is_ok_and(|s| s == "1"),
+            reg_memo_all: !(KNOBS && std::env::var("SK_REGION_MEMO_ALL").is_ok_and(|s| s == "0")),
+            args_refute: ARGS_REFUTE && !(KNOBS && std::env::var("SK_ARGS_REFUTE").is_ok_and(|s| s == "0")),
+            reg_lit_at: (if KNOBS { std::env::var("SK_REGION_LIT_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(REGION_LIT_AT) } else { REGION_LIT_AT }) << 20,
+            reg_fwd: if KNOBS { std::env::var("SK_REGION_FWD").ok().and_then(|s| s.parse().ok()).unwrap_or(REGION_FWD) } else { REGION_FWD },
+            reg_front: if KNOBS { std::env::var("SK_REGION_FRONT").ok().and_then(|s| s.parse().ok()).unwrap_or(REGION_FRONT) } else { REGION_FRONT },
+            mkv: Vec::new(),
+            mke: Vec::new(),
+            ghost: FxHashSet::default(),
+            pinned: FxHashSet::default(),
+            ghost_shape: FxHashSet::default(),
+            key_fuel: if KNOBS { std::env::var("SK_KEY_FUEL").ok().and_then(|s| s.parse().ok()).unwrap_or(region::KEY_FUEL) } else { region::KEY_FUEL },
+            ghost_ticks: if KNOBS { std::env::var("SK_GHOST_TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(region::GHOST_TICKS) } else { region::GHOST_TICKS },
+            reg_done: Vec::new(),
+            pin_ids: Vec::new(),
+            reg_pin: REGION_PIN && !(KNOBS && std::env::var("SK_REGION_PIN").is_ok_and(|s| s == "0")),
+            reg_logk: if KNOBS { std::env::var("SK_REGION_LOGK").ok().and_then(|s| s.parse().ok()).unwrap_or(REGION_LOGK) } else { REGION_LOGK },
+            reg_kmax: 0,
+            reg_grow: if KNOBS { std::env::var("SK_REGION_GROW").ok().and_then(|s| s.parse().ok()).unwrap_or(REGION_GROW) } else { REGION_GROW },
+            reg_delall: KNOBS && std::env::var("SK_REGION_DELALL").is_ok_and(|s| s == "1"),
+            reg_rebuild: KNOBS && std::env::var("SK_REGION_REBUILD").is_ok_and(|s| s == "1"),
+            big_share: !(KNOBS && std::env::var("SK_BIG_SHARE").is_ok_and(|s| s == "0")),
+            reg_ckpt: !(KNOBS && std::env::var("SK_REGION_CKPT").is_ok_and(|s| s == "0")),
+            reg_ckdiv: if KNOBS { std::env::var("SK_REGION_CKDIV").ok().and_then(|s| s.parse().ok()).unwrap_or(2) } else { 2 },
+            uses_cap: capped(if KNOBS { std::env::var("SK_USES_CAP").ok().and_then(|s| s.parse().ok()).unwrap_or(WIDE_CAP) } else { WIDE_CAP }),
+            eqp_cap: capped(1 << 22),
+            memo_cap: capped(MEMO_FLUSH),
+            reg_closed: !(KNOBS && std::env::var("SK_REGION_CLOSED").is_ok_and(|s| s == "0")),
+            reg_ckpt_same: !(KNOBS && std::env::var("SK_REGION_CKSAME").is_ok_and(|s| s == "0")),
+            reg_ckpt_req: false,
+            reg_ckpt_new: None,
+            wdepth: 0,
+            deep_at: match if KNOBS { std::env::var("SK_DEEP_DIV").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(DEEP_DIV) } else { DEEP_DIV } {
+                0 => 0,
+                d => stack_limit / d,
+            },
+            deep_v: NONE,
+            deep_n: if KNOBS { std::env::var("SK_DEEP_WHNF").ok().and_then(|s| s.parse().ok()).unwrap_or(DEEP_WHNF) } else { DEEP_WHNF },
+            deep_cur: u32::MAX,
+            deep_half: 0,
+            deep_ticks: if KNOBS { std::env::var("SK_DEEP_TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(DEEP_TICKS) } else { DEEP_TICKS },
+            deep_roll: !(KNOBS && std::env::var("SK_DEEP_ROLL").is_ok_and(|s| s == "0")),
+            reg_late: !(KNOBS && std::env::var("SK_REGION_LATE").is_ok_and(|s| s == "0")),
+            reg_late2: !(KNOBS && std::env::var("SK_REGION_LATE").is_ok_and(|s| s == "0" || s == "1")),
+            reg_lategate: KNOBS && std::env::var("SK_REGION_LATEGATE").is_ok_and(|s| s == "1"),
+            ground: !(KNOBS && std::env::var("SK_GROUND").is_ok_and(|s| s == "0")),
+            ground_all: KNOBS && std::env::var("SK_GROUND").is_ok_and(|s| s == "2"),
+            ground_fuel: GROUND_FUEL,
+            ground_at: if KNOBS { std::env::var("SK_GROUND_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(GROUND_AT) } else { GROUND_AT },
+            ground_out_at: None,
+            gm: None,
+            ground_cut: (u32::MAX, u32::MAX, u32::MAX),
+            ground_memo: !(KNOBS && std::env::var("SK_GROUND_MEMO").is_ok_and(|s| s == "0")),
+            memo_cost: if KNOBS { std::env::var("SK_MEMO_COST").ok().and_then(|s| s.parse().ok()).unwrap_or(MEMO_COST) } else { MEMO_COST },
+            ground_fuel0: if KNOBS { std::env::var("SK_GROUND_FUEL").ok().and_then(|s| s.parse().ok()).unwrap_or(GROUND_FUEL) } else { GROUND_FUEL },
+            ground_busy: false,
+            uenv_next: 0,
         }
     }
 
@@ -910,10 +1397,128 @@ impl Worker {
             + mb(&self.env_map)
             + mb(&self.proj_map)
             + mb(&self.nat_map)
+            + mb(&self.big_map)
             + mb(&self.prop_ind)
             + mb(&self.canon_memo)
     }
 
+
+    /// Milestone 37: bytes this worker holds, by group: per-constant
+    /// arrays, direct-mapped tables, tables kept across sessions, the
+    /// session's tables (room included), the scratch arena's.
+    pub fn mem_report(&self) -> String {
+        fn v<T>(x: &Vec<T>) -> usize {
+            x.capacity() * std::mem::size_of::<T>()
+        }
+        fn h<K, W, S>(m: &std::collections::HashMap<K, W, S>) -> usize {
+            m.capacity() * (std::mem::size_of::<(K, W)>() + 1)
+        }
+        fn hs<K, S>(m: &std::collections::HashSet<K, S>) -> usize {
+            m.capacity() * (std::mem::size_of::<K>() + 1)
+        }
+        let percon = v(&self.ktab) + v(&self.ktab_ll) + v(&self.pclass);
+        let dm = v(&self.pdm) + v(&self.lam_dm) + v(&self.udm) + v(&self.cdm) + v(&self.tdm) + v(&self.cll_dm)
+            + v(&self.lsub_dm) + self.tnp_dm.capacity() * 12 + v(&self.stab);
+        let lv = v(&self.ll) + h(&self.ll_map) + v(&self.lss) + h(&self.ls_map) + h(&self.lsub_memo) + h(&self.cll_memo)
+            + h(&self.ll_term_map) + h(&self.prop_pos) + h(&self.lp_list_map) + self.lv.held_bytes();
+        let kept = h(&self.eqp) + h(&self.uses_main) + h(&self.wide_main) + h(&self.cases) + h(&self.matchers)
+            + h(&self.pclass_map) + h(&self.lp_ok) + self.ind_memo.held_bytes();
+        let names = self.nm.held_bytes();
+        macro_rules! sess {
+            ($o:expr) => {{
+                let o = $o;
+                o.blk.bytes() + v(&o.wlits) + o.wlit_bytes + o.vals.held_bytes() + o.sp.held_bytes() + v(&o.projs)
+                    + o.eloc.held_bytes() + o.eslots.held_bytes() + o.ftab.held_bytes() + v(&o.fv_ty) + v(&o.fv_busy)
+                    + h(&o.lam_var) + h(&o.var_slots) + h(&o.shash_memo) + h(&o.term_memo) + h(&o.infer_cache)
+                    + h(&o.infer_u) + h(&o.unfold_memo) + h(&o.uenv_map) + h(&o.eq_cache) + hs(&o.fail_cache)
+                    + h(&o.uses0_memo) + h(&o.block_roots) + h(&o.vmap) + h(&o.env_map) + h(&o.proj_map)
+                    + h(&o.nat_map) + h(&o.big_map) + h(&o.prop_ind) + h(&o.canon_memo)
+            }};
+        }
+        let sess = sess!(self) + h(&self.wide_blk) + v(&self.undo) + v(&self.argstack);
+        let stash = sess!(&*self.stash);
+        let mb = |x: usize| x >> 20;
+        format!(
+            "mem percon {} dm {} lv {} kept {} [eqp {} uses_main {}/{} wide_main {} cases {} matchers {} ind {}] names {} sess {} stash {} (MiB; vals {} sp {} eloc {} eslots {} lits {} vmap {} env_map {})",
+            mb(percon), mb(dm), mb(lv), mb(kept), mb(h(&self.eqp)), mb(h(&self.uses_main)), self.uses_main.len(), mb(h(&self.wide_main)),
+            mb(h(&self.cases)), mb(h(&self.matchers)), mb(self.ind_memo.held_bytes()), mb(names), mb(sess), mb(stash),
+            mb(self.vals.held_bytes()), mb(self.sp.held_bytes()), mb(self.eloc.held_bytes()), mb(self.eslots.held_bytes()),
+            mb(self.wlit_bytes + v(&self.wlits)), mb(h(&self.vmap)), mb(h(&self.env_map))
+        )
+    }
+
+    /// knobs, SK_DIAG_SECS=N: every 2^24 ticks past N seconds of the run,
+    /// the tables, memory and (SK_UNFOLD_HIST) unfold counts; past 2N the
+    /// process ends with status 3 (diagnostics of runs that would be killed)
+    #[cold]
+    fn diag_dump(&mut self) {
+        thread_local! {
+            static T0: std::time::Instant = std::time::Instant::now();
+            static SECS: u64 = std::env::var("SK_DIAG_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        }
+        let secs = SECS.with(|s| *s);
+        if secs == 0 {
+            return;
+        }
+        let el = T0.with(|t| t.elapsed().as_secs());
+        thread_local! { static LAST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+        if el < secs || LAST.with(|l| l.get()) == el {
+            return;
+        }
+        LAST.with(|l| l.set(el));
+        eprintln!("DIAG {el} s ticks {} unfolds {} {}", self.ticks, self.stats.unfolds, self.table_report());
+        if dstack_on() {
+            let st: Vec<(u8, V, V, u32)> = DSTACK.with(|d| d.borrow().clone());
+            let n = st.len();
+            eprintln!("DSTACK decl {} depth {n}", self.cur_decl);
+            for (i, &(k, a, b, t)) in st.iter().enumerate() {
+                if i >= 30 && i + 8 < n {
+                    continue;
+                }
+                let age = self.ticks.wrapping_sub(t);
+                let mut sa = self.vshow(a, 5);
+                sa.truncate(600);
+                if b == NONE {
+                    eprintln!("DS {i:>4} {} age {age:>11} {sa}", k as char);
+                } else {
+                    let mut sb = self.vshow(b, 5);
+                    sb.truncate(600);
+                    eprintln!("DS {i:>4} {} age {age:>11} {sa}\n            =?= {sb}", k as char);
+                }
+            }
+        }
+        eprintln!("DIAG {}", self.mem_report());
+        eprintln!("DIAG ground live {:?}", ground::LIVE.with(|l| l.get()));
+        self.ground_made_report();
+        self.dump_unfold_hist();
+        if el >= 2 * secs {
+            std::process::exit(3);
+        }
+    }
+
+    /// knobs, SK_UNFOLD_HIST: the most unfolded constants of this thread
+    pub fn dump_unfold_hist(&self) {
+        UHIST.with(|h| {
+            if let Some(h) = h.borrow().as_ref() {
+                let mut v: Vec<(u64, u32)> = h.iter().map(|(&r, &c)| (c, r)).collect();
+                v.sort_unstable_by(|a, b| b.cmp(a));
+                for (c, r) in v.into_iter().take(40) {
+                    eprintln!("UH {c:>12} {}", self.env.name_str(self.consts[r as usize].name));
+                }
+            }
+        });
+    }
+
+    /// Milestone 36 (SK_DECL_INSTR): the sizes of the session's tables.
+    pub fn table_report(&self) -> String {
+        format!(
+            "gr {:?} pfirst {:?} ktrap {:?} natwait {:?} headprobe {:?} reg {:?} redo {} pinkept {} skip {} seg {} undo {} vals {} eloc {} eslots {} sp_b {} ftab_b {} wlits {} wlit_b {} blk {} vmap {} env_map {} eq {} fail {} icache {} iu {} unf {} uenv {} fv {} sess_b {}",
+            self.stats.gr, self.stats.pfirst, self.stats.ktrap, self.stats.natwait, self.stats.headprobe, self.stats.reg, self.stats.reg_redo, self.stats.reg_pin_kept, self.stats.reg_skip, self.stats.reg_seg, self.undo.len(), self.vals.len(), self.eloc.len(), self.eslots.len(), self.sp.bytes(), self.ftab.bytes(),
+            self.wlits.len(), self.wlit_bytes, self.blk.len(), self.vmap.len(), self.env_map.len(),
+            self.eq_cache.len(), self.fail_cache.len(), self.infer_cache.len(), self.infer_u.len(),
+            self.unfold_memo.len(), self.uenv_map.len(), self.fv_ty.len(), self.sess_bytes()
+        )
+    }
 
     /// Swaps the session's tables with the stash (scratch declarations).
     fn swap_stash(&mut self) {
@@ -928,6 +1533,8 @@ impl Worker {
     /// tables are put aside and the declaration starts from empty tables.
     fn enter_scratch(&mut self) {
         debug_assert!(!self.scratch);
+        self.mkv.clear();
+        self.mke.clear();
         self.swap_stash();
         self.scratch = true;
         self.stats.scratch_decls += 1;
@@ -951,6 +1558,8 @@ impl Worker {
         self.clear_sess_tables();
         self.swap_stash();
         self.scratch = false;
+        self.mkv.clear();
+        self.mke.clear();
         self.p2_vals0 = self.stash_p2_vals0;
         // the session's generation again (scratch entries carry a newer one,
         // never handed out again)
@@ -989,6 +1598,7 @@ impl Worker {
         clear_map!(self.infer_u);
         clear_map!(self.unfold_memo);
         clear_map!(self.uenv_map);
+        self.uenv_next = 0;
         clear_map!(self.eq_cache);
         clear_map!(self.fail_cache);
         clear_map!(self.uses0_memo);
@@ -997,6 +1607,7 @@ impl Worker {
         clear_map!(self.env_map);
         clear_map!(self.proj_map);
         clear_map!(self.nat_map);
+        clear_map!(self.big_map);
         clear_map!(self.prop_ind);
         clear_map!(self.canon_memo);
         clear_map!(self.wide_blk);
@@ -1021,10 +1632,13 @@ impl Worker {
 
     /// Ends the session: every table keyed by arena ids is emptied.
     fn new_session(&mut self, d: u32) {
+        self.gm = None;
         self.count_values();
         self.clear_sess_tables();
+        self.reg_forget();
         self.cgen_bump();
         self.stats.sess_resets += 1;
+        self.lam_any = false;
         self.sess_len = 0;
         if self.ll.len() + self.lss.len() + self.lv.len() > self.lvl_flush {
             self.flush_levels();
@@ -1034,6 +1648,13 @@ impl Worker {
 
     /// Clears everything that depends on the declaration being checked.
     pub fn reset(&mut self, d: u32) {
+        self.arena_full = false;
+        // milestone 36: no region is open between declarations
+        self.reg_vm = 0;
+        self.reg_kmax = 0;
+        self.undo.clear();
+        self.let_vals.clear();
+        self.let_skip = 0;
         // milestone 10: the arena and its tables live for a session
         let lvl_big = self.ll.len() + self.lss.len() + self.lv.len() > self.lvl_flush;
         let end = d == u32::MAX
@@ -1049,17 +1670,21 @@ impl Worker {
         self.sess_last = d;
         self.sess_len += 1;
         self.argstack.clear();
+        // milestone 38: the hand-up bound starts over with each declaration
+        // (and no whnf is running: a panic may have left the count)
+        self.deep_cur = self.deep_n;
+        self.wdepth = 0;
         clear_map!(self.lp_ok);
-        if self.eqp.len() > (1 << 22) {
+        if self.eqp.len() > self.eqp_cap {
             self.eqp = Default::default();
             self.stats.eqp_flushes += 1;
         }
         // pure memos (their values stay valid): dropped past a size
-        if self.cll_memo.len() > MEMO_FLUSH {
+        if self.cll_memo.len() > self.memo_cap {
             self.cll_memo = Default::default();
             self.stats.memo_flushes += 1;
         }
-        if self.lsub_memo.len() > MEMO_FLUSH {
+        if self.lsub_memo.len() > self.memo_cap {
             self.lsub_memo = Default::default();
             self.stats.memo_flushes += 1;
         }
@@ -1124,6 +1749,7 @@ impl Worker {
         // milestone 24: a panic inside an argument probe left the probe on,
         // and the worker's next declaration declined ("probe budget escaped")
         self.probe_on = false;
+        self.ground_busy = false;
         // milestone 28: an inductive block's memo names its scratch ids
         self.ind_memo = Default::default();
         self.set_alarm();
@@ -1131,6 +1757,23 @@ impl Worker {
         self.new_session(u32::MAX);
         self.sess_last = u32::MAX;
         self.flush_levels();
+    }
+    /// Milestone 35: swaps the worker's two block arenas with the overflow
+    /// arenas `big` (to run a declaration whose blocks did not fit, and
+    /// back after it). Both sides start from a new session: no table keeps
+    /// an id of the arenas left; the overflow arenas give their pages back.
+    pub fn swap_big(&mut self, big: &mut (crate::env::Cols, crate::env::Cols)) {
+        self.leave_scratch();
+        self.ind_memo = Default::default();
+        self.new_session(u32::MAX);
+        self.sess_last = u32::MAX;
+        std::mem::swap(&mut self.blk, &mut big.0);
+        std::mem::swap(&mut self.stash.blk, &mut big.1);
+        self.m = self.blk.base;
+        for c in [&mut big.0, &mut big.1] {
+            c.clear();
+            c.shrink(0);
+        }
     }
     /// A new generation for the direct tables: the next one never used
     /// (generations only grow; a scratch declaration takes one and the
@@ -1144,6 +1787,7 @@ impl Worker {
             self.tdm.iter_mut().for_each(|s| *s = [0; 8]);
             self.pdm.iter_mut().for_each(|s| *s = [0; 5]);
             self.udm.iter_mut().for_each(|s| *s = [0; 5]);
+            self.lam_dm.iter_mut().for_each(|s| *s = [0; 6]);
             self.gen_top = 1;
             // the stashed session's stamps are gone too: it must end
             self.sess_end = true;
@@ -1249,6 +1893,9 @@ impl Worker {
             return Err(Stop::Budget);
         }
         self.set_alarm();
+        if KNOBS && t & 0xf_ffff == 0 {
+            self.diag_dump();
+        }
         if t & 0xfff == 0 && self.first_fail.load(Ordering::Relaxed) < self.cur_decl {
             return Err(Stop::Cancel);
         }
@@ -1462,7 +2109,9 @@ impl Worker {
 
     pub fn lit(&self, i: u32) -> &LitVal {
         let g = self.env.lits.len() as u32;
-        if i < g { &self.env.lits[i as usize] } else { &self.wlits[(i - g) as usize] }
+        let l = if i < g { &self.env.lits[i as usize] } else { &self.wlits[(i - g) as usize] };
+        debug_assert!(!matches!(l, LitVal::Str(s) if s.starts_with('\u{0}')), "literal {i} read after its region was rolled back");
+        l
     }
 
     // -----------------------------------------------------------------------
@@ -1474,12 +2123,18 @@ impl Worker {
     // a session (it is cleared or swapped, `sess_tables!`, at a
     // session boundary, after which no old id is read: SK_POISON shifts the
     // id spaces to catch one). So `v < vals.len()`. Debug
-    // builds assert it.
+    // builds assert it. Milestone 36: a region's rollback cuts `vals`
+    // (and the environment, spine and literal tables) back to its marks
+    // after every table and memo that could name a cut id has dropped it
+    // (region.rs); SK_REGION_POISON marks the cut ids instead, and debug
+    // builds assert no marked value is read.
     #[inline(always)]
     pub fn val(&self, v: V) -> Val {
         debug_assert!((v as usize) < self.vals.len(), "value id {v} out of the arena ({})", self.vals.len());
         // SAFETY: invariant (A)
-        unsafe { self.vals.get_unchecked(v as usize).v }
+        let x = unsafe { self.vals.get_unchecked(v as usize).v };
+        debug_assert!(!matches!(x, Val::Sort(region::DEAD_LVL)), "value {v} read after its region was rolled back");
+        x
     }
     #[inline(always)]
     fn memo_at(&self, v: V) -> &Memo {
@@ -1503,6 +2158,7 @@ impl Worker {
         debug_assert!((env as usize) < self.eloc.len(), "environment id {env} out of range ({})", self.eloc.len());
         // SAFETY: invariant (E)
         let r = unsafe { *self.eloc.get_unchecked(env as usize) };
+        debug_assert!(r.0 != region::DEAD_RUN, "environment {env} read after its region was rolled back");
         debug_assert!((r.0 + r.1) as usize <= self.eslots.len());
         (r.0, r.1)
     }
@@ -1565,7 +2221,9 @@ impl Worker {
     }
     #[inline(never)]
     fn intern_sort_miss(&mut self, v: Val, i: usize) -> R<V> {
-        let id = self.mk(v)?;
+        // milestone 36: through `vmap`, so a sort keeps its id when the
+        // direct table is dropped (a region's rollback bumps the generation)
+        let id = self.intern_vmap(v, vkey(&v))?;
         self.stab[i] = ((self.cgen as u64) << 32) | id as u64;
         Ok(id)
     }
@@ -1646,6 +2304,7 @@ impl Worker {
         if e != n { cn!(973); }
         if e == n {
             self.push_loc(v, env);
+            self.ulog(Undo::EnvMap(key));
         }
         e
     }
@@ -1795,11 +2454,7 @@ impl Worker {
                 let e = self.eloc.len() as u32;
                 self.eloc.push((self.eslots.len() as u32, r, u));
                 self.eslots.extend_from_slice(&c);
-                let (eloc, eslots) = (&self.eloc, &self.eslots);
-                self.ftab.insert(h, slot, e, |x| {
-                    let (s, l, _) = eloc[x as usize];
-                    frames::fhash(&eslots[s as usize..(s + l) as usize])
-                });
+                self.ft_insert(h, slot, e);
                 e
             }
         };
@@ -1844,7 +2499,8 @@ impl Worker {
                 }
                 let s = self.sp.make(base, extra);
                 let v = self.mk(Val::Neu { head, spine: s })?;
-                self.sp.add(slot, v);
+                let j = self.sp.add(slot, v);
+                self.ulog(Undo::Sp(j as u32));
                 Ok(v)
             }
         }
@@ -2001,6 +2657,7 @@ impl Worker {
                 None => {
                     let x = self.fresh(ty)?;
                     self.var_slots.insert(key, x);
+                    self.ulog(Undo::VarSlot(key));
                     self.set_busy(x, true);
                     return Ok(x);
                 }
@@ -2042,6 +2699,7 @@ impl Worker {
             },
         };
         self.shash_memo.insert(v, h);
+        self.ulog(Undo::Shash(v));
         h
     }
 
@@ -2158,13 +2816,35 @@ impl Worker {
             }
         }
         let i = self.env.lits.len() as u32 + self.wlits.len() as u32;
+        let mut bk = 0;
         if small.is_none() {
+            // milestone 37: one value per content, found by a hash of the
+            // length and a few digits (both ends and the middle) and
+            // confirmed by comparing the contents; numbers that differ only
+            // elsewhere share a slot (the later one takes it: less sharing,
+            // never a wrong value)
+            bk = {
+                let mut d = n.iter_u64_digits();
+                let len = d.len();
+                let mid = n.iter_u64_digits().nth(len / 2).unwrap_or(0);
+                let (a, b) = (d.next().unwrap_or(0), d.next_back().unwrap_or(0));
+                hmix(hmix(hmix(hmix(n.bits(), len as u64), a), b), mid)
+            };
+            if let Some(&v) = self.big_map.get(&bk) {
+                if self.nat_ref(v) == Some(&n) {
+                    return Ok(v);
+                }
+            }
             self.wlit_bytes += (n.bits() / 8) as usize;
         }
         self.wlits.push(LitVal::Nat(n));
         let v = self.intern(Val::Lit(i))?;
         if let Some(k) = small {
             self.nat_map.insert(k, v);
+            self.ulog(Undo::Nat(k));
+        } else if self.big_share {
+            self.big_map.insert(bk, v);
+            self.ulog(Undo::BigNat(bk));
         }
         Ok(v)
     }
@@ -2178,6 +2858,7 @@ impl Worker {
                 }
                 let v = self.intern(Val::Lit(i))?;
                 self.nat_map.insert(k, v);
+                self.ulog(Undo::Nat(k));
                 return Ok(v);
             }
         }
@@ -2529,6 +3210,7 @@ impl Worker {
             self.cdm[slot] = [t, env, ls, self.cgen, v];
         } else {
             self.canon_memo.insert(key, v);
+            self.ulog(Undo::Canon(key));
         }
         Ok(Some(v))
     }
@@ -2607,6 +3289,7 @@ impl Worker {
         self.argstack.truncate(base);
         let v = self.neu(head, sp0, &xs)?;
         self.canon_memo.insert(mkey, v);
+        self.ulog(Undo::Canon(mkey));
         Ok(Some(v))
     }
 
@@ -2628,7 +3311,7 @@ impl Worker {
         if let Val::Thunk { term, env, ls } = self.val(v) {
             let r = self.eval(term, env, ls)?;
             let r = self.force(r)?;
-            self.memo_mut(v).whnf = r;
+            self.memo_w(v).whnf = r;
             Ok(r)
         } else {
             Ok(v)
@@ -2775,11 +3458,153 @@ impl Worker {
             }
             Val::CloI { term, env, ls } => {
                 let b = self.tb(term);
+                if self.lam_any {
+                    if let Some(r) = self.lam_type_at(term, env, ls, x)? {
+                        return Ok(r);
+                    }
+                }
                 let e = self.push_for(x, env, b);
                 self.infer(b, e, ls, false)
             }
             _ => reject("binder expected"),
         }
+    }
+
+    /// Milestone 34: the codomain of a lambda's type at argument `a`
+    /// without inferring the body again. When the lambda was checked, its
+    /// body got type `r` under its variable `y`; if `r` does not mention
+    /// `y` (`lam_type_record`), `r` is the body's type at any argument of
+    /// the domain (substitution: y : A ⊢ b : r with y not in r gives
+    /// b[a/y] : r), as Lean instantiates the inferred Pi. Without it a
+    /// ladder of n redexes, each body inferred again at its argument, costs
+    /// n² (beta-ladder). release-da infers the body at `a` too and asserts
+    /// the types equal.
+    fn lam_type_at(&mut self, term: u32, env: u32, ls: u32, a: V) -> R<Option<V>> {
+        let i = (hmix(hmix(term as u64, env as u64), ls as u64) >> 20) as usize & LAM_DM_MASK;
+        let x = self.lam_dm[i];
+        if x[0] != term || x[1] != env || x[2] != ls || x[3] != self.cgen {
+            return Ok(None);
+        }
+        let (r, _y) = (x[4], x[5]);
+        #[cfg(debug_assertions)]
+        {
+            // y was not in scope when the lambda was checked (`open_var`),
+            // so the lambda's environment does not mention it (as
+            // `reuse_var` relies on): an entry holding y would be
+            // substituted too in the fact
+            let Val::Neu { head: Head::FVar(yi), .. } = self.val(_y) else { unreachable!() };
+            let mut f = u32::MAX;
+            assert_eq!(self.mentions_te(term, env, yi, &mut f), Some(false), "lambda type at an argument: the environment mentions the lambda's variable");
+            let b = self.tb(term);
+            let e2 = self.push_for(a, env, b);
+            let w = self.infer(b, e2, ls, false)?;
+            assert!(self.defeq(r, w)?, "lambda type at an argument: term {term} in {env}: the recorded type is not the inferred one");
+        }
+        let _ = a;
+        Ok(Some(r))
+    }
+    /// Milestone 34: lambda `lam` (in pruned environment `ek`, levels
+    /// `ls`), checked with variable `y`: its body `b` has type `r`. Kept
+    /// for `lam_type_at` when the body reads `y` (else one environment
+    /// serves every argument already), `r` has no free variable at all
+    /// (so not `y`), and the lambda's environment surely does not mention
+    /// `y`: an entry holding `y` would make the fact one about the body
+    /// with that entry and the argument equal, not the body at any
+    /// argument. `y` was not in scope when the lambda was checked, so by
+    /// milestone 20's invariant no entry holds it; this condition is
+    /// conservative and costs beta_ladder 86 -> 178 M. (An earlier
+    /// release-da check said "could not tell" on cedar and con-leche, read
+    /// at first as such an entry; a conclusive walk of every checked
+    /// lambda found none on init, std, cedar and con-leche.) Types that mention only
+    /// other variables were measured too (a walk per checked lambda, Init
+    /// +0.6% instructions): their records were not used enough to pay.
+    fn lam_type_record(&mut self, lam: u32, ek: u32, ls: u32, b: u32, r: V, y: V) {
+        if lam == NONE || self.trng(b) == 0 || self.used_mask(self.tb(lam)) & 1 == 0 || self.has_fvar(r) {
+            return;
+        }
+        let Val::Neu { head: Head::FVar(yi), .. } = self.val(y) else { return };
+        // the entries the lambda reads (its used mask); in a wide context
+        // every entry (no used-variable walk there). Each must be closed
+        // or a variable other than y; anything else is not walked (a walk
+        // of MENTION_FUEL values per entry cost con-leche +3%) and the
+        // type is not kept.
+        let mut fuel = 0;
+        let rng = self.trng(lam);
+        if rng <= 63 {
+            let mut m = self.used_mask(lam) & ((1u64 << rng) - 1);
+            while m != 0 {
+                let i = m.trailing_zeros();
+                m &= m - 1;
+                let Some(x) = self.env_at(ek, i) else { break };
+                if self.mentions_fv(x, yi, &mut fuel) != Some(false) {
+                    return;
+                }
+            }
+        } else if let Some((st, len)) = self.env_run(ek) {
+            for k in st..st + len {
+                let x = self.eslot(k);
+                if self.mentions_fv(x, yi, &mut fuel) != Some(false) {
+                    return;
+                }
+            }
+        }
+        let i = (hmix(hmix(lam as u64, ek as u64), ls as u64) >> 20) as usize & LAM_DM_MASK;
+        self.lam_dm[i] = [lam, ek, ls, self.cgen, r, y];
+        self.lam_any = true;
+    }
+
+    /// Does value `v` mention variable `fv` (an `fv_ty` index)? Walks the
+    /// entries terms read and spines; None when `fuel` runs out.
+    fn mentions_fv(&mut self, v: V, fv: u32, fuel: &mut u32) -> Option<bool> {
+        if v == HOLE || !self.has_fvar(v) {
+            return Some(false);
+        }
+        if let Val::Neu { head: Head::FVar(i), spine: EMPTY } = self.val(v) {
+            return Some(i == fv);
+        }
+        if *fuel == 0 {
+            return None;
+        }
+        *fuel -= 1;
+        match self.val(v) {
+            Val::Sort(_) | Val::Lit(_) => Some(false),
+            Val::Thunk { term, env, .. } | Val::Clo { term, env, .. } | Val::CloI { term, env, .. } => self.mentions_te(term, env, fv, fuel),
+            Val::Neu { head, spine } => {
+                match head {
+                    Head::FVar(i) => {
+                        if i == fv {
+                            return Some(true);
+                        }
+                    }
+                    Head::Const(..) => {}
+                    Head::Stuck(x) => {
+                        if self.mentions_fv(x, fv, fuel)? {
+                            return Some(true);
+                        }
+                    }
+                }
+                for i in 0..self.sp.len(spine) {
+                    let e = self.sp.args(spine)[i];
+                    if e & PROJ_BIT == 0 && self.mentions_fv(e, fv, fuel)? {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+        }
+    }
+    /// Does an entry of `env` that `term` reads mention variable `fv`?
+    fn mentions_te(&mut self, term: u32, env: u32, fv: u32, fuel: &mut u32) -> Option<bool> {
+        for i in 0..self.trng(term) {
+            if !self.uses_var(term, i) {
+                continue;
+            }
+            let Some(x) = self.env_at(env, i) else { break };
+            if self.mentions_fv(x, fv, fuel)? {
+                return Some(true);
+            }
+        }
+        Some(false)
     }
 
     pub fn const_head(&self, v: V) -> Option<(u32, u32, u32)> {
@@ -2795,6 +3620,19 @@ impl Worker {
     // -----------------------------------------------------------------------
     // Literals
 
+    /// Milestone 37: a Nat literal (or `Nat.zero`) in place.
+    pub fn nat_ref(&self, v: V) -> Option<&BigUint> {
+        match self.val(v) {
+            Val::Lit(i) => match self.lit(i) {
+                LitVal::Nat(n) => Some(n),
+                _ => None,
+            },
+            Val::Neu { head: Head::Const(r, _), spine: EMPTY } if self.canon_of_row(r) == self.env.known.nat_zero => {
+                Some(&BIG_ZERO)
+            }
+            _ => None,
+        }
+    }
     pub fn nat_of(&mut self, v: V) -> Option<BigUint> {
         match self.val(v) {
             Val::Lit(i) => match self.lit(i) {
@@ -2974,9 +3812,14 @@ impl Worker {
         }
         let Some(op) = k.nat_ops.iter().position(|&x| x == c && x != NONE) else { return Ok(None) };
         let a = self.whnf(args[0])?;
-        let Some(x) = self.nat_of(a) else { return Ok(None) };
+        if self.nat_ref(a).is_none() {
+            return Ok(None);
+        }
         let b = self.whnf(args[1])?;
-        let Some(y) = self.nat_of(b) else { return Ok(None) };
+        // milestone 37: the operands are read in place (they were cloned:
+        // two copies of up to tens of KB per operation on CFSG's bit-sliced
+        // tables)
+        let (Some(x), Some(y)) = (self.nat_ref(a), self.nat_ref(b)) else { return Ok(None) };
         let r = match NAT_OPS[op] {
             "add" => x + y,
             "sub" => {
@@ -2986,7 +3829,7 @@ impl Worker {
                     BigUint::zero()
                 }
             }
-            "mul" => x * y,
+            "mul" => nat_mul(x, y),
             "div" => {
                 if y.is_zero() {
                     BigUint::zero()
@@ -2996,14 +3839,20 @@ impl Worker {
             }
             "mod" => {
                 if y.is_zero() {
-                    x
+                    x.clone()
                 } else {
                     x % y
                 }
             }
-            "gcd" => num_integer::Integer::gcd(&x, &y),
-            "beq" => return self.mk_bool(x == y),
-            "ble" => return self.mk_bool(x <= y),
+            "gcd" => num_integer::Integer::gcd(x, y),
+            "beq" => {
+                let e = x == y;
+                return self.mk_bool(e);
+            }
+            "ble" => {
+                let e = x <= y;
+                return self.mk_bool(e);
+            }
             "land" => x & y,
             "lor" => x | y,
             "xor" => x ^ y,
@@ -3066,8 +3915,52 @@ impl Worker {
             }
             cur = r;
         }
-        self.memo_mut(v0).core_set(cheap, cur);
+        self.memo_w(v0).core_set(cheap, cur);
         Ok(cur)
+    }
+
+    /// Milestone 38: `whnf_core` for whnf's own loop, which may pause it:
+    /// Err(current term) when a checkpoint of the loop's region `g` is due,
+    /// or (no region) when the session wants regions. Recursors over a
+    /// literal (`go n b`, Nat.rec all the way) reduce without a delta step,
+    /// so a loop of a million steps never came back to whnf's loop, where
+    /// checkpoints and late regions are. Paused, `t`'s memo is not set (it
+    /// may not outlive the checkpoint).
+    #[inline(always)]
+    fn whnf_core_ck(&mut self, t: V, g: Option<region::Reg>) -> R<Result<V, V>> {
+        let v0 = self.force(t)?;
+        let m = self.memo_at(v0).core_get(false);
+        if m != NONE {
+            return Ok(Ok(m));
+        }
+        self.whnf_core_ck_miss(v0, g)
+    }
+    #[inline(never)]
+    fn whnf_core_ck_miss(&mut self, v0: V, g: Option<region::Reg>) -> R<Result<V, V>> {
+        let mut cur = v0;
+        loop {
+            let (r, again) = self.whnf_core_step(cur, false)?;
+            let r = self.force(r)?;
+            if !again {
+                cur = r;
+                break;
+            }
+            let m = self.memo_at(r).core_get(false);
+            if m != NONE {
+                cur = m;
+                break;
+            }
+            cur = r;
+            let pause = match &g {
+                Some(g) => self.reg_ckpt && self.reg_due(g),
+                None => self.reg_late2 && self.reg_wanted(),
+            };
+            if pause {
+                return Ok(Err(cur));
+            }
+        }
+        self.memo_w(v0).core_set(false, cur);
+        Ok(Ok(cur))
     }
 
     /// One step: `(value, true)` when it reduced and may reduce further.
@@ -3196,13 +4089,24 @@ impl Worker {
 
     /// The rule recursor `row` takes on major premise `major` and the
     /// constructor's fields: the major premise brought to a constructor as
-    /// the recursor reduces it (K, literals, structure eta).
+    /// the recursor reduces it (K, structure eta, literals).
+    ///
+    /// Structure eta comes before the major is reduced (lean4#15351, with
+    /// lean4#15371's condition): a major with no weak head normal form, such
+    /// as a proof built from Coquand's paradox, then never stops the
+    /// recursor. Literals keep their own expansion (String is a structure).
     fn rec_rule(&mut self, row: u32, major: V) -> R<Option<(usize, ArgVec)>> {
         let env = self.env;
         let CKind::Rec { rules, k, .. } = &env.consts[row as usize].kind else { return Ok(None) };
         let mut major = major;
         if *k {
             major = self.to_ctor_when_k(row, major)?;
+        }
+        major = self.force(major)?;
+        if !matches!(self.val(major), Val::Lit(_)) && !self.is_ctor_app_only(major) {
+            if let Some(&ind) = env.rec_major.get(&row) {
+                major = self.to_ctor_when_structure(row, ind, major)?;
+            }
         }
         major = self.whnf(major)?;
         if let Val::Lit(i) = self.val(major) {
@@ -3215,10 +4119,6 @@ impl Worker {
                     Some(x) => major = self.whnf(x)?,
                     None => return Ok(None),
                 },
-            }
-        } else if !self.is_ctor_app(major) {
-            if let Some(&ind) = env.rec_major.get(&row) {
-                major = self.to_ctor_when_structure(ind, major)?;
             }
         }
         let Some((crow, _, mspine)) = self.const_head(major) else { return Ok(None) };
@@ -3251,7 +4151,7 @@ impl Worker {
             }
         }
         let r = self.cases_shape_of(row);
-        self.shape_flags[row as usize] |= SH_CASES_KNOWN | if r.is_some() { SH_CASES_SOME } else { 0 };
+        self.shared.shape[row as usize].fetch_or(SH_CASES_KNOWN | if r.is_some() { SH_CASES_SOME } else { 0 }, Ordering::Relaxed);
         if r.is_some() {
             self.cases.insert(row, r);
         }
@@ -3259,10 +4159,7 @@ impl Worker {
     }
     #[inline(always)]
     fn shape_flag(&mut self, row: u32) -> u8 {
-        if row as usize >= self.shape_flags.len() {
-            self.shape_flags.resize(self.consts.len().max(row as usize + 1), 0);
-        }
-        self.shape_flags[row as usize]
+        self.shared.shape[row as usize].load(Ordering::Relaxed)
     }
     fn cases_shape_of(&mut self, row: u32) -> Option<(u32, u32)> {
         let c = &self.consts[row as usize];
@@ -3378,7 +4275,7 @@ impl Worker {
             }
         }
         let r = self.match_shape_of(row);
-        self.shape_flags[row as usize] |= SH_MATCH_KNOWN | if r.is_some() { SH_MATCH_SOME } else { 0 };
+        self.shared.shape[row as usize].fetch_or(SH_MATCH_KNOWN | if r.is_some() { SH_MATCH_SOME } else { 0 }, Ordering::Relaxed);
         if r.is_some() {
             self.matchers.insert(row, r);
         }
@@ -3500,6 +4397,17 @@ impl Worker {
         }
     }
 
+    /// A constructor applied to arguments only: no projection in the
+    /// spine. `is_ctor_app` also takes `(mk a b).0`, a projection that
+    /// whnf still reduces, which is right after whnf but not before it
+    /// (Lean's is_constructor_app does not see through Expr.proj).
+    pub fn is_ctor_app_only(&self, v: V) -> bool {
+        match self.const_head(v) {
+            Some((r, _, sp)) => matches!(self.consts[r as usize].kind, CKind::Ctor { .. }) && self.app_args(sp).is_some(),
+            None => false,
+        }
+    }
+
     pub fn ind_info(&self, row: u32) -> Option<(u32, u32, &[u32], bool)> {
         match &self.consts[row as usize].kind {
             CKind::Induct { nparams, nindices, ctors, is_rec, .. } => Some((*nparams, *nindices, ctors, *is_rec)),
@@ -3532,12 +4440,36 @@ impl Worker {
         let c = self.mk_const(crow, illr)?;
         let capp = self.mk_app(c, &targs[..np as usize])?;
         let nt = self.infer_val(capp)?;
+        // knobs, SK_KTRAP: a closed major whose type is not the
+        // constructor's syntactically (the comparison may compute)
+        if KNOBS && self.ktrap > 0 && t != nt && !self.has_fvar(major) {
+            let t0 = self.ticks as u64;
+            let r = self.defeq(t, nt)?;
+            self.stats.ktrap[0] += 1;
+            self.stats.ktrap[1] += self.ticks.wrapping_sub(t0 as u32) as u64;
+            if self.ktrap >= 2 {
+                eprintln!("KTRAP decl {} rec {} ticks {} result {r}\n  t  = {}\n  nt = {}", self.cur_decl, self.env.name_str(self.consts[rec_row as usize].name), self.ticks.wrapping_sub(t0 as u32) as u64, self.vshow(t, 6), self.vshow(nt, 6));
+                std::process::exit(7);
+            }
+            return if r { Ok(capp) } else { Ok(major) };
+        }
         if self.defeq(t, nt)? { Ok(capp) } else { Ok(major) }
     }
 
-    fn to_ctor_when_structure(&mut self, ind: u32, major: V) -> R<V> {
+    /// `mk params major.0 ... major.(n-1)` when recursor `rec_row`'s major
+    /// inductive `ind` is a non-recursive structure (one constructor, no
+    /// indices: Gruszka's own checked data) and the recursor eliminates into
+    /// every sort; otherwise `major` unchanged. Lean's to_cnstr_when_structure
+    /// after lean4#15371: a structure in Prop is expanded only when it
+    /// eliminates into every sort (like And): with no indices every field is
+    /// then a proof, so its projections are well typed; one that eliminates
+    /// only into Prop (like Exists) has no projections and is left alone.
+    fn to_ctor_when_structure(&mut self, rec_row: u32, ind: u32, major: V) -> R<V> {
         let irow = self.env.known_row(ind);
-        if irow == NONE || !self.visible(irow) || !self.structure_like(irow) || self.is_ctor_app(major) {
+        if irow == NONE || !self.visible(irow) || !self.structure_like(irow) || self.is_ctor_app_only(major) {
+            return Ok(major);
+        }
+        if !self.rec_elim_any_sort(rec_row) {
             return Ok(major);
         }
         let t = self.infer_val(major)?;
@@ -3546,10 +4478,27 @@ impl Worker {
         if self.canon_of_row(trow) != ind {
             return Ok(major);
         }
-        if self.is_prop_type(t)? || self.ind_in_prop(irow)? {
-            return Ok(major);
-        }
         self.expand_eta_struct(irow, tllr, tspine, major)
+    }
+
+    /// Does recursor `rec_row` eliminate into every sort? Lean's test
+    /// (lean4#15371): it has one more universe parameter, the motive's,
+    /// than the first inductive of its block (not the major's inductive,
+    /// which for a nested auxiliary recursor is another type). The
+    /// recursor's universe parameters were checked against the block's
+    /// elimination level when the block was added (induct.rs
+    /// check_recursors: equal when it eliminates only into Prop, one fresh
+    /// motive universe more otherwise), and its `all` against the block.
+    fn rec_elim_any_sort(&self, rec_row: u32) -> bool {
+        let env = self.env;
+        let c = &env.consts[rec_row as usize];
+        let CKind::Rec { all, .. } = &c.kind else { return false };
+        let Some(&first) = all.first() else { return false };
+        let frow = env.known_row(env.canon(first));
+        if frow == NONE || !matches!(env.consts[frow as usize].kind, CKind::Induct { .. }) {
+            return false;
+        }
+        c.lparams.len() == env.consts[frow as usize].lparams.len() + 1
     }
 
     fn expand_eta_struct(&mut self, irow: u32, tllr: u32, tspine: u32, v: V) -> R<V> {
@@ -3615,6 +4564,7 @@ impl Worker {
             return decline("a term has 65535 or more loose bound variables");
         }
         if self.blk.full {
+            self.arena_full = true;
             return decline("the worker's block arena is full");
         }
         match r {
@@ -3687,7 +4637,7 @@ impl Worker {
                 return Ok(if r == UF_NO { None } else { Some(r) });
             }
             let r = self.unfold_raw(v)?;
-            self.memo_mut(v).set_unfold(r.unwrap_or(UF_NO));
+            self.memo_w(v).set_unfold(r.unwrap_or(UF_NO));
             return Ok(r);
         }
         self.unfold_raw(v)
@@ -3708,6 +4658,14 @@ impl Worker {
 
     fn unfold_body(&mut self, v: V, row: u32, llr: u32, spine: u32, body: u32) -> R<V> {
         self.stats.unfolds += 1;
+        if KNOBS {
+            UHIST.with(|h| {
+                let mut h = h.borrow_mut();
+                if let Some(h) = h.as_mut() {
+                    *h.entry(row).or_insert(0) += 1;
+                }
+            });
+        }
         let args = self.app_args(spine).unwrap_or(&[]);
         if true {
             if let Some(r) = self.cases_direct(row, llr, &args)? {
@@ -3742,6 +4700,15 @@ impl Worker {
     }
     #[inline(never)]
     fn whnf_miss(&mut self, v: V) -> R<V> {
+        if dstack_on() {
+            dstack_push(b'W', v, NONE, self.ticks);
+            let r = self.whnf_miss1(v);
+            dstack_pop();
+            return r;
+        }
+        self.whnf_miss1(v)
+    }
+    fn whnf_miss1(&mut self, v: V) -> R<V> {
         match self.val(v) {
             Val::Sort(_) | Val::Lit(_) | Val::Clo { .. } | Val::CloI { .. } => return Ok(v),
             Val::Neu { head: Head::FVar(_), spine: EMPTY } => return Ok(v),
@@ -3753,23 +4720,190 @@ impl Worker {
             return Ok(m);
         }
         if STATS { self.stats.whnf_misses += 1; }
-        let mut t = v;
-        let r = loop {
-            self.tick()?;
-            let c = self.whnf_core(t)?;
-            if let Some(n) = self.reduce_nat(c)? {
-                break n;
+        if self.deep_at != 0 {
+            if self.wdepth == 0 {
+                return self.whnf_outer(v);
             }
-            match self.unfold(c)? {
-                Some(u) => t = u,
-                None => break c,
+            let x = 0u8;
+            let sp = std::hint::black_box(&x) as *const u8 as usize;
+            if self.stack_base.saturating_sub(sp) > self.deep_at || self.wdepth >= self.deep_cur {
+                self.deep_v = v;
+                return Err(Stop::Deep);
+            }
+        }
+        self.wdepth += 1;
+        if self.wdepth == self.deep_cur / 2 && self.deep_half == 0 {
+            self.deep_half = self.ticks | 1;
+        }
+        let r = self.whnf_body(v);
+        self.wdepth -= 1;
+        r
+    }
+
+    /// Milestone 38: the outermost whnf. A nested whnf past `deep_at`
+    /// bytes of stack that misses its memo is handed up here (`Stop::Deep`): it is worked
+    /// out from this shallow stack (its own deep misses handed up the same
+    /// way, so the deepest first), its memo kept, and the call tried again,
+    /// finding it. A lazy accumulator (`go n (xor b true)`, a fold whose
+    /// state no step looks at) is a chain of thunks as long as the loop,
+    /// each one's whnf inside the next one's: a million steps overflowed
+    /// the stack; now it is worked out a slice of half the stack at a time.
+    /// Handing up is costly where the chain is not one thread (each retry
+    /// walks again to the next deep point: CFSG's hD at 8192 levels took
+    /// 73 G instead of 19), so it waits for the stack to be at risk.
+    #[inline(never)]
+    fn whnf_outer(&mut self, v: V) -> R<V> {
+        let (a0, l0, d0) = (self.argstack.len(), self.let_vals.len(), self.vdepth);
+        let mut pend: Vec<V> = Vec::new();
+        let mut x = v;
+        loop {
+            self.wdepth = 1;
+            self.deep_half = 0;
+            let r = self.whnf_body(x);
+            self.wdepth = 0;
+            match r {
+                Ok(r) => match pend.pop() {
+                    None => return Ok(r),
+                    Some(y) => x = y,
+                },
+                Err(Stop::Deep) => {
+                    // the frames between were unwound: their stacks too
+                    self.argstack.truncate(a0);
+                    self.let_vals.truncate(l0);
+                    self.vdepth_to(d0);
+                    self.stats.deep_up += 1;
+                    // an attempt whose deeper half cost `deep_ticks` or more
+                    // per level is costly to try again: the bound doubles
+                    // (CFSG's hD, a deep tree of levels of ~84 ticks, took
+                    // 3.7x its work at a fixed bound; a lazy accumulator's
+                    // levels take ~8 and keep it)
+                    let per = if self.deep_half == 0 { 0 } else { self.ticks.wrapping_sub(self.deep_half) / (self.deep_cur / 2).max(1) };
+                    if per >= self.deep_ticks {
+                        self.deep_cur = self.deep_cur.saturating_mul(2);
+                    }
+                    pend.push(x);
+                    x = self.deep_v;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn whnf_body(&mut self, v: V) -> R<V> {
+        let m = self.memo_at(v).whnf;
+        if m != NONE {
+            return Ok(m);
+        }
+        // milestone 39: a closed value of a heavy declaration by the ground machine
+        if self.ground && (self.vals.len() >= self.ground_at || self.ground_all) && !self.ground_busy {
+            if let Some(r) = self.ground_whnf(v)? {
+                self.memo_w(v).whnf = r;
+                return Ok(r);
+            }
+        }
+        // milestone 36: past `reg_at` values the call is a region
+        // (SK_REGION_LATEGATE=1, knobs, gates: every region opens late)
+        let r = if self.reg_wanted() && !self.reg_lategate {
+            self.whnf_region(v, v)?
+        } else {
+            match self.whnf_loop(v)? {
+                Ok(r) => r,
+                // milestone 38: the session passed `reg_at` while this
+                // loop ran: the rest of it is a region (a late region)
+                Err(t) => {
+                    self.stats.late += 1;
+                    self.whnf_region(v, t)?
+                }
             }
         };
-        self.memo_mut(v).whnf = r;
+        self.memo_w(v).whnf = r;
         // only real steps: a value in normal form found again under another
         // id with the same name must come back as itself, or a caller that
         // asks whether anything changed would go round between the two
         Ok(r)
+    }
+
+    /// The whnf loop of `v` from its current term `t` as a region (opened
+    /// at `v`'s call, or late: at a step of the loop, which keeps only its
+    /// current term from one step to the next, as at a checkpoint).
+    #[inline(never)]
+    fn whnf_region(&mut self, v: V, t: V) -> R<V> {
+        Ok({
+            let mut g = self.reg_open(v);
+            // milestone 37: the loop's current term is all it keeps from
+            // one step to the next: past `reg_min` values made since the
+            // region (re)opened, the region closes with that term as its
+            // result and opens again (a checkpoint). A long tail loop (CPS
+            // code over big literals, CFSG's rowOK*: one whnf for the whole
+            // check) gave nothing back before it returned.
+            let mut t = t;
+            loop {
+                let step = (|| -> R<Result<V, V>> {
+                    self.tick()?;
+                    let c = match self.whnf_core_ck(t, Some(g))? {
+                        Ok(c) => c,
+                        Err(cur) => return Ok(Err(cur)),
+                    };
+                    if let Some(n) = self.reduce_nat(c)? {
+                        return Ok(Ok(n));
+                    }
+                    Ok(match self.unfold(c)? {
+                        Some(u) => Err(u),
+                        None => Ok(c),
+                    })
+                })();
+                match step {
+                    Ok(Ok(r)) => break self.reg_close(&g, v, r)?,
+                    Ok(Err(u)) => {
+                        t = u;
+                        if self.reg_ckpt && self.reg_due(&g) {
+                            (t, g) = self.reg_checkpoint(&g, v, t)?;
+                        }
+                    }
+                    Err(Stop::Deep) if self.wdepth == 1 && self.deep_roll => {
+                        // milestone 38: the outermost whnf's attempt ended
+                        // at a miss handed up from too deep: what it made is
+                        // given back but the handed-up value (it is tried
+                        // again after that value is worked out)
+                        self.deep_v = self.reg_close(&g, v, self.deep_v)?;
+                        return Err(Stop::Deep);
+                    }
+                    Err(e) => {
+                        self.reg_keep(&g);
+                        return Err(e);
+                    }
+                }
+            }
+        })
+    }
+
+    /// The whnf loop without a region: Ok(result), or Err(current term)
+    /// once the session wants regions (milestone 38: a loop that began
+    /// before the session passed `reg_at` gave nothing back until it
+    /// returned; CFSG's Fi24P7.MS.a0 multiplies 42 bit-sliced matrices in
+    /// loops entered early, 11 GB of dead literals).
+    #[inline(always)]
+    fn whnf_loop(&mut self, v: V) -> R<Result<V, V>> {
+        let mut t = v;
+        Ok(loop {
+            self.tick()?;
+            let c = match self.whnf_core_ck(t, None)? {
+                Ok(c) => c,
+                Err(cur) => break Err(cur),
+            };
+            if let Some(n) = self.reduce_nat(c)? {
+                break Ok(n);
+            }
+            match self.unfold(c)? {
+                Some(u) => {
+                    t = u;
+                    if self.reg_late && self.reg_wanted() {
+                        break Err(t);
+                    }
+                }
+                None => break Ok(c),
+            }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -3873,6 +5007,7 @@ impl Worker {
                 if STATS { self.stats.infer_misses += 1; }
                 let r = if env == self.kb_env && check && ls == 0 { self.infer_known(t, env)? } else { self.infer_core(t, env, ls, check)? };
                 icache_put(&mut self.infer_u, ukey, r, check, self.cur_lp);
+                self.ulog(Undo::InferU(ukey));
                 return Ok(r);
             }
         }
@@ -3930,6 +5065,7 @@ impl Worker {
                         assert!(self.defeq(r, w)?, "inference by name: term {t} in {env}: a type not the inferred one");
                     }
                     icache_put(&mut self.infer_cache, ikey2(t, env, ls), r, check, self.cur_lp);
+            self.ulog(Undo::Infer(ikey2(t, env, ls)));
                     return Ok(r);
                 }
                 nkey = k | check as u64;
@@ -3940,12 +5076,14 @@ impl Worker {
             if STATS { self.stats.checked_hits += 1; }
             let r = self.infer(t, EMPTY, 0, false)?;
             icache_put(&mut self.infer_cache, ikey2(t, env, ls), r, check, self.cur_lp);
+            self.ulog(Undo::Infer(ikey2(t, env, ls)));
             return Ok(r);
         }
         let tk0 = self.ticks;
         let r = if env == self.kb_env && check && ls == 0 { self.infer_known(t, env)? } else { self.infer_core(t, env, ls, check)? };
         if nkey != u64::MAX {
             self.nm.infer.insert(nkey, (r, self.ticks.wrapping_sub(tk0)));
+            self.ulog(Undo::NmInfer(nkey));
         }
         if closed_main && self.safety == 0 {
             if STATS { self.stats.checked_misses += 1; }
@@ -3956,6 +5094,7 @@ impl Worker {
             self.shared.checked[t as usize].store(x, Ordering::Relaxed);
         }
         icache_put(&mut self.infer_cache, ikey2(t, env, ls), r, check, self.cur_lp);
+            self.ulog(Undo::Infer(ikey2(t, env, ls)));
         Ok(r)
     }
 
@@ -3990,6 +5129,9 @@ impl Worker {
                 // milestone 23: read from the end, as in eval_loop
                 let n = self.argstack.len() - base;
                 let top = base + n - 1;
+                if is_lam(self.tk(f)) {
+                    self.lam_head = f;
+                }
                 let mut ft = self.infer(f, env, ls, check)?;
                 // the function type walked as a syntactic Pi (term, env, ls)
                 // while it is one, without making a value per argument
@@ -4048,11 +5190,17 @@ impl Worker {
             }
             k if is_lam(k) => {
                 if check {
+                    // milestone 35: a lambda's body type is used at an argument
+                    // only when the lambda is an application's head (bind_body
+                    // of its inference closure); kept only for those (keeping
+                    // it for every checked lambda cost cedar, con-leche +1%)
+                    let head = std::mem::replace(&mut self.lam_head, NONE) == t;
                     let mut e = env;
                     let mut b = t;
                     // milestone 23: on the stack (no allocation per lambda)
                     let mut xs: ArgVec = ArgVec::new();
                     let d0 = self.vdepth;
+                    let mut last = (NONE, NONE);
                     while is_lam(self.tk(b)) {
                         let d = self.ta(b);
                         let s = self.infer(d, e, ls, true)?;
@@ -4061,12 +5209,17 @@ impl Worker {
                         let x = self.open_var(dv)?;
                         let ek = self.prune(b, e);
                         self.lam_var.entry((b, ek, ls)).or_insert(x);
+                        self.ulog(Undo::LamVar((b, ek, ls)));
+                        last = (b, ek);
                         self.set_busy(x, true);
                         xs.push(x);
                         e = self.push_env(x, e);
                         b = self.tb(b);
                     }
                     let r = self.infer(b, e, ls, true);
+                    if let (true, Ok(rv)) = (head, r) {
+                        self.lam_type_record(last.0, last.1, ls, b, rv, xs[xs.len() - 1]);
+                    }
                     for (j, &x) in xs.iter().enumerate().rev() {
                         self.close_var(x, d0 + j as u32);
                     }
@@ -4120,8 +5273,23 @@ impl Worker {
                     }
                 }
                 let lb = self.let_body(t);
-                let e = self.push_arg(val, env, ls, env, lb)?;
-                self.infer(lb, e, ls, check)
+                if self.trng(lb) == 0 || self.used_mask(lb) & 1 == 0 {
+                    let e = self.push_arg(val, env, ls, env, lb)?;
+                    return self.infer(lb, e, ls, check);
+                }
+                // milestone 34: Lean checks the body with the variable in
+                // the local context; its value is pushed as before and
+                // remembered as a let variable's (`over_let`)
+                let av = self.thunk(val, env, ls)?;
+                let e = self.push_env(av, env);
+                let n0 = self.let_vals.len();
+                if !matches!(self.val(av), Val::Lit(_) | Val::Sort(_)) {
+                    self.let_vals.push(av);
+                }
+                let r = self.infer(lb, e, ls, check);
+                self.let_vals.truncate(n0);
+                self.let_skip = self.let_skip.min(n0);
+                r
             }
             NAT | STR => self.lit_type(k == NAT),
             PROJ => {
@@ -4187,12 +5355,26 @@ impl Worker {
             key.push(self.env_at(env, i)?);
             m &= m - 1;
         }
-        let n = self.uenv_map.len() as u32;
-        let id = *self.uenv_map.entry(key).or_insert(n);
+        let id = self.uenv_id(key);
         if true {
             self.udm[slot] = [u as u32, (u >> 32) as u32, env, self.cgen, id];
         }
         Some(id)
+    }
+
+    /// Milestone 36: the id of used-entries key `key` (counted, not the
+    /// map's length: a rollback removes entries).
+    fn uenv_id(&mut self, key: smallvec::SmallVec<[u32; 8]>) -> u32 {
+        if let Some(&id) = self.uenv_map.get(&key) {
+            return id;
+        }
+        let id = self.uenv_next;
+        self.uenv_next += 1;
+        if self.reg_vm != 0 {
+            self.undo.push(Undo::Uenv(key[..].into()));
+        }
+        self.uenv_map.insert(key, id);
+        id
     }
 
     /// Milestone 29: `used_env_id` past 63 entries, for a term reading at
@@ -4220,8 +5402,7 @@ impl Worker {
         for &i in vs.iter() {
             key.push(self.env_at(env, i)?);
         }
-        let n = self.uenv_map.len() as u32;
-        Some(*self.uenv_map.entry(key).or_insert(n))
+        Some(self.uenv_id(key))
     }
 
     /// Milestone 29: the loose variables of `t` (range past 63), sorted, if
@@ -4242,7 +5423,7 @@ impl Worker {
         let mut budget = WIDE_NODES;
         let r = if self.wide_walk(t, 0, &mut out, &mut budget) { out.sort_unstable(); out.dedup(); Some(out) } else { None };
         if t < self.mlen {
-            if self.wide_main.len() > (1 << 20) {
+            if self.wide_main.len() > self.uses_cap {
                 self.wide_main = FxHashMap::default();
             }
             self.wide_main.insert(t, r.clone());
@@ -4327,6 +5508,13 @@ impl Worker {
             _ => false,
         };
         if t < self.mlen {
+            // milestone 37: bounded as `wide_main` is (it grew without
+            // bound: 1.5 GB per worker by the end of FLT at 4 workers, and
+            // with every worker the same file's terms again)
+            if self.uses_main.len() >= self.uses_cap {
+                self.uses_main = Default::default();
+                self.stats.memo_flushes += 1;
+            }
             self.uses_main.insert((t, d), x);
         } else {
             self.uses0_memo.insert((t, d), x);
@@ -4537,7 +5725,7 @@ impl Worker {
                 t
             }
         };
-        self.memo_mut(v).infer = r;
+        self.memo_w(v).infer = r;
         Ok(r)
     }
 
@@ -4566,6 +5754,7 @@ impl Worker {
     }
     #[inline(always)]
     fn eq_put(&mut self, pk: u64, r: bool) {
+        self.ulog(Undo::Eq(pk));
         let f = self.eq_cache.entry(pk).or_insert(0);
         *f = (*f & EQ_SAME_NO) | EQ_KNOWN | if r { EQ_TRUE } else { 0 };
     }
@@ -4580,6 +5769,55 @@ impl Worker {
     }
     #[inline(never)]
     fn defeq_ne(&mut self, a: V, b: V) -> R<bool> {
+        if dstack_on() {
+            dstack_push(b'D', a, b, self.ticks);
+            let r = self.defeq_ne1(a, b);
+            dstack_pop();
+            return r;
+        }
+        self.defeq_ne1(a, b)
+    }
+    fn defeq_ne1(&mut self, a: V, b: V) -> R<bool> {
+        if KNOBS && TRACE.with(|t| t.get()) > 0 {
+            let d = TDEPTH.with(|t| { let x = t.get(); t.set(x + 1); x });
+            let t0 = self.ticks;
+            let lim = TRACE.with(|t| t.get());
+            if d < lim {
+                eprintln!("{:>2}{} DEQ> {} =?= {}", d, " ".repeat(d as usize), self.vshow(a, 3), self.vshow(b, 3));
+            }
+            let r = self.defeq_ne0(a, b);
+            TDEPTH.with(|t| t.set(d));
+            let dt = self.ticks.wrapping_sub(t0);
+            if d < lim || dt > 200_000 {
+                eprintln!("{:>2}{} DEQ< {:?} ticks {} : {} =?= {}", d, " ".repeat(d as usize), r.as_ref().ok(), dt, self.vshow(a, 3), self.vshow(b, 3));
+            }
+            return r;
+        }
+        self.defeq_ne0(a, b)
+    }
+    /// knobs SK_TRACE: a value as text (depth-limited)
+    fn vshow(&self, v: V, d: u32) -> String {
+        if d == 0 { return "_".into(); }
+        let tn = |w: &Self, t: u32| -> String {
+            let mut h = t; let mut n = 0;
+            while w.tk(h) == APP { h = w.ta(h); n += 1; }
+            let hn = if w.tk(h) == CONST { w.env.name_str(w.ta(h)) } else { format!("k{}", w.tk(h)) };
+            format!("{hn}/{n}")
+        };
+        match self.val(v) {
+            Val::Sort(_) => "Sort".into(),
+            Val::Lit(i) => match self.lit(i) { LitVal::Nat(n) => { let s = n.to_string(); if s.len() > 12 { format!("{}..({}d)", &s[..6], s.len()) } else { s } }, LitVal::Str(_) => "\"..\"".into() },
+            Val::Clo { term, .. } => format!("λ[{}]", tn(self, term)),
+            Val::CloI { term, .. } => format!("λI[{}]", tn(self, term)),
+            Val::Thunk { term, .. } => format!("T[{}]", tn(self, term)),
+            Val::Neu { head, spine } => {
+                let h = match head { Head::Const(r, _) => self.env.name_str(self.consts[r as usize].name), Head::FVar(i) => format!("x{i}"), Head::Stuck(x) => format!("({})", self.vshow(x, d - 1)) };
+                let args: Vec<String> = self.sp.args(spine).iter().map(|&e| if e & PROJ_BIT != 0 { ".p".into() } else { self.vshow(e, d - 1) }).collect();
+                if args.is_empty() { h } else { format!("({} {})", h, args.join(" ")) }
+            }
+        }
+    }
+    fn defeq_ne0(&mut self, a: V, b: V) -> R<bool> {
         self.tick()?;
         if STATS { self.stats.defeq_calls += 1; }
         cn!(940);
@@ -4712,6 +5950,7 @@ impl Worker {
             Err(e) => Err(e),
         };
         if self.probe_on && matches!(r, Err(Stop::Budget)) {
+            self.ulog(Undo::Eq(pk));
             *self.eq_cache.entry(pk).or_insert(0) |= EQ_PDEAD;
         }
         let r = r?;
@@ -4845,6 +6084,7 @@ impl Worker {
             self.eq_put(pk, true);
         } else if *fuel > 0 {
             // a decided difference (not one that ran out of fuel)
+            self.ulog(Undo::Eq(pk));
             *self.eq_cache.entry(pk).or_insert(0) |= EQ_SAME_NO;
         }
         r
@@ -5183,6 +6423,20 @@ impl Worker {
         if let Some(r) = self.quick(a, b)? {
             return Ok(r);
         }
+        // milestone 41 (Pestka's ProofsComparedBeforeReduced): a side that
+        // is a recursor into Prop applied up to its major premise is a proof;
+        // whnf_core would reduce it first, and a K-like recursor checks its
+        // major's type against the constructor's (a closed computation).
+        // Proof irrelevance answers from the two types, which whnf_core
+        // keeps up to definitional equality.
+        if self.pfirst && (self.proof_by_rec(a) || self.proof_by_rec(b)) {
+            self.stats.pfirst[0] += 1;
+            let ta = self.infer_val(a)?;
+            let tb = self.infer_val(b)?;
+            let r = self.defeq(ta, tb)?;
+            self.stats.pfirst[1] += r as u64;
+            return Ok(r);
+        }
         let a1 = self.whnf_core_c(a, true)?;
         let b1 = self.whnf_core_c(b, true)?;
         if a1 != a || b1 != b {
@@ -5196,6 +6450,11 @@ impl Worker {
         }
         if let Some(r) = self.proof_irrel(a1, b1)? {
             return Ok(r);
+        }
+        if self.ground && (self.vals.len() >= self.ground_at || self.ground_all) {
+            if let Some(r) = self.ground_try(a1, b1)? {
+                return Ok(r);
+            }
         }
         let (a2, b2) = match self.lazy_delta(a1, b1)? {
             Ok(r) => return Ok(r),
@@ -5370,6 +6629,74 @@ impl Worker {
         self.tele_not_proof(&ctx, self.ta(t), m)
     }
 
+    /// Milestone 41: `v` is a recursor applied at least up to its major
+    /// premise (no projection in its spine), at as many levels as the
+    /// recursor has parameters, whose motive ends in a sort that is zero at
+    /// those levels: its type is the motive applied, a proposition, so `v`
+    /// is a proof. Read from the recursor's declared type, no inference.
+    fn proof_by_rec(&mut self, v: V) -> bool {
+        let Val::Neu { head: Head::Const(row, llr), spine } = self.val(v) else { return false };
+        let CKind::Rec { nparams, nmotives, nminors, nindices, .. } = self.consts[row as usize].kind else { return false };
+        let major_idx = (nparams + nmotives + nminors + nindices) as usize;
+        if spine == EMPTY || self.sp.len(spine) <= major_idx || self.spine_has_proj(spine) {
+            return false;
+        }
+        if self.ll_get(llr).len() != self.consts[row as usize].lparams.len() {
+            return false;
+        }
+        let l = match self.rec_msort.get(&row) {
+            Some(&l) => l,
+            None => {
+                let l = self.rec_motive_sort(row, major_idx + 1);
+                self.rec_msort.insert(row, l);
+                l
+            }
+        };
+        if l == NONE {
+            return false;
+        }
+        let ls = self.mk_ls(row, llr);
+        let l = self.lsub(l, ls);
+        self.lv.zeroish(l)
+    }
+
+    /// The level (a term of the recursor's type) of the sort its motive
+    /// ends in: the recursor's type past `n` pis is a bound variable (one of
+    /// those pis) applied to k arguments, and that variable's domain past
+    /// k pis is a sort. NONE otherwise.
+    fn rec_motive_sort(&self, row: u32, n: usize) -> u32 {
+        let mut doms: SmallVec16 = SmallVec16::new();
+        let mut t = self.consts[row as usize].ty;
+        for _ in 0..n {
+            if !is_pi(self.tk(t)) {
+                return NONE;
+            }
+            doms.push(self.ta(t));
+            t = self.tb(t);
+        }
+        let mut h = t;
+        let mut k = 0usize;
+        while self.tk(h) == APP {
+            h = self.ta(h);
+            k += 1;
+        }
+        if self.tk(h) != BVAR {
+            return NONE;
+        }
+        let j = self.tp(h) as usize;
+        if j >= doms.len() {
+            return NONE;
+        }
+        let mut u = doms[doms.len() - 1 - j];
+        for _ in 0..k {
+            if !is_pi(self.tk(u)) {
+                return NONE;
+            }
+            u = self.tb(u);
+        }
+        if self.tk(u) == SORT { self.tp(u) } else { NONE }
+    }
+
     fn proof_irrel(&mut self, a: V, b: V) -> R<Option<bool>> {
         match self.val(a) {
             Val::Sort(_) | Val::Lit(_) => return Ok(None),
@@ -5459,8 +6786,140 @@ impl Worker {
     }
 
     /// Lean's lazy delta reduction. `Ok(r)` decided, `Err((a, b))` undecided.
-    fn lazy_delta(&mut self, mut a: V, mut b: V) -> R<Result<bool, (V, V)>> {
+    fn lazy_delta(&mut self, a: V, b: V) -> R<Result<bool, (V, V)>> {
+        if self.head_probe == 0 || self.probe_on {
+            return self.lazy_delta_r(a, b);
+        }
+        // milestone 41 (CommonHeadFirst): the reference loop under a budget;
+        // past it, each side unfolded a step at a time towards the other's
+        // head under the same budget; then the reference loop again
+        let budget = self.head_probe;
+        let t0 = self.ticks;
+        let d0 = self.vdepth;
+        self.probe_on = true;
+        self.probe_end = t0.wrapping_add(budget);
+        self.set_alarm();
+        let r = self.lazy_delta_r(a, b);
+        self.probe_on = false;
+        self.set_alarm();
+        match r {
+            Err(Stop::Budget) => self.vdepth_to(d0),
+            r => return r,
+        }
+        self.stats.headprobe[2] += self.ticks.wrapping_sub(t0) as u64;
+        self.stats.headprobe[0] += 1;
+        let tl = self.ticks;
+        for (x, y) in [(a, b), (b, a)] {
+            let t0 = self.ticks;
+            let d0 = self.vdepth;
+            self.probe_on = true;
+            self.probe_end = t0.wrapping_add(budget);
+            self.set_alarm();
+            let r = self.head_lookahead(x, y);
+            self.probe_on = false;
+            self.set_alarm();
+            match r {
+                Ok(true) => {
+                    self.stats.headprobe[1] += 1;
+                    self.stats.headprobe[3] += self.ticks.wrapping_sub(tl) as u64;
+                    return Ok(Ok(true));
+                }
+                Ok(false) => self.stats.headprobe[5] += 1,
+                Err(Stop::Budget) => self.vdepth_to(d0),
+                Err(e) => return Err(e),
+            }
+        }
+        self.stats.headprobe[3] += self.ticks.wrapping_sub(tl) as u64;
+        let tr = self.ticks;
+        let r = self.lazy_delta_r(a, b);
+        self.stats.headprobe[4] += self.ticks.wrapping_sub(tr) as u64;
+        r
+    }
+
+    /// Milestone 41 (CommonHeadFirst): `x` unfolded a step at a time (a
+    /// projection application reduced, else delta and cheap whnf_core)
+    /// until its head is `y`'s constant; then the two compared by their
+    /// arguments (congruence). false: no such head reached, or the
+    /// arguments not shown equal.
+    fn head_lookahead(&mut self, x: V, y: V) -> R<bool> {
+        let Some((ry, ly, sy)) = self.const_head(y) else { return Ok(false) };
+        if sy == EMPTY || self.spine_has_proj(sy) {
+            return Ok(false);
+        }
+        let cy = self.canon_of_row(ry);
+        let mut x = x;
         loop {
+            self.tick()?;
+            let w = match self.proj_app_step(x)? {
+                Some(w) => w,
+                None => {
+                    if self.delta_info(x).is_none() {
+                        return Ok(false);
+                    }
+                    let Some(u) = self.unfold(x)? else { return Ok(false) };
+                    self.whnf_core_c(u, true)?
+                }
+            };
+            x = w;
+            if x == y {
+                return Ok(true);
+            }
+            if let Some((rx, lx, sx)) = self.const_head(x) {
+                if self.canon_of_row(rx) == cy && sx != EMPTY && !self.spine_has_proj(sx) {
+                    return Ok(self.levels_equiv(lx, ly) && self.spines_defeq_skip(sx, sy, rx, lx, true)?);
+                }
+            }
+        }
+    }
+
+    fn lazy_delta_r(&mut self, a: V, b: V) -> R<Result<bool, (V, V)>> {
+        let mut reg: Option<region::Reg> = None;
+        let r = self.lazy_delta_loop(a, b, &mut reg);
+        let Some(g) = reg else { return r };
+        // milestone 38: the late region of a long lazy delta (see below)
+        match r {
+            Ok(Ok(e)) => {
+                self.reg_close(&g, a, a)?;
+                Ok(Ok(e))
+            }
+            Ok(Err((x, y))) if self.reg_old(&g, y) => Ok(Err((self.reg_close(&g, a, x)?, y))),
+            Ok(Err((x, y))) if self.reg_old(&g, x) => Ok(Err((x, self.reg_close(&g, a, y)?))),
+            r => {
+                self.reg_keep(&g);
+                r
+            }
+        }
+    }
+    /// Lazy delta's loop. Milestone 38: once the session wants regions
+    /// the rest of the loop is a region (`reg`), with checkpoints when one
+    /// side is older than the region (the loop keeps only the pair from one
+    /// step to the next). A `decide` over a lazy loop (`go n (xor b true)`
+    /// against `true`) unfolds here a step at a time, a million steps with
+    /// nothing given back.
+    #[inline(always)]
+    fn lazy_delta_loop(&mut self, mut a: V, mut b: V, reg: &mut Option<region::Reg>) -> R<Result<bool, (V, V)>> {
+        // the region's root: older than it
+        let a0 = a;
+        loop {
+            if self.reg_late2 {
+                match reg {
+                    None => {
+                        if self.reg_wanted() {
+                            self.stats.late_ld += 1;
+                            *reg = Some(self.reg_open(a0));
+                        }
+                    }
+                    Some(g) => {
+                        if self.reg_ckpt && self.reg_due(g) {
+                            if self.reg_old(g, b) {
+                                (a, *g) = self.reg_checkpoint(g, a0, a)?;
+                            } else if self.reg_old(g, a) {
+                                (b, *g) = self.reg_checkpoint(g, a0, b)?;
+                            }
+                        }
+                    }
+                }
+            }
             self.tick()?;
             // offsets
             // milestone 23: both sides' shapes first, so a literal's
@@ -5473,7 +6932,25 @@ impl Worker {
             if self.is_nat_zero(a) && self.is_nat_zero(b) {
                 return Ok(Ok(true));
             }
-            if !self.has_fvar(a) && !self.has_fvar(b) {
+            if !self.has_fvar(a) && !self.has_fvar(b) && !self.let_skip_fold(a, b)? {
+                // milestone 41: a Nat operation whose operands are not
+                // literals yet waits while the other side can unfold or
+                // the two are the same operation (NatFoldWaits)
+                match self.nat_fold_wait(a, b)? {
+                    NatWait::Fold => {}
+                    NatWait::Equal => return Ok(Ok(true)),
+                    NatWait::Next(x, y) => {
+                        a = x;
+                        b = y;
+                        if let Some(r) = self.quick(a, b)? {
+                            return Ok(Ok(r));
+                        }
+                        if self.quick_parts(a, b) {
+                            return Ok(Ok(true));
+                        }
+                        continue;
+                    }
+                }
                 if let Some(an) = self.reduce_nat(a)? {
                     return Ok(Ok(self.defeq(an, b)?));
                 }
@@ -5495,6 +6972,257 @@ impl Worker {
             // Pestka's afterStep: identical, already equal or of such parts
             if self.quick_parts(a, b) {
                 return Ok(Ok(true));
+            }
+            // milestone 39: one side came to data
+            if self.ground && (self.vals.len() >= self.ground_at || self.ground_all) {
+                if let Some(r) = self.ground_try(a, b)? {
+                    return Ok(Ok(r));
+                }
+            }
+        }
+    }
+
+    /// Milestone 34: Lean folds `Nat` arithmetic in lazy delta only on
+    /// terms without free variables, and a `let` body is checked with the
+    /// bound variable free (in the local context, with its value). Here the
+    /// value itself is in the environment, so a side built over it looks
+    /// closed and the fold evaluates the value (let-fold: `let d := bits 16
+    /// 0; d + 0 =?= Nat.add d 0` made 2^16 calls, where Lean unfolds
+    /// `HAdd.hAdd`). Is the fold to be skipped? When a side `reduce_nat`
+    /// would fold reads the value of a `let` whose body is being inferred,
+    /// the fold's arguments are evaluated first as a probe of LET_PROBE
+    /// ticks: within it the fold runs as before; past it the fold is
+    /// skipped and lazy delta unfolds (complete without the fold; Lean's
+    /// order), and so for every later pair over these lets in their scope.
+    /// Always skipping costs where folding small values is cheaper than
+    /// unfolding: Init's Char.ofOrdinal proofs (lets over 0xD800, unary
+    /// unfolding) ran out of memory; delta first as a probe made Mathlib's
+    /// Nat.clog_of_one_lt._proof_1_4 16 -> 103 M. Inside another probe the
+    /// fold runs (its budget bounds the work). release-da, on a skip, folds
+    /// as well and asserts lazy delta's answer after one step the same.
+    fn let_skip_fold(&mut self, a: V, b: V) -> R<bool> {
+        if self.let_vals.is_empty() || self.probe_on || !(self.nat_fold_head(a) || self.nat_fold_head(b)) {
+            return Ok(false);
+        }
+        let mut fuel = MENTION_FUEL;
+        if self.over_let(a, &mut fuel) != Some(true) && self.over_let(b, &mut fuel) != Some(true) {
+            return Ok(false);
+        }
+        let skip = if self.let_skip >= self.let_vals.len() {
+            true
+        } else {
+            let t0 = self.ticks;
+            let d0 = self.vdepth;
+            self.probe_on = true;
+            self.probe_end = t0.wrapping_add(LET_PROBE);
+            self.set_alarm();
+            let r = self.fold_args_whnf(a).and_then(|_| self.fold_args_whnf(b));
+            self.probe_on = false;
+            self.set_alarm();
+            match r {
+                Ok(()) => false,
+                Err(Stop::Budget) => {
+                    self.vdepth_to(d0);
+                    self.let_skip = self.let_vals.len();
+                    true
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        #[cfg(debug_assertions)]
+        if skip {
+            let n0 = std::mem::take(&mut self.let_vals);
+            let folded = match self.reduce_nat(a)? {
+                Some(an) => Some(self.defeq(an, b)?),
+                None => match self.reduce_nat(b)? {
+                    Some(bn) => Some(self.defeq(a, bn)?),
+                    None => None,
+                },
+            };
+            self.let_vals = n0;
+            let d = match self.delta_step(a, b)? {
+                DStep::Equal => Some(true),
+                DStep::Next(x, y) => Some(self.defeq(x, y)?),
+                DStep::Stuck => None,
+            };
+            if let (Some(f), Some(d)) = (folded, d) {
+                assert_eq!(d, f, "literal folding over a let value: lazy delta and the fold disagree");
+            }
+        }
+        Ok(skip)
+    }
+    /// The arguments `reduce_nat` brings to weak head normal form for `v`.
+    fn fold_args_whnf(&mut self, v: V) -> R<()> {
+        if !self.nat_fold_head(v) {
+            return Ok(());
+        }
+        let Some((_, _, spine)) = self.const_head(v) else { return Ok(()) };
+        let Some(args) = self.app_args(spine) else { return Ok(()) };
+        let args = ArgVec::from_slice(args);
+        for &x in args.iter() {
+            self.whnf(x)?;
+        }
+        Ok(())
+    }
+    /// Milestone 41 (NatFoldWaits). Lean's lazy delta folds a Nat
+    /// operation as soon as a side is one, bringing its operands to weak
+    /// head normal form: in CFSG's totalC, `List.sum [x, y] =?= x + (y + 0)`
+    /// with `x` a closed count over a whole enumeration computed `x`, where
+    /// unfolding `List.sum` on the other side reaches the same `x` by
+    /// congruence. A side `Nat.op x y` whose operands are not literals
+    /// already (no whnf is asked) waits:
+    /// - the other side the same operation: the operands are compared
+    ///   first (congruence; equal operands give equal results), and fold
+    ///   only if they are not shown equal;
+    /// - the other side unfolds (a definition, not a Nat operation, or a
+    ///   projection application that reduces): it takes one step, and the
+    ///   loop goes on;
+    /// - otherwise (a literal, a constructor, a stuck term) the fold
+    ///   happens as before.
+    /// The steps are the kernel's own (delta, whnf_core, congruence) in
+    /// another order; a fold is never refused, only delayed while the
+    /// other side still unfolds, so the answer is the one lazy delta gives.
+    fn nat_fold_wait(&mut self, a: V, b: V) -> R<NatWait> {
+        if !self.nat_wait {
+            return Ok(NatWait::Fold);
+        }
+        let (fa, fb) = (self.nat_fold_head(a) && !self.nat_args_lit(a), self.nat_fold_head(b) && !self.nat_args_lit(b));
+        if !fa && !fb {
+            return Ok(NatWait::Fold);
+        }
+        if fa && fb || (self.nat_fold_head(a) && self.nat_fold_head(b)) {
+            let (ra, la, sa) = self.const_head(a).unwrap();
+            let (rb, lb, sb) = self.const_head(b).unwrap();
+            if self.canon_of_row(ra) == self.canon_of_row(rb) && !self.fail_cache.contains(&(a, b)) {
+                self.stats.natwait[0] += 1;
+                // under CommonHeadFirst's budget: two runs of one
+                // computation on different inputs agree in shape down to
+                // where the inputs differ (CFSG traps' s2bad: `g 19 0`
+                // against `g 19 1`, congruence nested 2^19 deep), so a
+                // comparison past the budget folds, as the reference does
+                let eq = self.levels_equiv(la, lb) && self.budgeted(|w| w.spines_defeq_skip(sa, sb, ra, la, true))? == Some(true);
+                if eq {
+                    self.stats.natwait[1] += 1;
+                    return Ok(NatWait::Equal);
+                }
+                self.fail_cache.insert((a, b));
+                self.ulog(Undo::Fail(a, b));
+            }
+            return Ok(NatWait::Fold);
+        }
+        // one side waits; the other unfolds if it can
+        let o = if fa { b } else { a };
+        if self.nat_fold_head(o) {
+            return Ok(NatWait::Fold);
+        }
+        // a projection application first (as delta_step's
+        // try_unfold_proj_app), else one unfolding
+        let u = match self.proj_app_step(o)? {
+            Some(w) => w,
+            None => {
+                if self.delta_info(o).is_none() {
+                    return Ok(NatWait::Fold);
+                }
+                let Some(u) = self.unfold(o)? else { return Ok(NatWait::Fold) };
+                self.whnf_core_c(u, true)?
+            }
+        };
+        self.stats.natwait[2] += 1;
+        Ok(if fa { NatWait::Next(a, u) } else { NatWait::Next(u, b) })
+    }
+    /// Milestone 41: `f` under a budget of `head_probe` ticks (the argument
+    /// probes' machinery); None past it. Inside another probe, `f` shares
+    /// that probe's budget.
+    fn budgeted<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
+        if self.probe_on {
+            return f(self).map(Some);
+        }
+        if self.head_probe == 0 {
+            return f(self).map(Some);
+        }
+        let t0 = self.ticks;
+        let d0 = self.vdepth;
+        self.probe_on = true;
+        self.probe_end = t0.wrapping_add(self.head_probe);
+        self.set_alarm();
+        let r = f(self);
+        self.probe_on = false;
+        self.set_alarm();
+        match r {
+            Ok(x) => Ok(Some(x)),
+            Err(Stop::Budget) => {
+                self.vdepth_to(d0);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Are all of the operation's operands literals already (or values
+    /// whose weak head normal form, already known, is one)?
+    fn nat_args_lit(&mut self, v: V) -> bool {
+        let Some((_, _, spine)) = self.const_head(v) else { return false };
+        let Some(args) = self.app_args(spine) else { return false };
+        let args = ArgVec::from_slice(args);
+        args.iter().all(|&x| {
+            if self.nat_ref(x).is_some() {
+                return true;
+            }
+            let w = self.memo_at(x).whnf;
+            w != NONE && self.nat_ref(w).is_some()
+        })
+    }
+
+    /// Is `v` an application `reduce_nat` folds (a `Nat` operation)?
+    fn nat_fold_head(&self, v: V) -> bool {
+        match self.const_head(v) {
+            Some((row, _, spine)) => spine != EMPTY && self.env.nat_op[row as usize] != 0,
+            None => false,
+        }
+    }
+    /// Does `v` read one of `let_vals` (entries terms read, spines)? None
+    /// when `fuel` runs out.
+    fn over_let(&mut self, v: V, fuel: &mut u32) -> Option<bool> {
+        if v == HOLE {
+            return Some(false);
+        }
+        if self.let_vals.contains(&v) {
+            return Some(true);
+        }
+        if *fuel == 0 {
+            return None;
+        }
+        *fuel -= 1;
+        match self.val(v) {
+            Val::Sort(_) | Val::Lit(_) => Some(false),
+            Val::Thunk { term, env, .. } | Val::Clo { term, env, .. } | Val::CloI { term, env, .. } => {
+                if self.trng(term) > 63 {
+                    return None;
+                }
+                for i in 0..self.trng(term) {
+                    if !self.uses_var(term, i) {
+                        continue;
+                    }
+                    let Some(x) = self.env_at(env, i) else { break };
+                    if self.over_let(x, fuel)? {
+                        return Some(true);
+                    }
+                }
+                Some(false)
+            }
+            Val::Neu { head, spine } => {
+                if let Head::Stuck(x) = head {
+                    if self.over_let(x, fuel)? {
+                        return Some(true);
+                    }
+                }
+                for i in 0..self.sp.len(spine) {
+                    let e = self.sp.args(spine)[i];
+                    if e & PROJ_BIT == 0 && self.over_let(e, fuel)? {
+                        return Some(true);
+                    }
+                }
+                Some(false)
             }
         }
     }
@@ -5553,7 +7281,7 @@ impl Worker {
                         if sa != EMPTY && sb != EMPTY && !self.fail_cache.contains(&(a, b)) {
                             #[cfg(feature = "cnt")]
                             let tk0 = self.ticks;
-                            let same = self.levels_equiv(la, lb) && self.spines_defeq_skip(sa, sb, ra, la, true)?;
+                            let same = self.levels_equiv(la, lb) && !self.args_refuted(sa, sb, ra, la)? && self.spines_defeq_skip(sa, sb, ra, la, true)?;
                             #[cfg(feature = "cnt")]
                             {
                                 let d = self.ticks.wrapping_sub(tk0) as u64;
@@ -5564,6 +7292,7 @@ impl Worker {
                                 return Ok(DStep::Equal);
                             }
                             self.fail_cache.insert((a, b));
+                            self.ulog(Undo::Fail(a, b));
                         }
                     }
                     if ra == rb && !matches!(ha, Hint::Regular(_)) {
@@ -5574,6 +7303,7 @@ impl Worker {
                                 return Ok(DStep::Equal);
                             }
                             self.fail_cache.insert((a, b));
+                            self.ulog(Undo::Fail(a, b));
                         }
                     }
                     let ua = self.unfold(a)?;
@@ -5606,10 +7336,10 @@ impl Worker {
             return true;
         }
         if c >= 2 {
-            let mut k = self.abbr_shape[row as usize];
+            let mut k = self.shared.abbr[row as usize].load(Ordering::Relaxed);
             if k == 0 {
                 k = self.abbr_shape_of(row);
-                self.abbr_shape[row as usize] = k;
+                self.shared.abbr[row as usize].store(k, Ordering::Relaxed);
             }
             if c == 2 {
                 return k >= 2;
@@ -5635,10 +7365,10 @@ impl Worker {
         if ea.len() != eb.len() {
             return false;
         }
-        let mut m = self.explicit_pos[row as usize];
+        let mut m = self.shared.explicit[row as usize].load(Ordering::Relaxed);
         if m == 0 {
             m = self.explicit_mask(row);
-            self.explicit_pos[row as usize] = m;
+            self.shared.explicit[row as usize].store(m, Ordering::Relaxed);
         }
         let ea = self.sp.args(sa);
         let eb = self.sp.args(sb);
@@ -5744,6 +7474,49 @@ impl Worker {
         }
         m
     }
+    /// Milestone 36: before lazy delta compares the arguments of the same
+    /// regular definition left to right, each pair is tried under a small
+    /// budget; a pair found different settles it (the arguments are not
+    /// all equal), so a later cheap difference (`getD l 2 _` against
+    /// `getD l' 0 _`) is found before an earlier argument is evaluated in
+    /// full (lyLet_mem: the 111x111 matrices of `aStarList`). A false here
+    /// only skips the shortcut: both sides are unfolded as after any
+    /// failed argument comparison, so verdicts cannot depend on it.
+    fn args_refuted(&mut self, sa: u32, sb: u32, row: u32, llr: u32) -> R<bool> {
+        if self.probe_on || !self.args_refute || self.spine_has_proj(sa) || self.spine_has_proj(sb) {
+            return Ok(false);
+        }
+        let n = self.sp.len(sa);
+        if n != self.sp.len(sb) || n < 2 {
+            return Ok(false);
+        }
+        let skip = self.prop_positions(row, llr)?;
+        for i in (0..n).rev() {
+            if i < 64 && skip & (1u64 << i) != 0 {
+                continue;
+            }
+            let (x, y) = (self.sp.args(sa)[i], self.sp.args(sb)[i]);
+            if x == y {
+                continue;
+            }
+            let t0 = self.ticks;
+            let d0 = self.vdepth;
+            self.probe_on = true;
+            self.probe_end = t0.wrapping_add(REFUTE_TICKS);
+            self.set_alarm();
+            let r = self.defeq(x, y);
+            self.probe_on = false;
+            self.set_alarm();
+            match r {
+                Ok(false) => return Ok(true),
+                Ok(true) => {}
+                Err(Stop::Budget) => self.vdepth_to(d0),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(false)
+    }
+
     fn probe_args(&mut self, sa: u32, sb: u32, row: u32, llr: u32) -> R<bool> {
         if self.probe_on {
             return self.spines_defeq_skip(sa, sb, row, llr, true);
@@ -5954,9 +7727,10 @@ impl Worker {
 
     /// (leading lambdas, positions never read) of a definition's value.
     fn unused_args(&mut self, row: u32) -> (u8, u64) {
-        let (l, m) = self.unused[row as usize];
-        if l != 254 {
-            return (l, m);
+        let l = self.shared.unused_l[row as usize].load(Ordering::Acquire);
+        if l != 0 {
+            let m = self.shared.unused_m[row as usize].load(Ordering::Relaxed);
+            return (if l == 255 { 255 } else { l - 1 }, m);
         }
         let r = match self.consts[row as usize].kind {
             CKind::Defn { value, .. } if value < self.mlen => {
@@ -5980,7 +7754,8 @@ impl Worker {
             }
             _ => (255, 0),
         };
-        self.unused[row as usize] = r;
+        self.shared.unused_m[row as usize].store(r.1, Ordering::Relaxed);
+        self.shared.unused_l[row as usize].store(if r.0 == 255 { 255 } else { r.0 + 1 }, Ordering::Release);
         r
     }
 
@@ -6236,6 +8011,9 @@ impl Worker {
         self.cur_lp_list = NONE;
         self.cur_lp = self.lp_list();
         self.lp_ok.clear();
+        self.ground_fuel = self.ground_fuel0;
+        self.ground_out_at = None;
+        self.gm = None;
     }
 
     pub fn set_lparams(&mut self, lp: Vec<u32>) {
@@ -6489,6 +8267,9 @@ pub const HOLE: u32 = PROJ_BIT - 1;
 /// dividing 4096, the cancellation period)
 const TICK_STACK: u32 = 256;
 const UDM_MASK: usize = (1 << 14) - 1;
+/// milestone 34: slots of `lam_dm` minus one (a map grew with every checked
+/// lambda of closed body type: cedar and con-leche +1%)
+const LAM_DM_MASK: usize = (1 << 12) - 1;
 
 #[cfg(feature = "cnt")]
 pub static THUNK_KINDS: [std::sync::atomic::AtomicU64; 1200] = [const { std::sync::atomic::AtomicU64::new(0) }; 1200];
@@ -6498,4 +8279,29 @@ const TDM_MASK: usize = (1 << 13) - 1;
 #[inline(always)]
 fn hmix(h: u64, x: u64) -> u64 {
     (h ^ x).wrapping_mul(0x9E37_79B9_7F4A_7C15).rotate_left(29)
+}
+
+#[cfg(test)]
+mod nat_tests {
+    use super::*;
+    #[test]
+    fn nat_mul_matches() {
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2000 {
+            let nl = 32 + (rnd() % 64) as usize;
+            let ns = 1 + (rnd() % 4) as usize;
+            let mut a: Vec<u32> = (0..2 * nl).map(|_| if rnd() % 3 == 0 { rnd() as u32 } else { 0 }).collect();
+            a.push(1);
+            let b: Vec<u32> = (0..2 * ns).map(|_| if rnd() % 4 == 0 { 0 } else { rnd() as u32 }).collect();
+            let (x, y) = (BigUint::new(a), BigUint::new(b));
+            assert_eq!(nat_mul(&x, &y), &x * &y);
+            assert_eq!(nat_mul(&y, &x), &x * &y);
+        }
+    }
 }

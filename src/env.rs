@@ -69,8 +69,12 @@ pub struct Node {
 /// no bounds check). The range covers every u32 id (64 GiB + 32 GiB of
 /// address space, reserved once, pages made on first write), so a read at
 /// any id reads mapped memory. Layout: MAIN at ids [0, main_len); after it
-/// (rounded up to 2^16) slabs of `slab` ids, two per worker (session and
+/// (rounded up to 2^16) the two overflow arenas of `big` ids each
+/// (milestone 35), then slabs of `slab` ids, two per worker (session and
 /// scratch arena), all below 2^31 (term ids share u32s with LL_POOL refs).
+/// A declaration whose blocks do not fit its worker's slab runs again in
+/// the overflow arenas (one worker at a time); their size does not depend
+/// on the number of workers, so neither does the verdict.
 /// Soundness: a node is read only at an id of MAIN or of the current
 /// arena's pushed nodes (`Worker::term_live`, asserted in release-da).
 pub struct Region {
@@ -79,6 +83,9 @@ pub struct Region {
     first: std::sync::atomic::AtomicU32,
     slab: std::sync::atomic::AtomicU32,
     next: std::sync::atomic::AtomicU32,
+    /// milestone 35: the overflow arenas (session, scratch), taken by one
+    /// worker at a time; set by `layout`
+    pub big: std::sync::Mutex<Option<(Cols, Cols)>>,
 }
 unsafe impl Sync for Region {}
 unsafe impl Send for Region {}
@@ -124,7 +131,7 @@ pub fn region() -> &'static Region {
         let nodes = vm::reserve(ID_SPACE * 16) as *mut Node;
         let used = vm::reserve(ID_SPACE * 8) as *mut u64;
         assert!(!nodes.is_null() && !used.is_null(), "cannot reserve the term address range");
-        Region { nodes, used, first: 0.into(), slab: 0.into(), next: 0.into() }
+        Region { nodes, used, first: 0.into(), slab: 0.into(), next: 0.into(), big: std::sync::Mutex::new(None) }
     })
 }
 
@@ -141,32 +148,50 @@ impl Region {
     pub fn main_cols(&self, cap: usize) -> Cols {
         Cols::at(self, 0, cap.min(ID_LIMIT as usize / 2))
     }
-    /// After MAIN is loaded: `n` slabs share the ids left below 2^31.
-    /// Err when they would be smaller than 2^20 nodes.
-    pub fn layout(&self, main_len: usize, n: usize) -> Result<(), String> {
+    /// After MAIN is loaded: the two overflow arenas, then two slabs per
+    /// worker share the ids left below 2^31. Returns the number of workers
+    /// whose slabs fit (at least 2^20 ids each; fewer workers than asked
+    /// when they do not). Err when MAIN leaves no room for overflow arenas
+    /// of 2^20 ids (whatever the number of workers).
+    pub fn layout(&self, main_len: usize, workers: usize) -> Result<usize, String> {
         use std::sync::atomic::Ordering::Relaxed;
         let first = (main_len as u64 + 0xffff) & !0xffff;
         let room = ID_LIMIT.saturating_sub(first);
-        let mut s = (room / n.max(1) as u64).min(1 << 28) & !0xffff;
+        // a quarter of the room each (at most 2^28 ids, 6 GiB of nodes)
+        let mut big = (room / 4).min(1 << 28) & !0xffff;
+        let rest = room - 2 * big;
+        let mut workers = workers.max(1);
+        let mut s = (rest / (2 * workers) as u64).min(1 << 28) & !0xffff;
+        if s < 1 << 20 {
+            workers = (rest / (2 << 20)) as usize;
+            s = 1 << 20;
+        }
+        if big < 1 << 20 || workers == 0 {
+            return Err(format!("no room for block arenas next to {main_len} MAIN nodes"));
+        }
         // knobs builds: SK_SLAB_IDS=n makes the slabs n ids, a multiple of 4096 (to test the
-        // full path: a block past it declines)
+        // full path: a block past it runs in the overflow arenas); SK_BIG_IDS=n makes the
+        // overflow arenas n ids (default: SK_SLAB_IDS, so a block past it declines)
         if cfg!(feature = "knobs") {
-            if let Some(k) = std::env::var("SK_SLAB_IDS").ok().and_then(|x| x.parse::<u64>().ok()) {
-                let k = k.max(1 << 12) & !0xfff;
-                if k < s {
-                    s = k;
-                    self.first.store(first as u32, Relaxed);
-                    self.slab.store(s as u32, Relaxed);
-                    return Ok(());
-                }
+            let knob = |v: &str| std::env::var(v).ok().and_then(|x| x.parse::<u64>().ok()).map(|k| k.max(1 << 12) & !0xfff);
+            if let Some(k) = knob("SK_SLAB_IDS") {
+                s = s.min(k);
+                big = big.min(k);
+            }
+            // (SK_BIG_IDS=0: the default size, with small slabs)
+            if let Ok(k) = std::env::var("SK_BIG_IDS") {
+                let d = (room / 4).min(1 << 28) & !0xffff;
+                big = match k.parse::<u64>() {
+                    Ok(0) => d,
+                    _ => d.min(knob("SK_BIG_IDS").unwrap_or(d)),
+                };
             }
         }
-        if s < 1 << 20 {
-            return Err(format!("{n} block arenas do not fit next to {main_len} MAIN nodes"));
-        }
-        self.first.store(first as u32, Relaxed);
+        self.first.store((first + 2 * big) as u32, Relaxed);
         self.slab.store(s as u32, Relaxed);
-        Ok(())
+        let b = (Cols::at(self, first as u32, big as usize), Cols::at(self, (first + big) as u32, big as usize));
+        *self.big.lock().unwrap() = Some(b);
+        Ok(workers)
     }
     /// One block arena (a slab of the layout).
     pub fn take(&self) -> Cols {
@@ -246,6 +271,17 @@ impl<T: Copy> Slab<T> {
     pub fn clear(&mut self) {
         self.hw = self.hw.max(self.len);
         self.len = 0;
+    }
+    /// Milestone 37: bytes of pages held (the high-water mark since pages
+    /// were last given back)
+    pub fn held_bytes(&self) -> usize {
+        self.hw.max(self.len) * std::mem::size_of::<T>()
+    }
+    /// Milestone 36: drops the elements past `n` (a region's rollback; the
+    /// pages stay for the elements made next).
+    pub fn truncate(&mut self, n: usize) {
+        self.hw = self.hw.max(self.len);
+        self.len = self.len.min(n);
     }
     /// After `clear`: keeps about `max / 2` bytes of pages when more than
     /// `max` are held (as `clear_vec` shrinks a vector); the rest go back.

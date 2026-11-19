@@ -16,6 +16,9 @@
 //! admitted unchecked)` (0), `rejected: ...` (1), `declined: ...` (2) or
 //! `index invalid: ...` (2), never `accepted`. README, "Checking part of a
 //! file".
+//!
+//! `--progress[=SECS]` (milestone 37), anywhere: a progress line on stderr
+//! every SECS seconds (default 10).
 
 mod env;
 mod induct;
@@ -266,8 +269,59 @@ fn unsafe_or_partial(c: &env::ConstInfo) -> bool {
     }
 }
 
+/// Milestone 37: `--progress[=SECS]` anywhere in the arguments: a progress
+/// line on stderr every SECS seconds (default 10); None when absent.
+fn progress_of(args: &[String]) -> (Option<u64>, Vec<String>) {
+    let mut every = None;
+    let mut rest = Vec::new();
+    for a in args {
+        if a == "--progress" {
+            every = Some(10);
+        } else if let Some(v) = a.strip_prefix("--progress=") {
+            match v.parse::<u64>() {
+                Ok(n) if n > 0 => every = Some(n),
+                _ => {
+                    eprintln!("--progress=SECS: SECS is a whole number of seconds, at least 1");
+                    std::process::exit(2);
+                }
+            }
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (every, rest)
+}
+
+/// This process's resident memory now, in bytes (0 where unknown).
+fn rss_now() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // proc_pid_rusage: ri_phys_footprint, as `time -l` reports it
+        unsafe extern "C" {
+            fn proc_pid_rusage(pid: i32, flavor: i32, buf: *mut u64) -> i32;
+        }
+        let mut b = [0u64; 64];
+        // RUSAGE_INFO_V0: ri_phys_footprint is the 9th u64 (after the uuid)
+        if unsafe { proc_pid_rusage(std::process::id() as i32, 0, b.as_mut_ptr()) } == 0 {
+            return b[9];
+        }
+        0
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1).and_then(|x| x.parse::<u64>().ok()))
+            .map_or(0, |p| p * 4096)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        0
+    }
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let (progress, args) = progress_of(&std::env::args().collect::<Vec<_>>());
     // milestone 26: `--only NAME[,NAME...]` anywhere, as Pestka takes it
     let only_names: Option<Vec<String>> = only_of(&args[1..]);
     let args: Vec<String> = match &only_names {
@@ -278,7 +332,7 @@ fn main() {
         finish(2, "declined: usage: gruszka --only NAME[,NAME...] FILE.susz [WORKERS]; NAME may be Foo.* for every name under Foo");
     }
     if args.len() < 2 {
-        eprintln!("usage: gruszka FILE [WORKERS] | gruszka --only NAME[,NAME...] FILE.susz [WORKERS]");
+        eprintln!("usage: gruszka [--progress[=SECS]] FILE [WORKERS] | gruszka --only NAME[,NAME...] FILE.susz [WORKERS]");
         std::process::exit(2);
     }
     let path = &args[1];
@@ -341,16 +395,25 @@ fn main() {
     };
     let env: &'static env::Env<'static> = Box::leak(Box::new(env));
     // milestone 18: block arenas after MAIN in the term range, two per worker
-    if let Err(m) = env::region().layout(env.main.len(), 2 * workers) {
-        finish(2, &format!("declined: {m}"));
-    }
+    // (milestone 35: and the two overflow arenas before them; fewer workers
+    // when their arenas do not fit)
+    let workers = match env::region().layout(env.main.len(), workers) {
+        Ok(w) => {
+            if w < workers {
+                eprintln!("note: {w} workers (the block arenas of {workers} do not fit)");
+            }
+            w
+        }
+        Err(m) => finish(2, &format!("declined: {m}")),
+    };
     // the MAIN pages were copied into columns: let them go
     let remap_on = mapped;
     if remap_on && !remap(bytes, path) {
         eprintln!("note: could not map the file again");
     }
     let nd = env.decl_rows.len();
-    let shared: &'static tc::Shared = Box::leak(Box::new(tc::Shared::new(env.main.len())));
+    tc::set_workers(workers);
+    let shared: &'static tc::Shared = Box::leak(Box::new(tc::Shared::new(env.main.len(), env.consts.len())));
     let first_fail: &'static AtomicU32 = Box::leak(Box::new(AtomicU32::new(u32::MAX)));
     let status: Vec<AtomicU8> = (0..nd).map(|_| AtomicU8::new(0)).collect();
     let msgs: Mutex<Vec<(u32, String)>> = Mutex::new(Vec::new());
@@ -450,10 +513,60 @@ fn main() {
     const STACK: usize = 1 << 30;
     // per worker: declaration being checked (u32::MAX: none)
     let running: Vec<AtomicU32> = (0..workers).map(|_| AtomicU32::new(u32::MAX)).collect();
+    // milestone 37: when each worker's current declaration began (ms since
+    // `t_run`), for the progress line
+    let t_run = Instant::now();
+    let began: Vec<std::sync::atomic::AtomicU64> = (0..workers).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+    let done = std::sync::atomic::AtomicUsize::new(0);
     let all_done = std::sync::atomic::AtomicBool::new(false);
+    // milestone 37: SK_MEM_REPORT=1: each worker's held bytes by group at its end
+    let mem_report = std::env::var_os("SK_MEM_REPORT").is_some();
 
     std::thread::scope(|s| {
         let mut remap_thread = None;
+        // milestone 37: `--progress`: declarations checked out of those to
+        // check, memory, and the longest-running declarations in flight
+        let mut progress_thread = None;
+        if let Some(every) = progress {
+            let (all_done, running, began, done) = (&all_done, &running, &began, &done);
+            progress_thread = Some(s.spawn(move || {
+                let mut next = every;
+                while !all_done.load(Ordering::Relaxed) {
+                    let left = std::time::Duration::from_secs(next).saturating_sub(t_run.elapsed());
+                    if !left.is_zero() {
+                        std::thread::park_timeout(left);
+                        continue;
+                    }
+                    next += every;
+                    let now = t_run.elapsed().as_millis() as u64;
+                    let mut fl: Vec<(u64, u32)> = Vec::new();
+                    for (r, b) in running.iter().zip(began) {
+                        let d = r.load(Ordering::Relaxed);
+                        if d != u32::MAX {
+                            fl.push((now.saturating_sub(b.load(Ordering::Relaxed)), d));
+                        }
+                    }
+                    fl.sort_unstable_by(|a, b| b.cmp(a));
+                    let longest: Vec<String> = fl
+                        .iter()
+                        .take(3)
+                        .map(|&(ms, d)| {
+                            let (first, _) = env.decl_rows[d as usize];
+                            format!("{} ({:.1} s)", env.name_str(env.consts[first as usize].name), ms as f64 / 1000.0)
+                        })
+                        .collect();
+                    let n = done.load(Ordering::Relaxed);
+                    eprintln!(
+                        "progress: {:.0} s, {n}/{no} declarations ({:.1}%), {} workers busy, {:.2} GB; longest: {}",
+                        now as f64 / 1000.0,
+                        100.0 * n as f64 / no.max(1) as f64,
+                        fl.len(),
+                        rss_now() as f64 / 1e9,
+                        if longest.is_empty() { "-".to_string() } else { longest.join(", ") }
+                    );
+                }
+            }));
+        }
         if remap_on {
             // proof blocks are read from the mapping as declarations need
             // them: map it again once a second, so pages read once do not
@@ -475,10 +588,14 @@ fn main() {
         let mut handles = Vec::new();
         for wi in 0..workers {
             let (status, msgs, running, order, spill, take) = (&status, &msgs, &running, &order, &spill, &take);
+            let (began, done) = (&began, &done);
             let h = std::thread::Builder::new()
                 .stack_size(STACK)
                 .spawn_scoped(s, move || {
                     let mut w = Worker::new(env, shared, first_fail, STACK - (64 << 20));
+                    if tc::KNOBS && wi == 0 {
+                        w.show_consts();
+                    }
                     let mut batch: Vec<u32> = Vec::with_capacity(CHUNK);
                     loop {
                         // spilled declarations first (one at a time), then a new chunk
@@ -505,18 +622,41 @@ fn main() {
                                 status[d].store(ST_CANCEL, Ordering::Relaxed);
                                 continue;
                             }
+                            began[wi].store(t_run.elapsed().as_millis() as u64, Ordering::Relaxed);
                             running[wi].store(d32, Ordering::Relaxed);
                             let t0 = Instant::now();
                             let st0 = if decl_instr { Some((w.stats.clone(), w.ticks)) } else { None };
                             let i0 = if decl_instr { instr_now() } else { 0 };
-                            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.check_decl(d32)));
+                            let mut r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.check_decl(d32)));
+                            // milestone 35: a block did not fit the worker's arena: the
+                            // declaration runs again in the overflow arenas, whose size
+                            // does not depend on the number of workers
+                            if w.arena_full && !matches!(r, Ok(Ok(()) | Err(Stop::Cancel))) {
+                                if r.is_err() {
+                                    w.after_panic();
+                                }
+                                let mut g = env::region().big.lock().unwrap_or_else(|e| e.into_inner());
+                                let big = g.as_mut().expect("overflow arenas taken before the layout");
+                                w.swap_big(big);
+                                r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.check_decl(d32)));
+                                if r.is_err() {
+                                    w.after_panic();
+                                }
+                                // a block left out (a theorem not unfolded) may have
+                                // led to a rejection: declined
+                                if w.arena_full && matches!(r, Ok(Err(Stop::Reject))) {
+                                    r = Ok(tc::decline("the block arena is full"));
+                                }
+                                w.swap_big(big);
+                                w.stats.big_runs += 1;
+                            }
                             if decl_instr {
                                 let i1 = instr_now();
                                 let (first, _) = env.decl_rows[d];
                                 let (a, tk0) = st0.unwrap();
                                 let b = &w.stats;
                                 eprintln!(
-                                    "DI\t{d}\t{}\t{}\t{}\tticks {}\twhnf {}\tunfold {}\tdeq {}\tdeq_hit {}\tinfer {}\tinfer_calls {}\teval {}\tvals {}\tinterns {}",
+                                    "DI\t{d}\t{}\t{}\t{}\tticks {}\twhnf {}\tunfold {}\tdeq {}\tdeq_hit {}\tinfer {}\tinfer_calls {}\teval {}\tinterns {}\t{}",
                                     env.name_str(env.consts[first as usize].name),
                                     i1.wrapping_sub(i0),
                                     t0.elapsed().as_nanos(),
@@ -528,8 +668,8 @@ fn main() {
                                     b.infer_misses - a.infer_misses,
                                     b.infer_calls - a.infer_calls,
                                     b.evals - a.evals,
-                                    w.vals.len(),
-                                    b.interns - a.interns
+                                    b.interns - a.interns,
+                                    w.table_report()
                                 );
                             }
                             let (st, msg) = match r {
@@ -538,6 +678,8 @@ fn main() {
                                 Ok(Err(Stop::Decline)) => (ST_DECLINE, Some(tc::stop_msg())),
                                 Ok(Err(Stop::Cancel)) => (ST_CANCEL, None),
                                 Ok(Err(Stop::Budget)) => (ST_DECLINE, Some("probe budget escaped".into())),
+                                Ok(Err(Stop::Deep)) => (ST_DECLINE, Some("deep whnf escaped".into())),
+                                Ok(Err(Stop::Ground)) => (ST_DECLINE, Some("ground machine stop escaped".into())),
                                 Err(p) => {
                                     w.after_panic();
                                     let m = p
@@ -553,6 +695,7 @@ fn main() {
                                 msgs.lock().unwrap().push((d32, msg.unwrap()));
                             }
                             status[d].store(st, Ordering::Relaxed);
+                            done.fetch_add(1, Ordering::Relaxed);
                             if t0.elapsed().as_millis() > SPILL_MS && bi < batch.len() {
                                 // hand the rest over before this worker says it is idle
                                 spill.lock().unwrap().extend(batch[bi..].iter().rev());
@@ -563,6 +706,16 @@ fn main() {
                     }
                     // milestone 24: the process exits after the verdict; freeing
                     // a worker's tables here only delayed it
+                    w.dump_unfold_hist();
+                    if mem_report {
+                        eprintln!("MEM worker {wi}: {} deep_up {} ckpts {} late {}/{}", w.mem_report(), w.stats.deep_up, w.stats.ckpts, w.stats.late, w.stats.late_ld);
+                    }
+                    if tc::KNOBS && (w.stats.pfirst[0] > 0 || w.stats.ktrap[0] > 0 || w.stats.natwait[0] + w.stats.natwait[2] + w.stats.headprobe[0] > 0) {
+                        eprintln!("PFIRST worker {wi}: taken {} equal {} ktrap {} ticks {} natwait {:?} headprobe {:?}", w.stats.pfirst[0], w.stats.pfirst[1], w.stats.ktrap[0], w.stats.ktrap[1], w.stats.natwait, w.stats.headprobe);
+                    }
+                    if w.stats.big_runs > 0 {
+                        eprintln!("note: worker {wi}: {} declarations ran in the overflow arenas", w.stats.big_runs);
+                    }
                     std::mem::forget(w);
                 })
                 .expect("spawn");
@@ -573,6 +726,9 @@ fn main() {
         }
         all_done.store(true, Ordering::Relaxed);
         if let Some(h) = &remap_thread {
+            h.thread().unpark();
+        }
+        if let Some(h) = &progress_thread {
             h.thread().unpark();
         }
     });

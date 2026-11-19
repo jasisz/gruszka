@@ -24,6 +24,10 @@ impl<'e> Levels<'e> {
     pub fn new(g: &'e [(u8, u32, u32)], gmap: &'e FxHashMap<(u8, u32, u32), u32>) -> Levels<'e> {
         Levels { g, gmap, loc: Vec::new(), lmap: FxHashMap::default(), norm_memo: FxHashMap::default() }
     }
+    /// Milestone 37: bytes held (room included)
+    pub fn held_bytes(&self) -> usize {
+        self.loc.capacity() * 12 + self.lmap.capacity() * 17 + self.norm_memo.capacity() * 9
+    }
     /// Worker-made levels and memo entries.
     pub fn len(&self) -> usize {
         self.loc.len() + self.norm_memo.len()

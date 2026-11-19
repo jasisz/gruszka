@@ -68,6 +68,15 @@ in the file, and Gruszka reports the first failure in file order.
 If you need an export first, Lean and `lean4export` produce the file;
 neither is needed when checking it.
 
+`--progress` (or `--progress=SECS`) prints a line on stderr every 10 (or
+SECS) seconds: declarations checked out of those to check, the process's
+memory, and the three longest-running declarations in flight with their
+elapsed time. It is off by default.
+
+```text
+progress: 30 s, 605928/1710994 declarations (35.4%), 4 workers busy, 8.93 GB; longest: WeierstrassCurve.ellipticNet_four (3.7 s), ...
+```
+
 ## Checking part of a file
 
 `--only` checks named declarations in a Susz file rather than the whole
@@ -191,7 +200,9 @@ attached caches, including its weak-head form and type.
 across many declarations so that later declarations can reuse earlier work.
 It keeps only facts that hold in any later environment, stamping each one
 with the declaration that produced it so that nothing travels backward in
-file order.
+file order. Inside one heavy declaration, a `whnf` call whose result
+reaches few of the values it made gives the rest back (a *region*), so a
+long kernel computation runs in bounded memory.
 
 **What not to compute comes from Pestka.** A call walks through its
 function's lambdas without creating values for them, while a `casesOn`
