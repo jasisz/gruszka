@@ -129,6 +129,9 @@ const REGION_MIN_LIT_BYTES: usize = 1 << 20;
 const MEMO_LIT_BYTES: u64 = 1 << 14;
 /// milestone 43: most keys in `lit_dropped` / `lit_redo` (8 MiB each);
 /// past it the set starts over
+/// milestone 46: first redos of the sampled keys before their second
+/// redos decide when the others are pinned
+const REDO_SAMPLE: u64 = 64;
 pub(super) const LIT_KEYS_CAP: usize = 1 << 20;
 /// marker of a dead value (SK_REGION_POISON): a level id no table hands out
 pub const DEAD_LVL: u32 = 0xDEAD_0001;
@@ -148,10 +151,38 @@ impl Worker {
         if self.reg_pin && !self.ghost.is_empty() && self.ghost_shape.contains(&self.shape_key(v)) {
             let mut fuel = self.key_fuel;
             let k = self.mkey(v, &mut fuel);
-            if self.pinned.contains(&k) || self.ghost.remove(&k) {
+            if self.pinned.contains(&k) {
                 pin = true;
-                self.pinned.insert(k);
                 self.stats.reg_redo += 1;
+            } else if self.ghost.remove(&k) {
+                // milestone 46: a pin keeps the work and its result through
+                // every enclosing rollback for the rest of the session.
+                // Pinned at its first redo it pays when redone work is
+                // asked for again; when it mostly is not, the pins only
+                // hold memory (MatCert_J4Fix's row5: 2.9 M first redos,
+                // 0.6 M second ones, 4.7 GB; LyOm 1.1 M / 0.04 M, 6.9 GB).
+                // So: an eighth of the keys (a sample by key bits) is
+                // always pinned at its second redo, and counts how often a
+                // redone piece of work is redone again; the other keys are
+                // pinned at their first redo while at least half of the
+                // sample's were (AlphaMc_Fi23Data 0.62, p6 0.60: as
+                // before), else at their second (row5 0.21, LyOm 0.04).
+                if self.redo_seen.len() >= GHOST_CAP {
+                    self.redo_seen.clear();
+                }
+                let seen = self.redo_seen.contains(&k);
+                let sample = k >> 61 == 0;
+                if sample {
+                    self.redo_n[seen as usize] += 1;
+                }
+                let first = !sample && self.redo_n[0] >= REDO_SAMPLE && self.redo_cut * self.redo_n[1] >= self.redo_n[0];
+                if self.reg_pin_first || first || seen {
+                    pin = true;
+                    self.pinned.insert(k);
+                    self.stats.reg_redo += 1;
+                } else {
+                    self.redo_seen.insert(k);
+                }
             }
         }
         let mut r = self.reg_open_marks();
@@ -278,6 +309,7 @@ impl Worker {
     pub(super) fn reg_forget(&mut self) {
         self.mkv.clear();
         self.mke.clear();
+        self.redo_seen.clear();
         self.ghost.clear();
         self.ghost_shape.clear();
         self.pinned.clear();
@@ -398,6 +430,42 @@ impl Worker {
             self.reg_kmax = self.reg_kmax.max(made);
             return Ok(self.reg_close_keep(r, v, res));
         };
+        // milestone 46: what the rollback would give back, not what the
+        // region made: values and big-literal bytes not reached by the
+        // copies. Below the bounds that open a rollback at all
+        // (`reg_min` values, `REGION_MIN_LIT_BYTES`) the region is kept, as
+        // when its result reaches too much. McertP_Ly's ly31_K proof
+        // rolled back 98 K regions that copied out 1109 M of the 1111 M
+        // values they made (10.3 TB of literal bytes made, 10.29 TB
+        // copied): a chain of Nat operations, each whnf a region whose
+        // result is the next big literal, every level copying it again
+        // (2929 G; Pestka 69 G).
+        if self.reg_benefit {
+            let (mut cv, mut cb) = (0usize, 0usize);
+            for c in &rcp {
+                match c {
+                    Rcp::Val(..) | Rcp::Neu(..) => cv += 1,
+                    Rcp::Lit(_, l) => {
+                        cv += 1;
+                        if let LitVal::Nat(n) = l {
+                            cb += (n.bits() / 8) as usize;
+                        }
+                    }
+                    Rcp::LitAt(_, i) => {
+                        cv += 1;
+                        if let LitVal::Nat(n) = self.lit(*i) {
+                            cb += (n.bits() / 8) as usize;
+                        }
+                    }
+                    Rcp::Env(..) => {}
+                }
+            }
+            if made.saturating_sub(cv) < self.reg_min && lit_made.saturating_sub(cb) < REGION_MIN_LIT_BYTES {
+                self.stats.reg[2] += 1;
+                self.reg_kmax = self.reg_kmax.max(made);
+                return Ok(self.reg_close_keep(r, v, res));
+            }
+        }
         self.stats.reg[1] += 1;
 
         self.stats.reg[3] += made as u64;

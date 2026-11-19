@@ -302,6 +302,8 @@ const GROUND_AT: usize = 1 << 26;
 const MEMO_COST: u64 = 4;
 
 const DEEP_WHNF: u32 = 8192;
+/// milestone 46: see `redo_cut`
+const REDO_CUT: u64 = 2;
 /// milestone 45: most comparisons or inferences an outermost call keeps
 /// waiting while it works out handed-up ones (a bound, not a tuning: a
 /// chain deeper than this many slices of half the stack is declined)
@@ -1083,6 +1085,19 @@ pub struct Worker {
     ghost: FxHashSet<u64>,
     pinned: FxHashSet<u64>,
     ghost_shape: FxHashSet<u64>,
+    /// milestone 46: keys of ghost work redone once and not pinned;
+    /// SK_PIN_FIRST=1 (knobs): every key pinned at its first redo, as before
+    redo_seen: FxHashSet<u64>,
+    reg_pin_first: bool,
+    /// milestone 46: the sampled keys' first and second redos (the
+    /// worker's run: a property of the workload, not of a session's ids)
+    redo_n: [u64; 2],
+    /// pinned at the first redo while `redo_cut` x second redos >= first
+    /// ones in the sample (REDO_CUT; SK_REDO_CUT in knobs)
+    redo_cut: u64,
+    /// milestone 46: a rollback must give back `reg_min` values or
+    /// REGION_MIN_LIT_BYTES of literals (SK_REGION_BENEFIT=0, knobs: off)
+    reg_benefit: bool,
     /// milestone 43: content keys (`lit_key`) of big literals whose memos a
     /// rollback dropped, and of those among them made again after the drop
     /// (work done again: their memos are kept from then on)
@@ -1337,6 +1352,11 @@ impl Worker {
             ghost: FxHashSet::default(),
             pinned: FxHashSet::default(),
             ghost_shape: FxHashSet::default(),
+            redo_seen: FxHashSet::default(),
+            reg_pin_first: KNOBS && std::env::var("SK_PIN_FIRST").is_ok_and(|s| s == "1"),
+            redo_n: [0, 0],
+            redo_cut: if KNOBS { std::env::var("SK_REDO_CUT").ok().and_then(|s| s.parse().ok()).unwrap_or(REDO_CUT) } else { REDO_CUT },
+            reg_benefit: !(KNOBS && std::env::var("SK_REGION_BENEFIT").is_ok_and(|s| s == "0")),
             lit_dropped: FxHashSet::default(),
             lit_redo: FxHashSet::default(),
             lit_redo_on: !(KNOBS && std::env::var("SK_LIT_REDO").is_ok_and(|s| s == "0")),
@@ -1553,8 +1573,8 @@ impl Worker {
     /// Milestone 36 (SK_DECL_INSTR): the sizes of the session's tables.
     pub fn table_report(&self) -> String {
         format!(
-            "gr {:?} pfirst {:?} ktrap {:?} natwait {:?} headprobe {:?} reg {:?} redo {} pinkept {} skip {} seg {} undo {} vals {} eloc {} eslots {} sp_b {} ftab_b {} wlits {} wlit_b {} blk {} vmap {} env_map {} eq {} fail {} icache {} iu {} unf {} uenv {} fv {} sess_b {}",
-            self.stats.gr, self.stats.pfirst, self.stats.ktrap, self.stats.natwait, self.stats.headprobe, self.stats.reg, self.stats.reg_redo, self.stats.reg_pin_kept, self.stats.reg_skip, self.stats.reg_seg, self.undo.len(), self.vals.len(), self.eloc.len(), self.eslots.len(), self.sp.bytes(), self.ftab.bytes(),
+            "redo_n {:?} gr {:?} pfirst {:?} ktrap {:?} natwait {:?} headprobe {:?} reg {:?} redo {} pinkept {} skip {} seg {} undo {} vals {} eloc {} eslots {} sp_b {} ftab_b {} wlits {} wlit_b {} blk {} vmap {} env_map {} eq {} fail {} icache {} iu {} unf {} uenv {} fv {} sess_b {}",
+            self.redo_n, self.stats.gr, self.stats.pfirst, self.stats.ktrap, self.stats.natwait, self.stats.headprobe, self.stats.reg, self.stats.reg_redo, self.stats.reg_pin_kept, self.stats.reg_skip, self.stats.reg_seg, self.undo.len(), self.vals.len(), self.eloc.len(), self.eslots.len(), self.sp.bytes(), self.ftab.bytes(),
             self.wlits.len(), self.wlit_bytes, self.blk.len(), self.vmap.len(), self.env_map.len(),
             self.eq_cache.len(), self.fail_cache.len(), self.infer_cache.len(), self.infer_u.len(),
             self.unfold_memo.len(), self.uenv_map.len(), self.fv_ty.len(), self.sess_bytes()

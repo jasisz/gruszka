@@ -259,6 +259,30 @@ than they gave back:
   The ghost table holds at most 2^20 keys (`GHOST_CAP`, 16 MiB), then
   starts over; a value's shape (term or head) is checked first, so most
   region openings compute no key.
+  Milestone 46: pinned at the first redo when redone work tends to be
+  redone again, else at the second. A pin lives for the session, so
+  pinning work asked for twice only holds memory: MatCert_J4Fix's row5
+  made 2.9 M first redos and 0.6 M second ones (4.7 GB), LyOm 1.1 M and
+  0.04 M (6.9 GB at w4). An eighth of the keys (by key bits) is always
+  pinned at its second redo and counts both; the others are pinned at the
+  first while second redos are at least half the first ones in that
+  sample (`REDO_CUT` = 2, after 64 first redos; the worker's run, not
+  the session). Ratios measured: AlphaMc_Fi23Data 0.50, p6 0.60, CosetW
+  0.43, row5 0.21, LyOm 0.06. Sweep of the cut (data/m46/redo-cut-sweep.txt,
+  w4): x1/2 .. x2 keep row5 at 1.6-1.8 GB; x4 (8) pins row5 at the first
+  redo again (4.6 GB) and gives Fi23Data 647 G instead of 702 G. Against
+  milestone 45 (every key at its first redo): row5 4.3 -> 1.6 GB and
+  570 -> 406 G, LyOm w4 7.6 -> 4.1 GB, MatCert_J4Fix past 12 GB ->
+  6.3 GB; Fi23Data +21% instructions, CosetW +10%, m6c +7% (and
+  1.7 -> 1.3 GB), kSol +2.5%.
+- *A rollback must give something back* (milestone 46). The entry
+  bounds (256 values made, or 1 MiB of big literals) are applied again
+  to what the rollback frees: values and literal bytes the copies do not
+  reach. McertP_Ly's ly31_K proof rolled back 98 K regions that copied
+  out 1109 M of the 1111 M values they made (10.29 of 10.30 TB of literal
+  bytes): a chain of Nat operations, each whnf a region whose result is
+  the next big literal, each level copying it again. 314 s / 2929 G ->
+  9.3 s / 94 G (Pestka 7.2 s / 69 G).
 - *Attempts grow geometrically.* An attempt reads the region's log and
   walks what its result reaches; a region kept after an attempt is read
   again by every enclosing attempt (quadratic in deep recursions). An
