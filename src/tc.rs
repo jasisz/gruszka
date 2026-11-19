@@ -348,6 +348,10 @@ const LET_PROBE: u32 = 1024;
 /// 45.72 / 22.49, 256: 50.59 / 24.93, 1024: 46.47 / 22.57, 4096: 45.40 /
 /// 22.47, 16384: 45.47 / 22.48; CFSG's three walls pass at each.
 const HEAD_PROBE: u32 = 4096;
+/// Milestone 48: the budget in ticks of comparing two applications of the
+/// same regular definition by unfolding both, before their arguments
+/// (knobs SK_DOVETAIL, 0: off); args_refuted's, the other way round
+const DOVETAIL: u32 = 256;
 const LS_IDENT: bool = true;
 const LS_CLASS: bool = true;
 
@@ -557,6 +561,8 @@ enum DStep {
     Next(V, V),
     /// neither side unfolds
     Stuck,
+    /// milestone 48: both sides unfolded and compared: not equal
+    Differ,
 }
 
 #[derive(Clone, Copy)]
@@ -722,6 +728,9 @@ pub struct Stats {
     /// milestone 41: CommonHeadFirst (lazy delta past its budget, decided
     /// by a common head)
     pub headprobe: [u64; 6],
+    /// milestone 48: same-head comparisons unfolded first (runs, arguments
+    /// after, -, decided by unfolding, ticks)
+    pub dovetail: [u64; 5],
 }
 
 pub(crate) enum NatWait {
@@ -893,6 +902,15 @@ pub struct Worker {
     /// milestone 41: CommonHeadFirst's budget in ticks, also NatFoldWaits'
     /// congruence (HEAD_PROBE; knobs SK_HEAD_PROBE, 0: off / unbudgeted)
     head_probe: u32,
+    /// milestone 48: the budget of unfolding first (DOVETAIL)
+    dovetail: u32,
+    /// milestone 48: unfolding first runs: EQ_PDEAD is not read (a mark
+    /// left by an earlier probe would end it at once)
+    pdead_off: bool,
+    /// milestone 48: unfolding first came past `deep_at` bytes of stack,
+    /// where a probe does not hand comparisons up: it stops and the
+    /// arguments are compared as before, outside any budget
+    dove_deep: bool,
     matchers: CMap<u32, Option<(u32, u32, u32)>, 29>,
     /// (type, k) -> the k-th variable of that type (`open_var`); per declaration
     var_slots: CMap<u64, V, 16>,
@@ -1303,6 +1321,9 @@ impl Worker {
             rec_msort: FxHashMap::default(),
             pfirst: !(KNOBS && std::env::var("SK_PFIRST").is_ok_and(|s| s == "0")),
             head_probe: if KNOBS { std::env::var("SK_HEAD_PROBE").ok().and_then(|s| s.parse().ok()).unwrap_or(HEAD_PROBE) } else { HEAD_PROBE },
+            dovetail: if KNOBS { std::env::var("SK_DOVETAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(DOVETAIL) } else { DOVETAIL },
+            pdead_off: false,
+            dove_deep: false,
             nat_wait: !(KNOBS && std::env::var("SK_NATWAIT").is_ok_and(|s| s == "0")),
             ktrap: if KNOBS { std::env::var("SK_KTRAP").ok().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 },
             matchers: Default::default(),
@@ -6071,6 +6092,16 @@ impl Worker {
     /// probe (its budget belongs to the probe's caller).
     #[inline(never)]
     fn defeq_ne(&mut self, a: V, b: V) -> R<bool> {
+        if self.deep_zone && self.probe_on && self.pdead_off {
+            let x = 0u8;
+            let sp = std::hint::black_box(&x) as *const u8 as usize;
+            if self.stack_base.saturating_sub(sp) > self.deep_at {
+                self.dove_deep = true;
+                self.probe_end = self.ticks.wrapping_add(1);
+                self.tick_alarm = self.probe_end;
+                return Err(Stop::Budget);
+            }
+        }
         if self.deep_zone && !self.probe_on {
             let x = 0u8;
             let sp = std::hint::black_box(&x) as *const u8 as usize;
@@ -6148,7 +6179,7 @@ impl Worker {
         }
         let key = [ia[0], ia[1], ia[2], ib[0], ib[1], ib[2]];
         let pk = if a < b { (a as u64) << 32 | b as u64 } else { (b as u64) << 32 | a as u64 };
-        if self.probe_on {
+        if self.probe_on && !self.pdead_off {
             if let Some(&f) = self.eq_cache.get(&pk) {
                 if f & (EQ_KNOWN | EQ_PDEAD) == EQ_PDEAD {
                     self.stats.probe[4] += 1;
@@ -6640,6 +6671,7 @@ impl Worker {
                     let Ok(y) = self.env_get(eb, nb.p) else { return false };
                     return self.same_vt(y, ta, ea, la, fuel);
                 }
+                return false;
             }
             return false;
         }
@@ -7156,7 +7188,7 @@ impl Worker {
     /// arguments not shown equal.
     fn head_lookahead(&mut self, x: V, y: V) -> R<bool> {
         let Some((ry, ly, sy)) = self.const_head(y) else { return Ok(false) };
-        if sy == EMPTY || self.spine_has_proj(sy) {
+        if self.spine_has_proj(sy) {
             return Ok(false);
         }
         let cy = self.canon_of_row(ry);
@@ -7178,8 +7210,18 @@ impl Worker {
                 return Ok(true);
             }
             if let Some((rx, lx, sx)) = self.const_head(x) {
-                if self.canon_of_row(rx) == cy && sx != EMPTY && !self.spine_has_proj(sx) {
-                    return Ok(self.levels_equiv(lx, ly) && self.spines_defeq_skip(sx, sy, rx, lx, true)?);
+                if self.canon_of_row(rx) == cy {
+                    // milestone 48: a constant without arguments on the
+                    // other side is reached when x comes to it (an `ite`
+                    // whose branch is that constant); before, such a `y`
+                    // ended the probe at once and the reference loop
+                    // unfolded the constant itself
+                    if sx == EMPTY && sy == EMPTY {
+                        return Ok(self.levels_equiv(lx, ly));
+                    }
+                    if sx != EMPTY && sy != EMPTY && !self.spine_has_proj(sx) {
+                        return Ok(self.levels_equiv(lx, ly) && self.spines_defeq_skip(sx, sy, rx, lx, true)?);
+                    }
                 }
             }
         }
@@ -7273,6 +7315,7 @@ impl Worker {
             }
             match self.delta_step(a, b)? {
                 DStep::Equal => return Ok(Ok(true)),
+                DStep::Differ => return Ok(Ok(false)),
                 DStep::Stuck => return Ok(Err((a, b))),
                 DStep::Next(x, y) => {
                     a = x;
@@ -7355,6 +7398,7 @@ impl Worker {
             self.let_vals = n0;
             let d = match self.delta_step(a, b)? {
                 DStep::Equal => Some(true),
+                DStep::Differ => Some(false),
                 DStep::Next(x, y) => Some(self.defeq(x, y)?),
                 DStep::Stuck => None,
             };
@@ -7594,7 +7638,16 @@ impl Worker {
                         if sa != EMPTY && sb != EMPTY && !self.fail_cache.contains(&(a, b)) {
                             #[cfg(feature = "cnt")]
                             let tk0 = self.ticks;
-                            let same = self.levels_equiv(la, lb) && !self.args_refuted(sa, sb, ra, la)? && self.spines_defeq_skip(sa, sb, ra, la, true)?;
+                            let same = if !self.levels_equiv(la, lb) || self.args_refuted(sa, sb, ra, la)? {
+                                false
+                            } else if self.dovetail == 0 || self.probe_on {
+                                self.spines_defeq_skip(sa, sb, ra, la, true)?
+                            } else {
+                                match self.dovetail_args(a, b, sa, sb, ra, la)? {
+                                    Some(d) => return Ok(d),
+                                    None => false,
+                                }
+                            };
                             #[cfg(feature = "cnt")]
                             {
                                 let d = self.ticks.wrapping_sub(tk0) as u64;
@@ -7830,6 +7883,78 @@ impl Worker {
         Ok(false)
     }
 
+    /// Milestone 48: `f` under a budget of `budget` ticks; `None` when the
+    /// budget ran out (binders opened inside are closed again).
+    fn budgeted_n(&mut self, budget: u32, f: impl FnOnce(&mut Self) -> R<bool>) -> R<Option<bool>> {
+        let d0 = self.vdepth;
+        self.probe_on = true;
+        self.probe_end = self.ticks.wrapping_add(budget);
+        self.set_alarm();
+        let r = f(self);
+        self.probe_on = false;
+        self.set_alarm();
+        match r {
+            Ok(r) => Ok(Some(r)),
+            Err(Stop::Budget) => {
+                self.vdepth_to(d0);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Milestone 48: two applications `a`, `b` of the same regular
+    /// definition (arguments `sa`, `sb`) whose arguments were not refuted
+    /// (args_refuted). Lean's order compares the arguments, unbudgeted, and
+    /// unfolds both sides only when they differ; that can walk without end
+    /// where unfolding decides at once: `(false && A) && B =?= (false && A')
+    /// && B'`, `A`, `A'` open computations that differ (CFSG's
+    /// Batch27581.p2). So before the arguments, both sides unfolded and
+    /// compared under the budget args_refuted has (DOVETAIL ticks): an
+    /// answer within it decides, true or false (it is what the reference
+    /// loop comes to after unequal arguments); past it, the arguments as
+    /// before. `Some(Equal | Differ)`: decided; `None`: the arguments
+    /// differ (both sides unfold next).
+    ///
+    /// (Taking turns between the two ways under a doubling budget, tried
+    /// first, blew CFSG's lyLet and AlphaMc_SuzData slices past 6 GB: under
+    /// a budget no inner probe runs (CommonHeadFirst, args_refuted, the
+    /// hand-ups), and the arguments' way grew far dearer than unbudgeted.)
+    fn dovetail_args(&mut self, a: V, b: V, sa: u32, sb: u32, ra: u32, la: u32) -> R<Option<DStep>> {
+        let t0 = self.ticks;
+        self.stats.dovetail[0] += 1;
+        let r = self.unfold_first(a, b);
+        self.stats.dovetail[4] += self.ticks.wrapping_sub(t0) as u64;
+        match r? {
+            Some(d) => {
+                self.stats.dovetail[3] += 1;
+                Ok(Some(d))
+            }
+            None => {
+                self.stats.dovetail[1] += 1;
+                Ok(if self.spines_defeq_skip(sa, sb, ra, la, true)? { Some(DStep::Equal) } else { None })
+            }
+        }
+    }
+
+    fn unfold_first(&mut self, a: V, b: V) -> R<Option<DStep>> {
+        // a side whose unfolding is refused (a trapped Nat operation): the
+        // arguments alone, as before
+        let (Some(ua), Some(ub)) = (self.unfold(a)?, self.unfold(b)?) else { return Ok(None) };
+        self.pdead_off = true;
+        self.dove_deep = false;
+        let r = self.budgeted_n(self.dovetail, |s| {
+            let x = s.whnf_core_c(ua, true)?;
+            let y = s.whnf_core_c(ub, true)?;
+            s.defeq(x, y)
+        });
+        self.pdead_off = false;
+        if std::mem::take(&mut self.dove_deep) {
+            return Ok(None);
+        }
+        Ok(r?.map(|r| if r { DStep::Equal } else { DStep::Differ }))
+    }
+
     fn probe_args(&mut self, sa: u32, sb: u32, row: u32, llr: u32) -> R<bool> {
         if self.probe_on {
             return self.spines_defeq_skip(sa, sb, row, llr, true);
@@ -7942,7 +8067,7 @@ impl Worker {
             }
             match self.delta_step(a, b)? {
                 DStep::Equal => return Ok(true),
-                DStep::Stuck => break,
+                DStep::Stuck | DStep::Differ => break,
                 DStep::Next(x, y) => {
                     a = x;
                     b = y;

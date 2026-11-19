@@ -741,8 +741,8 @@ fn main() {
                     if mem_report {
                         eprintln!("MEM worker {wi}: {} deep_up {} ckpts {} late {}/{}", w.mem_report(), w.stats.deep_up, w.stats.ckpts, w.stats.late, w.stats.late_ld);
                     }
-                    if tc::KNOBS && (w.stats.pfirst[0] > 0 || w.stats.ktrap[0] > 0 || w.stats.natwait[0] + w.stats.natwait[2] + w.stats.headprobe[0] > 0) {
-                        eprintln!("PFIRST worker {wi}: taken {} equal {} ktrap {} ticks {} natwait {:?} headprobe {:?}", w.stats.pfirst[0], w.stats.pfirst[1], w.stats.ktrap[0], w.stats.ktrap[1], w.stats.natwait, w.stats.headprobe);
+                    if tc::KNOBS && (w.stats.pfirst[0] > 0 || w.stats.ktrap[0] > 0 || w.stats.natwait[0] + w.stats.natwait[2] + w.stats.headprobe[0] + w.stats.dovetail[0] > 0) {
+                        eprintln!("PFIRST worker {wi}: taken {} equal {} ktrap {} ticks {} natwait {:?} headprobe {:?} dovetail {:?}", w.stats.pfirst[0], w.stats.pfirst[1], w.stats.ktrap[0], w.stats.ktrap[1], w.stats.natwait, w.stats.headprobe, w.stats.dovetail);
                     }
                     if w.stats.big_runs > 0 {
                         eprintln!("note: worker {wi}: {} declarations ran in the overflow arenas", w.stats.big_runs);
