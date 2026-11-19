@@ -12,6 +12,15 @@
 --   good_m48_dovetail_same      goodDoveSame     equal arguments, shown slowly
 --   good_m48_lookahead_const    goodLookConst    CFSG Batch27011.optI_eq
 --   bad_m48_lookahead_const     badLookConst
+--   good_m48_pad_env            goodPadEnv       a loop's closure against the same closure written
+--                                                with the predicate inline (CFSG HNSchreier
+--                                                orbitTreeCheck_certificate); before, one nested
+--                                                comparison a step: declined at a 16 MiB stack
+--   bad_m48_pad_env             badPadEnv
+--   good_m48_pad_env_reads      goodPadEnvReads  the inline term reads a binder: compared as before
+--   bad_m48_pad_env_reads       badPadEnvReads
+-- (the pad_env vectors: Lean's own check ran past 500 s and was stopped; their
+-- verdicts follow from computing the loops, as Gruszka m47 gives them)
 import Lean
 open Lean Meta Elab Tactic
 
@@ -50,3 +59,16 @@ theorem goodLookConst : (if true = true then m48cA else m48cB) = m48cA := by unc
 set_option debug.skipKernelTC true in
 theorem badLookConst : (if true = true then m48cA else m48cB) = m48cB := by unchecked_rfl
 
+def m48allInK (lo hi : Nat) (p : Nat → Bool) : Bool := Nat.allTR (hi - lo) (fun k _ => p (lo + k))
+
+set_option debug.skipKernelTC true in
+theorem goodPadEnv (w : Nat) (g : Nat → Nat → Bool) : m48allInK 0 100000 (fun i => g w i) = decide (Nat.allTR (100000 - 0) (fun k _ => (fun i => g w i) (0 + k)) = true) := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem badPadEnv (w : Nat) (g : Nat → Nat → Bool) : m48allInK 0 2000 (fun i => g w i) = decide (Nat.allTR (2000 - 0) (fun k _ => (fun i => g w i) (1 + k)) = true) := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem goodPadEnvReads (w : Nat) (g : Nat → Nat → Bool) : m48allInK 0 2000 (fun i => g w i) = decide (Nat.allTR (2000 - 0) (fun k _ => (fun _i => g w k) (0 + k)) = true) := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem badPadEnvReads (w : Nat) (g : Nat → Nat → Bool) : m48allInK 0 2000 (fun i => g w i) = decide (Nat.allTR (2000 - 0) (fun k _ => (fun _i => g w (k + 1)) (0 + k)) = true) := by unchecked_rfl

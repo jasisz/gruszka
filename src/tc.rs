@@ -6543,6 +6543,20 @@ impl Worker {
         }
     }
 
+    /// Milestone 48: term `t` reads none of the `depth` innermost binders.
+    fn reads_none_below(&mut self, t: u32, depth: u32) -> bool {
+        (0..depth).all(|d| !self.uses_var(t, d))
+    }
+    /// Milestone 48: `env` with `depth` entries pushed (`v`, never read: the
+    /// term evaluated in it reads none of them).
+    fn pad_env(&mut self, v: V, env: u32, depth: u32) -> u32 {
+        let mut e = env;
+        for _ in 0..depth {
+            e = self.push_env(v, e);
+        }
+        e
+    }
+
     /// same_vt for a constant-headed neutral value `v`.
     fn same_vt_neu(&mut self, v: V, t: u32, e: u32, ls: u32, fuel: &mut u32) -> bool {
         let Val::Neu { head: Head::Const(r, l), spine } = self.val(v) else { return false };
@@ -6672,6 +6686,23 @@ impl Worker {
                     return self.same_vt(y, ta, ea, la, fuel);
                 }
                 return false;
+            }
+            // milestone 48: under binders too, when the variable is one of
+            // the environment's and the other term reads none of the
+            // binders: that term in its environment with `depth` unread
+            // entries pushed (CFSG's HNSchreier orbitTreeCheck_certificate:
+            // `λ k _, (λ i, body) (0 + k)` against `λ k _, p (lo + k)`, `p`
+            // and `lo` standing for those values; before, the two loops
+            // were compared step by step, 1 140 000 nested comparisons)
+            if k == BVAR && na.p >= depth && self.reads_none_below(tb, depth) {
+                let Ok(x) = self.env_get(ea, na.p - depth) else { return false };
+                let e2 = self.pad_env(x, eb, depth);
+                return self.same_vt(x, tb, e2, lb, fuel);
+            }
+            if nb.kind == BVAR && nb.p >= depth && self.reads_none_below(ta, depth) {
+                let Ok(y) = self.env_get(eb, nb.p - depth) else { return false };
+                let e2 = self.pad_env(y, ea, depth);
+                return self.same_vt(y, ta, e2, la, fuel);
             }
             return false;
         }
