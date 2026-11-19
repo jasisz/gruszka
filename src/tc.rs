@@ -3723,8 +3723,22 @@ impl Worker {
         }
         self.has_fvar_miss(v)
     }
+    /// Milestone 42: past half the stack limit. The walks that do not tick
+    /// (has_fvar, uses_var) go on with an explicit stack from there.
+    #[inline(always)]
+    pub(super) fn stack_half(&self) -> bool {
+        let x = 0u8;
+        let sp = std::hint::black_box(&x) as *const u8 as usize;
+        self.stack_base.saturating_sub(sp) > self.stack_limit / 2
+    }
     #[inline(never)]
     fn has_fvar_miss(&mut self, v: V) -> bool {
+        // milestone 42: a value's entries can nest as deep as a loop ran (a
+        // lazy accumulator: each step's closure holds the one before), one
+        // Rust frame per level here: past half the stack, an explicit stack
+        if self.stack_half() {
+            return self.has_fvar_iter(v);
+        }
         let r = match self.val(v) {
             Val::Sort(_) | Val::Lit(_) => false,
             Val::Thunk { term, env, .. } | Val::Clo { term, env, .. } | Val::CloI { term, env, .. } => {
@@ -3755,6 +3769,123 @@ impl Worker {
         };
         self.memo_mut(v).set_fvar(r);
         r
+    }
+
+    /// has_fvar_miss with an explicit stack: the same walk (the same
+    /// entries and spine arguments, in the same order, stopping at the
+    /// first one found) and the same memos (per value, per spine node).
+    #[inline(never)]
+    fn has_fvar_iter(&mut self, v: V) -> bool {
+        struct Fr {
+            v: V,
+            // what is left to look at, last first; the first `nspine` are
+            // `spine`'s arguments (looked at last)
+            kids: Vec<V>,
+            nspine: usize,
+            spine: u32,
+            from_spine: bool,
+        }
+        // Ok: known at once; Err: a frame to walk
+        let open = |s: &mut Self, v: V| -> Result<bool, Fr> {
+            let m = s.memo_at(v).fvar();
+            if m != 2 {
+                return Ok(m == 1);
+            }
+            let mut kids = Vec::new();
+            let (mut spine, mut nspine) = (EMPTY, 0);
+            match s.val(v) {
+                Val::Sort(_) | Val::Lit(_) => {}
+                Val::Thunk { term, env, .. } | Val::Clo { term, env, .. } | Val::CloI { term, env, .. } => {
+                    for i in 0..s.trng(term) {
+                        if !s.uses_var(term, i) {
+                            continue;
+                        }
+                        let Some(x) = s.env_at(env, i) else { break };
+                        kids.push(x);
+                    }
+                }
+                Val::Neu { head, spine: sp } => {
+                    match head {
+                        Head::FVar(_) => {
+                            s.memo_mut(v).set_fvar(true);
+                            return Ok(true);
+                        }
+                        Head::Const(..) => {}
+                        Head::Stuck(x) => kids.push(x),
+                    }
+                    if sp != EMPTY {
+                        let f = s.sp.flags(sp);
+                        if f & spines::F_FV_KNOWN != 0 {
+                            if f & spines::F_FV != 0 && kids.is_empty() {
+                                s.memo_mut(v).set_fvar(true);
+                                return Ok(true);
+                            }
+                            if f & spines::F_FV != 0 {
+                                // the stuck head first, then the spine's answer
+                                kids.push(NONE);
+                            }
+                        } else {
+                            spine = sp;
+                            for i in 0..s.sp.len(sp) {
+                                let e = s.sp.args(sp)[i];
+                                if e & PROJ_BIT == 0 {
+                                    kids.push(e);
+                                    nspine += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if kids.is_empty() {
+                s.memo_mut(v).set_fvar(false);
+                if spine != EMPTY {
+                    s.sp.set_flags(spine, spines::F_FV_KNOWN);
+                }
+                return Ok(false);
+            }
+            kids.reverse();
+            Err(Fr { v, kids, nspine, spine, from_spine: false })
+        };
+        let mut st: Vec<Fr> = match open(self, v) {
+            Ok(b) => return b,
+            Err(f) => vec![f],
+        };
+        let mut done: Option<bool> = None;
+        loop {
+            let top = st.last_mut().unwrap();
+            let r = match done.take() {
+                Some(true) => Some(true),
+                _ => match top.kids.pop() {
+                    None => Some(false),
+                    // a spine already known to have one (after the stuck head)
+                    Some(NONE) => Some(true),
+                    Some(k) => {
+                        top.from_spine = top.kids.len() < top.nspine;
+                        match open(self, k) {
+                            Ok(b) => {
+                                done = Some(b);
+                                None
+                            }
+                            Err(f) => {
+                                st.push(f);
+                                None
+                            }
+                        }
+                    }
+                },
+            };
+            let Some(r) = r else { continue };
+            let f = st.pop().unwrap();
+            self.memo_mut(f.v).set_fvar(r);
+            if f.spine != EMPTY && (!r || f.from_spine) {
+                self.sp.set_flags(f.spine, spines::F_FV_KNOWN | if r { spines::F_FV } else { 0 });
+            }
+            if st.is_empty() {
+                return r;
+            }
+            done = Some(r);
+        }
     }
 
     /// Does an argument of spine `s` have a free variable? Remembered per
@@ -5495,6 +5626,11 @@ impl Worker {
         if let Some(&x) = memo.get(&(t, d)) {
             return x;
         }
+        // milestone 42: one frame per level of the term: past half the
+        // stack, an explicit stack (a term nests as deep as the file says)
+        if self.stack_half() {
+            return self.uses_var_iter(t, d);
+        }
         let k = self.tk(t);
         let x = match k {
             BVAR => self.tp(t) == d,
@@ -5520,6 +5656,52 @@ impl Worker {
             self.uses0_memo.insert((t, d), x);
         }
         x
+    }
+    /// uses_var with an explicit stack (reads the memos, writes none).
+    #[inline(never)]
+    fn uses_var_iter(&mut self, t: u32, d: u32) -> bool {
+        let mut st: Vec<(u32, u32)> = vec![(t, d)];
+        while let Some((t, d)) = st.pop() {
+            if self.trng(t) <= d {
+                continue;
+            }
+            if d < 63 {
+                if self.used_mask(t) & (1 << d) != 0 {
+                    return true;
+                }
+                continue;
+            }
+            let memo = if t < self.mlen { &self.uses_main } else { &self.uses0_memo };
+            if let Some(&x) = memo.get(&(t, d)) {
+                if x {
+                    return true;
+                }
+                continue;
+            }
+            match self.tk(t) {
+                BVAR => {
+                    if self.tp(t) == d {
+                        return true;
+                    }
+                }
+                APP => {
+                    st.push((self.tb(t), d));
+                    st.push((self.ta(t), d));
+                }
+                LET => {
+                    st.push((self.let_body(t), d + 1));
+                    st.push((self.tb(t), d));
+                    st.push((self.ta(t), d));
+                }
+                PROJ => st.push((self.ta(t), d)),
+                k if is_lam(k) || is_pi(k) => {
+                    st.push((self.tb(t), d + 1));
+                    st.push((self.ta(t), d));
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     pub fn proj_type(&mut self, sv: V, st: V, idx: u32, sname: u32) -> R<V> {

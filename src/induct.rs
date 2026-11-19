@@ -211,6 +211,9 @@ impl Worker {
     }
 
     fn occ_val_go(&mut self, v: V, set: &[u32]) -> R<bool> {
+        // milestone 42: stuck heads and spines recurse here without a term
+        // step: the tick measures the stack
+        self.tick()?;
         match self.val(v) {
             Val::Thunk { term, env, .. } | Val::Clo { term, env, .. } | Val::CloI { term, env, .. } => self.occ_term(term, env, 0, set),
             Val::Sort(_) | Val::Lit(_) => Ok(false),

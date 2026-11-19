@@ -479,6 +479,17 @@ fn mke(n: ENode) -> Rc<ENode> {
 impl Drop for ENode {
     fn drop(&mut self) {
         live_add(6, -1);
+        // milestone 42: the rest of the chain freed without recursion (a
+        // chain dropped from outside an object, a local or a table, freed
+        // one Rust frame per node before)
+        let mut next = std::mem::replace(&mut self.next, Env::Nil);
+        while let Env::Cons(n) = next {
+            match Rc::try_unwrap(n) {
+                // its own `next` taken first: its drop does not walk on
+                Ok(mut node) => next = std::mem::replace(&mut node.next, Env::Nil),
+                Err(_) => break,
+            }
+        }
     }
 }
 
@@ -2284,5 +2295,36 @@ impl Worker {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // milestone 42: an environment chain dropped from outside an object
+    // (a local, a table) is freed without one frame per node
+    #[test]
+    fn long_env_chain_drops_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(|| {
+                let mut e = Env::Nil;
+                for _ in 0..1_000_000 {
+                    e = Env::Cons(mke(ENode { v: mk(Obj::Erased), next: e }));
+                }
+                // a second owner of a node in the middle: the walk stops there
+                let mut mid = &e;
+                for _ in 0..500_000 {
+                    let Env::Cons(n) = mid else { unreachable!() };
+                    mid = &n.next;
+                }
+                let keep = mid.clone();
+                drop(e);
+                drop(keep);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

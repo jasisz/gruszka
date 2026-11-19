@@ -19,6 +19,10 @@
 //!
 //! `--progress[=SECS]` (milestone 37), anywhere: a progress line on stderr
 //! every SECS seconds (default 10).
+//!
+//! `GRUSZKA_STACK_MB` (milestone 42): each worker's stack in MiB (default
+//! 1024). Recursion that reaches its limit (the stack less a quarter of it,
+//! at most 64 MiB) declines the declaration.
 
 mod env;
 mod induct;
@@ -510,7 +514,13 @@ fn main() {
     // not run one after another on one worker
     const SPILL_MS: u128 = 20;
     let spill: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-    const STACK: usize = 1 << 30;
+    // milestone 42: GRUSZKA_STACK_MB (the deep vectors run at 16 MiB)
+    let stack: usize = std::env::var("GRUSZKA_STACK_MB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&m| (4..=1 << 20).contains(&m))
+        .map_or(1 << 30, |m| m << 20);
+    let stack_limit = stack - (stack / 4).min(64 << 20);
     // per worker: declaration being checked (u32::MAX: none)
     let running: Vec<AtomicU32> = (0..workers).map(|_| AtomicU32::new(u32::MAX)).collect();
     // milestone 37: when each worker's current declaration began (ms since
@@ -590,9 +600,9 @@ fn main() {
             let (status, msgs, running, order, spill, take) = (&status, &msgs, &running, &order, &spill, &take);
             let (began, done) = (&began, &done);
             let h = std::thread::Builder::new()
-                .stack_size(STACK)
+                .stack_size(stack)
                 .spawn_scoped(s, move || {
-                    let mut w = Worker::new(env, shared, first_fail, STACK - (64 << 20));
+                    let mut w = Worker::new(env, shared, first_fail, stack_limit);
                     if tc::KNOBS && wi == 0 {
                         w.show_consts();
                     }

@@ -202,7 +202,9 @@ impl Worker {
         if let Some(&n) = self.nm.of_val.get(&v) {
             return n;
         }
-        if self.nm.fuel == 0 {
+        // milestone 42: one frame per level; past half the stack no name
+        // (the plain path runs), as over the node budget
+        if self.nm.fuel == 0 || self.stack_half() {
             return NONE;
         }
         self.nm.fuel -= 1;
@@ -286,7 +288,7 @@ impl Worker {
         if let Some(&n) = self.nm.of_term.get(&key) {
             return n;
         }
-        if self.nm.fuel == 0 {
+        if self.nm.fuel == 0 || self.stack_half() {
             return NONE;
         }
         self.nm.fuel -= 1;
