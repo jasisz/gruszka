@@ -23,6 +23,11 @@
 --   bad_m48_proj_shape          badProjShape     fields 1 and 2 of one value: the shape decides
 --                                                before the arguments (CFSG HNSchreier.matG_sU)
 --   bad_m48_proj_shape_args     badProjShapeArgs
+--   good_m48_nat_open_fold      goodNatOpenFold  an open side against a Nat operation on literals:
+--                                                the operation is folded (CFSG TripleCoverSuz.gen_of_le)
+--   bad_m48_nat_open_fold       badNatOpenFold
+--   bad_m48_nat_open_shift      badNatOpenShift  `x + 7 = 2` against `3^12000 <<< 297 = 0`
+--                                                (m48 before: past 2 GB, unfolding the shift)
 -- (the pad_env vectors: Lean's own check ran past 500 s and was stopped; their
 -- verdicts follow from computing the loops, as Gruszka m47 gives them)
 import Lean
@@ -85,3 +90,12 @@ theorem badProjShape (n : Nat) (f : Nat → Nat × Nat) : (f (m48fold n 0)).1 = 
 
 set_option debug.skipKernelTC true in
 theorem badProjShapeArgs (n : Nat) (f : Nat → Nat × Nat) : (f (m48fold n 0)).1 = (f (m48fold n 1)).1 := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem goodNatOpenFold (x : Nat) : x * 0 + 23 = 3 ^ 12000 >>> 19015 := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem badNatOpenFold (x : Nat) : x * 0 + 23 = 3 ^ 12000 >>> 19014 := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem badNatOpenShift (x : Nat) : (x + 7 = 2) = ((3 ^ 12000 <<< 297) = 0) := by unchecked_rfl

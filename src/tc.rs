@@ -4831,13 +4831,13 @@ impl Worker {
     /// arguments come to literals, else it stays stuck (less reduction is
     /// never unsound, but it makes a check fail: only where the arguments
     /// are not literals).
-    fn nat_op_unfold_trap(&mut self, row: u32, spine: u32) -> bool {
+    fn nat_op_unfold_trap(&mut self, row: u32, spine: u32) -> R<bool> {
         let c = self.canon_of_row(row);
         let k = self.env.known;
         if !k.nat_ops.contains(&c) && c != k.nat_succ {
-            return false;
+            return Ok(false);
         }
-        let Some(args) = self.app_args(spine) else { return false };
+        let Some(args) = self.app_args(spine) else { return Ok(false) };
         let mut big = false;
         let mut open = false;
         for &a in args {
@@ -4846,13 +4846,14 @@ impl Worker {
                 continue;
             }
             // closed: evaluates to a literal through the GMP operations
-            if let Ok(w) = self.whnf(a) {
-                if matches!(self.val(w), Val::Lit(i) if matches!(self.lit(i), LitVal::Nat(n) if n.bits() > 16)) {
-                    big = true;
-                }
+            // (milestone 48: its errors are the caller's; they were
+            // swallowed, a probe's stop and a refusal past Lean's bound too)
+            let w = self.whnf(a)?;
+            if matches!(self.val(w), Val::Lit(i) if matches!(self.lit(i), LitVal::Nat(n) if n.bits() > 16)) {
+                big = true;
             }
         }
-        big && open
+        Ok(big && open)
     }
 
     fn unfold(&mut self, v: V) -> R<Option<V>> {
@@ -4872,7 +4873,19 @@ impl Worker {
     fn unfold_raw(&mut self, v: V) -> R<Option<V>> {
         let Some((row, _)) = self.delta_info(v) else { return Ok(None) };
         let (_, llr, spine) = self.const_head(v).unwrap();
-        if self.nat_op_unfold_trap(row, spine) {
+        // milestone 48: a Nat operation without free variables is computed,
+        // not unfolded (whnf computes it; every unfolding caller, probes
+        // too, gets the literal). CFSG's TripleCoverSuz.gen_of_le compared
+        // `x + 7` with `n <<< 297`, n a 5901-digit literal: lazy delta does
+        // not fold with a free variable on the other side (Lean's guard),
+        // so the shift was unfolded and each `2 * m` came to Nat.mul's
+        // recursion on m, peeling the literal one by one
+        if self.env.nat_op[row as usize] != 0 && !self.has_fvar(v) {
+            if let Some(n) = self.reduce_nat(v)? {
+                return Ok(Some(n));
+            }
+        }
+        if self.nat_op_unfold_trap(row, spine)? {
             // milestone 47: an argument with free variables may still come
             // to a literal (`Bool.rec 0 (n + 1) false`: the variable in a
             // branch not taken); then the operation is computed, as whnf
