@@ -352,6 +352,38 @@ accumulator's levels take ~8 and keep it. Half the stack (`DEEP_DIV` =
 2) is a backstop for chains whose levels are very wide; the depth bound
 acts first everywhere measured.
 
+**Deep inferences and comparisons handed up (milestone 45).** CFSG's
+`CertificateChecks.KernelMisc.RuFive.RG.chars` is a `List Char` literal of
+913 500 conses, and `RG.eq` states that a string literal of as many
+characters is `String.ofList chars` by `Eq.refl`. Inferring the list's type
+infers each tail inside its cons (infer, infer_core: ~500 B of stack a
+level on arm64), and comparing the two lists compares each tail inside its
+cons (defeq_app, spines: ~630 B a level): on AWS (x86, PGO, 1 GiB) the
+inference passed the stack limit, the declaration was declined and the
+rest of the file skipped. The same hand-up as for whnf, by stack only
+(past `deep_at`, half the stack): an inference of a closed term that
+misses `infer_cache` returns `Stop::DeepInfer`, a comparison of two
+values without free variables that misses `eq_cache` (both outcomes are
+kept) returns `Stop::DeepDefeq`, outside probes; the declaration
+(`check_decl_deep`) works it out from its own shallow stack, deepest
+first, and checks the declaration again, which finds it cached. Both
+look at the stack only once `tick_slow` (every `TICK_STACK` ticks) found
+it past `deep_at` (`deep_zone`): an outermost inference and comparison
+catching them, as `whnf_outer` does, cost +1.7% / +0.5% instructions on
+Init (every call went through them); the declaration-level catch +0.25%.
+Scratch declarations (inductive groups, the quotient, unsafe ones) do not
+hand up.
+Two walks that never tick went with them: `canon_app` makes each argument
+canonical inside its own call (past half the stack a closed term is left
+the lazy thunk, past the limit a decline; leaving open terms lazy too
+turned the deep vector lets_bad into 7 GB of thunks over environments),
+and names (`nv`) walked the 913 K-element list to the budget or to half
+the stack once per element compared: a value without a name is now
+remembered as such (`of_val` NONE), as the field's comment always said.
+RuFive (6342 declarations) is accepted at 16 MiB of stack and at the
+default; m43 declined RG.chars at 256 MiB, and with only the inference
+handed up `canon_app` aborted the run with a stack overflow at 64 MiB. tests/deep.sh: list_good / list_bad (1 M conses) at 4-64 MiB.
+
 The constants and switches (data/m38/sweep.txt: knobs build, w1, CFSG
 slices, the deep tests, Init and con-leche; G, s, peak MiB):
 

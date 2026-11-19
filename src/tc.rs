@@ -102,6 +102,14 @@ pub enum Stop {
     /// milestone 39: the ground machine gives a comparison or a whnf back
     /// to the kernel (caught where the run began; never leaves it)
     Ground,
+    /// milestone 45: a closed term's inference too deeply nested in other
+    /// inferences, handed up to the outermost (`deep_inf`; caught there,
+    /// never leaves it)
+    DeepInfer,
+    /// milestone 45: a comparison of closed values too deeply nested in
+    /// other comparisons, handed up to the outermost (`deep_eq`; caught
+    /// there, never leaves it)
+    DeepDefeq,
 }
 pub type R<T> = Result<T, Stop>;
 
@@ -294,6 +302,10 @@ const GROUND_AT: usize = 1 << 26;
 const MEMO_COST: u64 = 4;
 
 const DEEP_WHNF: u32 = 8192;
+/// milestone 45: most comparisons or inferences an outermost call keeps
+/// waiting while it works out handed-up ones (a bound, not a tuning: a
+/// chain deeper than this many slices of half the stack is declined)
+const DEEP_PEND_CAP: usize = 1 << 24;
 /// Milestone 38: ticks per level past which a handed-up attempt doubles the
 /// bound (a quarter of `GHOST_TICKS`, a rollback's own cost)
 const DEEP_TICKS: u32 = region::GHOST_TICKS / 4;
@@ -1007,6 +1019,12 @@ pub struct Worker {
     deep_at: usize,
     /// the value handed up with `Stop::Deep`
     deep_v: V,
+    /// milestone 45: the closed term (term, level substitution, check)
+    /// handed up with `Stop::DeepInfer`, the pair with `Stop::DeepDefeq`
+    deep_inf: (u32, u32, bool),
+    deep_eq: (V, V),
+    /// past `deep_at` when the stack was last measured (tick_slow)
+    deep_zone: bool,
     /// milestone 38: an outermost attempt that handed up is rolled back (SK_DEEP_ROLL=1)
     deep_roll: bool,
     /// milestone 38: past this many nested whnfs a miss is handed up (SK_DEEP_WHNF)
@@ -1348,6 +1366,9 @@ impl Worker {
                 d => stack_limit / d,
             },
             deep_v: NONE,
+            deep_inf: (NONE, 0, false),
+            deep_eq: (NONE, NONE),
+            deep_zone: false,
             deep_n: if KNOBS { std::env::var("SK_DEEP_WHNF").ok().and_then(|s| s.parse().ok()).unwrap_or(DEEP_WHNF) } else { DEEP_WHNF },
             deep_cur: u32::MAX,
             deep_half: 0,
@@ -1900,7 +1921,11 @@ impl Worker {
         // margin below the limit
         let x = 0u8;
         let sp = std::hint::black_box(&x) as *const u8 as usize;
-        if self.stack_base.saturating_sub(sp) > self.stack_limit {
+        let used = self.stack_base.saturating_sub(sp);
+        // milestone 45: inferences and comparisons hand up past `deep_at`
+        // (read here, every TICK_STACK ticks: they tick)
+        self.deep_zone = self.deep_at != 0 && used > self.deep_at && !self.scratch;
+        if used > self.stack_limit {
             // while too deep, every tick measures again (a caller that
             // swallows the decline still stops), as before
             self.tick_alarm = self.ticks.wrapping_add(1);
@@ -3156,6 +3181,28 @@ impl Worker {
             }
             i
         };
+        // milestone 45: each argument is made canonical inside this call,
+        // one Rust frame chain per level and no tick: CFSG's RG.chars (a
+        // 913 K-element list literal) overflowed a 64 MiB stack here (an
+        // abort of the whole run). Past half the stack a closed term is
+        // left the lazy thunk (as for any doubt; it has no environment to
+        // hold); past the limit, as a tick, a decline. (The lazy thunk for
+        // open terms too turned the deep vector lets_bad, 300 K nested
+        // lets, from a decline into 7 GB of thunks over their
+        // environments.)
+        {
+            let x = 0u8;
+            let sp = std::hint::black_box(&x) as *const u8 as usize;
+            let used = self.stack_base.saturating_sub(sp);
+            if used > self.stack_limit / 2 {
+                if env == EMPTY {
+                    return Ok(None);
+                }
+                if used > self.stack_limit {
+                    return decline("recursion too deep (stack limit)");
+                }
+            }
+        }
         let base = self.argstack.len();
         let mut f = t;
         loop {
@@ -5132,9 +5179,32 @@ impl Worker {
         }
         self.infer_full(t, env, ls, check)
     }
+    /// Milestone 45: an inference past `deep_at` bytes of stack of a
+    /// closed term that misses its cache is handed up (`Stop::DeepInfer`)
+    /// to the declaration (`check_decl`), worked out there from a shallow
+    /// stack (its own deep misses handed up the same way, so the deepest
+    /// first), cached, and the declaration tried again, finding it. CFSG's
+    /// RG.chars is a List Char literal of 913 K conses: each tail's type
+    /// was inferred inside its cons's, past the stack limit on AWS
+    /// ("recursion too deep", declined, and everything after it in the
+    /// file skipped). Pestka hands deep arguments up the same way
+    /// (DeepSpinesResumed). (An outermost inference catching them, as
+    /// whnf_outer does, cost +1.7% instructions on Init: every inference
+    /// went through it.)
     #[inline(never)]
     fn infer_full(&mut self, t: u32, env: u32, ls: u32, check: bool) -> R<V> {
         self.tick()?;
+        if self.deep_zone && self.trng(t) == 0 {
+            let x = 0u8;
+            let sp = std::hint::black_box(&x) as *const u8 as usize;
+            if self.stack_base.saturating_sub(sp) > self.deep_at
+                && self.tk(t) != BVAR
+                && icache_hit(self.infer_cache.get(&ikey2(t, EMPTY, ls)), check, self.cur_lp).is_none()
+            {
+                self.deep_inf = (t, ls, check);
+                return Err(Stop::DeepInfer);
+            }
+        }
         #[cfg(feature = "cnt")]
         { self.stats.infer_calls += 1; }
         if self.tk(t) == BVAR {
@@ -5971,8 +6041,28 @@ impl Worker {
         }
         self.defeq_ne(a, b)
     }
+    /// Milestone 45: a comparison past `deep_at` bytes of stack of two
+    /// values without free variables whose pair is not cached is handed up
+    /// (`Stop::DeepDefeq`) to the declaration, worked out there from a
+    /// shallow stack, cached (`eq_cache` keeps both outcomes), and the
+    /// declaration tried again. CFSG's RG.eq compares a 913 K-character
+    /// string literal with String.ofList of a list literal: one nested
+    /// comparison per element (each tail is the last argument of a cons),
+    /// ~630 B of stack each on arm64, more on x86 with PGO. Not inside a
+    /// probe (its budget belongs to the probe's caller).
     #[inline(never)]
     fn defeq_ne(&mut self, a: V, b: V) -> R<bool> {
+        if self.deep_zone && !self.probe_on {
+            let x = 0u8;
+            let sp = std::hint::black_box(&x) as *const u8 as usize;
+            if self.stack_base.saturating_sub(sp) > self.deep_at {
+                let pk = if a < b { (a as u64) << 32 | b as u64 } else { (b as u64) << 32 | a as u64 };
+                if self.eq_get(pk).is_none() && !self.has_fvar(a) && !self.has_fvar(b) {
+                    self.deep_eq = (a, b);
+                    return Err(Stop::DeepDefeq);
+                }
+            }
+        }
         if dstack_on() {
             dstack_push(b'D', a, b, self.ticks);
             let r = self.defeq_ne1(a, b);
@@ -8360,7 +8450,7 @@ impl Worker {
         if scratch {
             self.enter_scratch();
         }
-        let r = self.check_decl_in(d);
+        let r = if scratch { self.check_decl_in(d) } else { self.check_decl_deep(d) };
         self.leave_scratch();
         // a failure, or a built-in reading not available yet: the session
         // ends before the next declaration
@@ -8368,6 +8458,49 @@ impl Worker {
             self.sess_end = true;
         }
         r
+    }
+
+    /// Milestone 45: the declaration, with the inferences and comparisons
+    /// handed up from too deep (`Stop::DeepInfer`, `Stop::DeepDefeq`)
+    /// worked out here, deepest first, and the declaration tried again.
+    fn check_decl_deep(&mut self, d: u32) -> R<()> {
+        enum Up {
+            Inf(u32, u32, bool),
+            Eq(V, V),
+        }
+        let (a0, l0, d0) = (self.argstack.len(), self.let_vals.len(), self.vdepth);
+        let mut pend: Vec<Up> = Vec::new();
+        loop {
+            let r = match pend.last() {
+                None => self.check_decl_in(d),
+                Some(&Up::Inf(t, ls, c)) => self.infer(t, EMPTY, ls, c).map(|_| ()),
+                Some(&Up::Eq(a, b)) => self.defeq(a, b).map(|_| ()),
+            };
+            let up = match r {
+                Ok(()) => {
+                    if pend.pop().is_none() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(Stop::DeepInfer) => {
+                    let (t, ls, c) = self.deep_inf;
+                    Up::Inf(t, ls, c)
+                }
+                Err(Stop::DeepDefeq) => Up::Eq(self.deep_eq.0, self.deep_eq.1),
+                Err(e) => return Err(e),
+            };
+            // the frames between were unwound: their stacks too
+            self.argstack.truncate(a0);
+            self.let_vals.truncate(l0);
+            self.vdepth_to(d0);
+            self.wdepth = 0;
+            self.stats.deep_up += 1;
+            if pend.len() >= DEEP_PEND_CAP {
+                return decline("recursion too deep (hand-ups)");
+            }
+            pend.push(up);
+        }
     }
 
     fn check_decl_in(&mut self, d: u32) -> R<()> {

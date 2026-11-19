@@ -5,6 +5,9 @@
 #                     big := dbl^20 (succ zero): a lazy accumulator 2^20 steps deep
 #                     t : forall y, P (go big y) -> P (g y)            (rejected)
 #   acc_good.ndjson   t : forall y, P (go big y) -> P (go2 big y)      (accepted; go2 a copy of go)
+#   list_good.ndjson  chars : L := cons z (cons z (... nil)), N = 1000000 conses (accepted;
+#                     milestone 45: CFSG's RG.chars, a 791 K-element List Char literal)
+#   list_bad.ndjson   the same with the innermost element of the wrong type (rejected)
 # usage: python3 scripts/deep_vectors.py OUTDIR
 import os, sys
 here = os.path.dirname(os.path.abspath(__file__))
@@ -60,6 +63,23 @@ def acc(m, kind, path):
     w.thm(nm("t"), w.pi(y, cA, w.pi(h, lhs, rhs)), w.lam(y, cA, w.lam(h, lhs, w.bvar(0))))
     w.save(path)
 
+def lst(n, kind, path):
+    w = from_base(os.path.join(here, "..", "tests", "adv-base", "n.base"))
+    cN = w.const(1); z = w.const(2); one = w.succ(0); ty = w.sort(one)
+    nm = w.name; x = nm("x"); xs = nm("xs")
+    L = nm("L"); w.axiom(L, ty); cL = w.const(L)
+    nil = nm("nil"); w.axiom(nil, cL)
+    cons = nm("cons"); w.axiom(cons, w.pi(x, cN, w.pi(xs, cL, cL))); cc = w.const(cons)
+    body = w.const(nil)
+    if kind == "bad":
+        body = w.app(w.app(cc, w.const(nil)), body)
+    for _ in range(n):
+        body = w.app(w.app(cc, z), body)
+    w.defn(nm("chars"), cL, body, h={"regular": 1})
+    w.save(path)
+
 lets(300000, os.path.join(outd, "lets_bad.ndjson"))
+lst(1000000, "good", os.path.join(outd, "list_good.ndjson"))
+lst(1000000, "bad", os.path.join(outd, "list_bad.ndjson"))
 acc(20, "bad", os.path.join(outd, "acc_bad.ndjson"))
 acc(20, "good", os.path.join(outd, "acc_good.ndjson"))

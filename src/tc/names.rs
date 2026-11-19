@@ -36,7 +36,8 @@ const T_VAL: u8 = 14;
 #[derive(Default)]
 pub struct Names {
     nodes: FxHashMap<(u8, u32, u32), u32>,
-    /// value -> name (NONE: over budget once; not retried)
+    /// value -> name (NONE: over budget or past half the stack once; not
+    /// retried, milestone 45)
     pub(super) of_val: FxHashMap<V, u32>,
     /// (term, env, ls, depth) -> name
     pub(super) of_term: FxHashMap<(u64, u64), u32>,
@@ -249,6 +250,15 @@ impl Worker {
             self.nm.of_val.insert(v, n);
             self.ulog(Undo::NmOfVal(v));
             self.nm.made += 1;
+        } else {
+            // milestone 45: over the budget or past half the stack (the
+            // only ways to no name): not walked again. A list literal of
+            // 913 K elements (CFSG's RG.chars) was walked to the budget or
+            // the stack once per element compared. A value walked again
+            // from a shallower stack might have had a name: only sharing
+            // is lost, as over the budget
+            self.nm.of_val.insert(v, NONE);
+            self.ulog(Undo::NmOfVal(v));
         }
         n
     }
