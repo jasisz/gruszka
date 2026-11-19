@@ -338,6 +338,16 @@ const LS_CLASS: bool = true;
 
 pub type V = u32;
 static BIG_ZERO: BigUint = BigUint::ZERO;
+/// Milestone 37: the content key of a big Nat literal: its length and a
+/// few digits (both ends and the middle). Equal contents, equal keys;
+/// numbers that differ only elsewhere share a key.
+fn lit_key(n: &BigUint) -> u64 {
+    let mut d = n.iter_u64_digits();
+    let len = d.len();
+    let mid = n.iter_u64_digits().nth(len / 2).unwrap_or(0);
+    let (a, b) = (d.next().unwrap_or(0), d.next_back().unwrap_or(0));
+    hmix(hmix(hmix(hmix(n.bits(), len as u64), a), b), mid)
+}
 /// Milestone 37: `x * y` skipping the zero 64-bit digits of the shorter
 /// operand (CFSG's bit-sliced tables multiply a long, mostly zero number
 /// by a short one); num-bigint's product otherwise.
@@ -1055,6 +1065,13 @@ pub struct Worker {
     ghost: FxHashSet<u64>,
     pinned: FxHashSet<u64>,
     ghost_shape: FxHashSet<u64>,
+    /// milestone 43: content keys (`lit_key`) of big literals whose memos a
+    /// rollback dropped, and of those among them made again after the drop
+    /// (work done again: their memos are kept from then on)
+    lit_dropped: FxHashSet<u64>,
+    lit_redo: FxHashSet<u64>,
+    /// SK_LIT_REDO=0 (knobs): every big literal's memo dropped, as before
+    lit_redo_on: bool,
     /// `GHOST_TICKS` (SK_GHOST_TICKS in knobs)
     ghost_ticks: u32,
     /// `KEY_FUEL` (SK_KEY_FUEL in knobs)
@@ -1302,6 +1319,9 @@ impl Worker {
             ghost: FxHashSet::default(),
             pinned: FxHashSet::default(),
             ghost_shape: FxHashSet::default(),
+            lit_dropped: FxHashSet::default(),
+            lit_redo: FxHashSet::default(),
+            lit_redo_on: !(KNOBS && std::env::var("SK_LIT_REDO").is_ok_and(|s| s == "0")),
             key_fuel: if KNOBS { std::env::var("SK_KEY_FUEL").ok().and_then(|s| s.parse().ok()).unwrap_or(region::KEY_FUEL) } else { region::KEY_FUEL },
             ghost_ticks: if KNOBS { std::env::var("SK_GHOST_TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(region::GHOST_TICKS) } else { region::GHOST_TICKS },
             reg_done: Vec::new(),
@@ -2823,17 +2843,19 @@ impl Worker {
             // confirmed by comparing the contents; numbers that differ only
             // elsewhere share a slot (the later one takes it: less sharing,
             // never a wrong value)
-            bk = {
-                let mut d = n.iter_u64_digits();
-                let len = d.len();
-                let mid = n.iter_u64_digits().nth(len / 2).unwrap_or(0);
-                let (a, b) = (d.next().unwrap_or(0), d.next_back().unwrap_or(0));
-                hmix(hmix(hmix(hmix(n.bits(), len as u64), a), b), mid)
-            };
+            bk = lit_key(&n);
             if let Some(&v) = self.big_map.get(&bk) {
                 if self.nat_ref(v) == Some(&n) {
                     return Ok(v);
                 }
+            }
+            // milestone 43: a literal whose memo a rollback dropped is made
+            // again: the work that made it was done again
+            if !self.lit_dropped.is_empty() && self.lit_dropped.contains(&bk) {
+                if self.lit_redo.len() >= region::LIT_KEYS_CAP {
+                    self.lit_redo.clear();
+                }
+                self.lit_redo.insert(bk);
             }
             self.wlit_bytes += (n.bits() / 8) as usize;
         }

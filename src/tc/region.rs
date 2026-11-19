@@ -127,6 +127,9 @@ pub(super) const KEY_FUEL: u32 = 4096;
 /// many bytes of big literals.
 const REGION_MIN_LIT_BYTES: usize = 1 << 20;
 const MEMO_LIT_BYTES: u64 = 1 << 14;
+/// milestone 43: most keys in `lit_dropped` / `lit_redo` (8 MiB each);
+/// past it the set starts over
+pub(super) const LIT_KEYS_CAP: usize = 1 << 20;
 /// marker of a dead value (SK_REGION_POISON): a level id no table hands out
 pub const DEAD_LVL: u32 = 0xDEAD_0001;
 /// marker of a dead environment's run start
@@ -639,11 +642,32 @@ impl Worker {
     /// pass `reg_lit_keep` bytes, a memo that names one is not kept by a
     /// rollback (made again if asked again; CFSG's gf3 holds
     /// 609961-bit intermediates of matrix products that are read once).
-    fn big_lit(&self, x: V) -> bool {
-        match self.val(x) {
-            Val::Lit(i) => matches!(self.lit(i), LitVal::Nat(n) if n.bits() > 8 * MEMO_LIT_BYTES),
-            _ => false,
+    /// Milestone 43: unless a literal of the same content was made again
+    /// after such a drop (`lit_redo`): then the drop cost the work again
+    /// and the memo stays. CFSG's LyOm.neg_a3 forces the same table
+    /// entries (2290-limb products) about 100 times each: every force
+    /// after a rollback multiplied again (> 80 min; 37 s with the memos
+    /// kept, as with SK_REGION_LIT_KEEP past its literals). Read-once
+    /// intermediates are never made again, so they are still dropped.
+    fn big_lit(&mut self, x: V) -> bool {
+        let k = match self.val(x) {
+            Val::Lit(i) => match self.lit(i) {
+                LitVal::Nat(n) if n.bits() > 8 * MEMO_LIT_BYTES => lit_key(n),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        if !self.lit_redo_on {
+            return true;
         }
+        if self.lit_redo.contains(&k) {
+            return false;
+        }
+        if self.lit_dropped.len() >= LIT_KEYS_CAP {
+            self.lit_dropped.clear();
+        }
+        self.lit_dropped.insert(k);
+        true
     }
 
     /// `reg_reach` from one root: false (and nothing added) past `limit`

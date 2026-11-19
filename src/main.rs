@@ -528,6 +528,10 @@ fn main() {
     let t_run = Instant::now();
     let began: Vec<std::sync::atomic::AtomicU64> = (0..workers).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
     let done = std::sync::atomic::AtomicUsize::new(0);
+    // milestone 43: declarations not checked because an earlier one (in
+    // file order) failed, for the progress line: on AWS a decline left 31
+    // of 32 workers idle with 73% of CFSG "to do" and no word of why
+    let cancelled = std::sync::atomic::AtomicUsize::new(0);
     let all_done = std::sync::atomic::AtomicBool::new(false);
     // milestone 37: SK_MEM_REPORT=1: each worker's held bytes by group at its end
     let mem_report = std::env::var_os("SK_MEM_REPORT").is_some();
@@ -538,7 +542,7 @@ fn main() {
         // check, memory, and the longest-running declarations in flight
         let mut progress_thread = None;
         if let Some(every) = progress {
-            let (all_done, running, began, done) = (&all_done, &running, &began, &done);
+            let (all_done, running, began, done, cancelled) = (&all_done, &running, &began, &done, &cancelled);
             progress_thread = Some(s.spawn(move || {
                 let mut next = every;
                 while !all_done.load(Ordering::Relaxed) {
@@ -566,10 +570,12 @@ fn main() {
                         })
                         .collect();
                     let n = done.load(Ordering::Relaxed);
+                    let nc = cancelled.load(Ordering::Relaxed);
                     eprintln!(
-                        "progress: {:.0} s, {n}/{no} declarations ({:.1}%), {} workers busy, {:.2} GB; longest: {}",
+                        "progress: {:.0} s, {n}/{no} declarations ({:.1}%){}, {} workers busy, {:.2} GB; longest: {}",
                         now as f64 / 1000.0,
                         100.0 * n as f64 / no.max(1) as f64,
+                        if nc > 0 { format!(", {nc} not checked after a failure") } else { String::new() },
                         fl.len(),
                         rss_now() as f64 / 1e9,
                         if longest.is_empty() { "-".to_string() } else { longest.join(", ") }
@@ -598,7 +604,7 @@ fn main() {
         let mut handles = Vec::new();
         for wi in 0..workers {
             let (status, msgs, running, order, spill, take) = (&status, &msgs, &running, &order, &spill, &take);
-            let (began, done) = (&began, &done);
+            let (began, done, cancelled) = (&began, &done, &cancelled);
             let h = std::thread::Builder::new()
                 .stack_size(stack)
                 .spawn_scoped(s, move || {
@@ -630,6 +636,7 @@ fn main() {
                             let d = d32 as usize;
                             if d32 > first_fail.load(Ordering::Relaxed) {
                                 status[d].store(ST_CANCEL, Ordering::Relaxed);
+                                cancelled.fetch_add(1, Ordering::Relaxed);
                                 continue;
                             }
                             began[wi].store(t_run.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -701,8 +708,20 @@ fn main() {
                                 }
                             };
                             if st == ST_REJECT || st == ST_DECLINE {
-                                first_fail.fetch_min(d32, Ordering::Relaxed);
-                                msgs.lock().unwrap().push((d32, msg.unwrap()));
+                                let before = first_fail.fetch_min(d32, Ordering::Relaxed);
+                                let msg = msg.unwrap();
+                                // milestone 43: with --progress, a failure is told when
+                                // it happens (the run still waits for the declarations
+                                // before it in the file, to name the first failure)
+                                if progress.is_some() && d32 < before {
+                                    let (first, _) = env.decl_rows[d];
+                                    eprintln!(
+                                        "progress: {} {}: {msg} (the declarations after it in the file are not checked)",
+                                        if st == ST_REJECT { "rejected" } else { "declined" },
+                                        env.name_str(env.consts[first as usize].name)
+                                    );
+                                }
+                                msgs.lock().unwrap().push((d32, msg));
                             }
                             status[d].store(st, Ordering::Relaxed);
                             done.fetch_add(1, Ordering::Relaxed);

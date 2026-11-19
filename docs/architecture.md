@@ -164,7 +164,12 @@ back:
   within a small budget, closed thunks forced in the region with their
   forced values. Past 512 MiB of big literals in the
   session, a memo naming a literal over 16 KiB is not kept (it is made
-  again if asked again: CFSG's gf3 test holds 609961-bit intermediates);
+  again if asked again: CFSG's gf3 test holds 609961-bit intermediates),
+  until a literal of the same content is made again after such a drop
+  (milestone 43): the drop then cost the work again, and memos naming
+  that content are kept from then on (CFSG's LyOm.neg_a3 forces each
+  18 KB table entry about 100 times; with every force after a rollback
+  multiplied again it ran past 80 minutes, now 8.5 s);
 - the result, memos and thunks together may reach at most a quarter of
   what the region made, or the region is kept. The threshold of 2^22
   values is a guard against thrashing: at 2^20, Arena's reachability
