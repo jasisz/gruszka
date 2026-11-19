@@ -19,6 +19,10 @@
 --   bad_m48_pad_env             badPadEnv
 --   good_m48_pad_env_reads      goodPadEnvReads  the inline term reads a binder: compared as before
 --   bad_m48_pad_env_reads       badPadEnvReads
+--   good_m48_proj_shape         goodProjShape    projections of a stuck application, same field
+--   bad_m48_proj_shape          badProjShape     fields 1 and 2 of one value: the shape decides
+--                                                before the arguments (CFSG HNSchreier.matG_sU)
+--   bad_m48_proj_shape_args     badProjShapeArgs
 -- (the pad_env vectors: Lean's own check ran past 500 s and was stopped; their
 -- verdicts follow from computing the loops, as Gruszka m47 gives them)
 import Lean
@@ -72,3 +76,12 @@ theorem goodPadEnvReads (w : Nat) (g : Nat → Nat → Bool) : m48allInK 0 2000 
 
 set_option debug.skipKernelTC true in
 theorem badPadEnvReads (w : Nat) (g : Nat → Nat → Bool) : m48allInK 0 2000 (fun i => g w i) = decide (Nat.allTR (2000 - 0) (fun k _ => (fun _i => g w (k + 1)) (0 + k)) = true) := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem goodProjShape (n : Nat) (f : Nat → Nat × Nat) : (f (m48fold n 0)).1 = (f (m48fold n 0 + 0)).1 := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem badProjShape (n : Nat) (f : Nat → Nat × Nat) : (f (m48fold n 0)).1 = (f (m48fold n 0)).2 := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem badProjShapeArgs (n : Nat) (f : Nat → Nat × Nat) : (f (m48fold n 0)).1 = (f (m48fold n 1)).1 := by unchecked_rfl

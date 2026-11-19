@@ -8325,26 +8325,41 @@ impl Worker {
     }
 
     fn spines_defeq(&mut self, sa: u32, sb: u32) -> R<bool> {
-        let n = self.sp.len(sa);
-        if n != self.sp.len(sb) {
+        if !self.spines_same_shape(sa, sb) {
             return Ok(false);
         }
-        for i in 0..n {
+        for i in 0..self.sp.len(sa) {
             let (x, y) = (self.sp.args(sa)[i], self.sp.args(sb)[i]);
-            let px = x & PROJ_BIT != 0;
-            let py = y & PROJ_BIT != 0;
-            if px != py {
-                return Ok(false);
-            }
-            if px {
-                if self.projs[(x & !PROJ_BIT) as usize].1 != self.projs[(y & !PROJ_BIT) as usize].1 {
-                    return Ok(false);
-                }
-            } else if !self.defeq(x, y)? {
+            if x & PROJ_BIT == 0 && !self.defeq(x, y)? {
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Milestone 48: two spines of one length with their projections at the
+    /// same places, of the same fields. Read before any argument is
+    /// compared: CFSG's HNSchreier.matG_sU compared `↑(dJ⁻¹)` (Subgroup's
+    /// inverse: `Subtype.val _ _ Y .1`) with `(↑dJ)⁻¹` (Units': `Subtype.val
+    /// _ _ dJ .0`) argument by argument, `Y =?= dJ` first: two 133x133
+    /// matrices multiplied out entry by entry (past 200 GB on AWS) before
+    /// the next position showed field 1 against field 0.
+    fn spines_same_shape(&self, sa: u32, sb: u32) -> bool {
+        let n = self.sp.len(sa);
+        if n != self.sp.len(sb) {
+            return false;
+        }
+        for i in 0..n {
+            let (x, y) = (self.sp.args(sa)[i], self.sp.args(sb)[i]);
+            let px = x & PROJ_BIT != 0;
+            if px != (y & PROJ_BIT != 0) {
+                return false;
+            }
+            if px && self.projs[(x & !PROJ_BIT) as usize].1 != self.projs[(y & !PROJ_BIT) as usize].1 {
+                return false;
+            }
+        }
+        true
     }
 
     fn defeq_app(&mut self, a: V, b: V) -> R<bool> {
@@ -8360,7 +8375,7 @@ impl Worker {
                 }
                 false
             }
-            (Head::Stuck(x), Head::Stuck(y)) => self.defeq(x, y)?,
+            (Head::Stuck(x), Head::Stuck(y)) => self.spines_same_shape(sa, sb) && self.defeq(x, y)?,
             _ => false,
         };
         if !heads {
