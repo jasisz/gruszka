@@ -4806,8 +4806,10 @@ impl Worker {
 
     /// A Nat operation the kernel computes on literals, applied to a large
     /// literal and to something with free variables: unfolding it would peel
-    /// the literal one successor at a time. It stays stuck (less reduction
-    /// is never unsound; it can only make a check fail).
+    /// the literal one successor at a time. It is computed when its
+    /// arguments come to literals, else it stays stuck (less reduction is
+    /// never unsound, but it makes a check fail: only where the arguments
+    /// are not literals).
     fn nat_op_unfold_trap(&mut self, row: u32, spine: u32) -> bool {
         let c = self.canon_of_row(row);
         let k = self.env.known;
@@ -4850,7 +4852,13 @@ impl Worker {
         let Some((row, _)) = self.delta_info(v) else { return Ok(None) };
         let (_, llr, spine) = self.const_head(v).unwrap();
         if self.nat_op_unfold_trap(row, spine) {
-            return Ok(None);
+            // milestone 47: an argument with free variables may still come
+            // to a literal (`Bool.rec 0 (n + 1) false`: the variable in a
+            // branch not taken); then the operation is computed, as whnf
+            // computes it. The trap left it stuck and the comparison with
+            // the literal on the other side failed (CFSG's PtCnt.dJ_mod:
+            // `X % 1048576 =?= 0`).
+            return self.reduce_nat(v);
         }
         let Some(body) = self.decl_value(row)? else { return Ok(None) };
         if self.trng(body) != 0 {

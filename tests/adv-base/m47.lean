@@ -10,6 +10,10 @@
 --   bad_m47_pow_count        badPowCount      true, but the count is past 32 bits
 --   good_m47_shift_2p24      goodShift2p24    a count past 2^24 is computed (CFSG HNSchreier)
 --   bad_m47_shift_2p24       badShift2p24
+--   good_m47_nat_trap_open   goodNatTrapOpen  a free variable only in a branch not taken:
+--                                             the operation is computed (CFSG PtCnt.dJ_mod)
+--   bad_m47_nat_trap_open    badNatTrapOpen
+--   bad_m47_nat_trap_stuck   badNatTrapStuck  the variable in the branch taken
 import Lean
 open Lean Meta Elab Tactic
 
@@ -36,3 +40,12 @@ theorem goodShift2p24 : (1 <<< 16777217) % 7 = 4 := by unchecked_rfl
 
 set_option debug.skipKernelTC true in
 theorem badShift2p24 : (1 <<< 16777217) % 7 = 5 := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem goodNatTrapOpen (n : Nat) : (Bool.rec (motive := fun _ => Nat) 0 (n + 5) false) % 1048576 = 0 := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem badNatTrapOpen (n : Nat) : (Bool.rec (motive := fun _ => Nat) 0 (n + 5) false) % 1048576 = 1 := by unchecked_rfl
+
+set_option debug.skipKernelTC true in
+theorem badNatTrapStuck (n : Nat) : (Bool.rec (motive := fun _ => Nat) 0 (n + 5) true) % 1048576 = 0 := by unchecked_rfl
