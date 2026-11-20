@@ -80,6 +80,9 @@ pub struct Node {
 pub struct Region {
     nodes: *mut Node,
     used: *mut u64,
+    /// the used mask's high word (`used_hi`), written only for nodes whose
+    /// range is past 63
+    hi: *mut u64,
     first: std::sync::atomic::AtomicU32,
     slab: std::sync::atomic::AtomicU32,
     next: std::sync::atomic::AtomicU32,
@@ -130,8 +133,9 @@ pub fn region() -> &'static Region {
     REGION.get_or_init(|| {
         let nodes = vm::reserve(ID_SPACE * 16) as *mut Node;
         let used = vm::reserve(ID_SPACE * 8) as *mut u64;
-        assert!(!nodes.is_null() && !used.is_null(), "cannot reserve the term address range");
-        Region { nodes, used, first: 0.into(), slab: 0.into(), next: 0.into(), big: std::sync::Mutex::new(None) }
+        let hi = vm::reserve(ID_SPACE * 8) as *mut u64;
+        assert!(!nodes.is_null() && !used.is_null() && !hi.is_null(), "cannot reserve the term address range");
+        Region { nodes, used, hi, first: 0.into(), slab: 0.into(), next: 0.into(), big: std::sync::Mutex::new(None) }
     })
 }
 
@@ -341,6 +345,7 @@ pub struct Cols {
     pub base: u32,
     n_ptr: *mut Node,
     u_ptr: *mut u64,
+    h_ptr: *mut u64,
     len: usize,
     cap: usize,
     /// largest length since pages were last given back
@@ -354,8 +359,8 @@ unsafe impl Sync for Cols {}
 
 impl Default for Cols {
     fn default() -> Cols {
-        let (n_ptr, u_ptr) = (std::ptr::NonNull::dangling().as_ptr(), std::ptr::NonNull::dangling().as_ptr());
-        Cols { base: 0, n_ptr, u_ptr, len: 0, cap: 0, hw: 0, too_deep: false, full: false }
+        let (n_ptr, u_ptr, h_ptr) = (std::ptr::NonNull::dangling().as_ptr(), std::ptr::NonNull::dangling().as_ptr(), std::ptr::NonNull::dangling().as_ptr());
+        Cols { base: 0, n_ptr, u_ptr, h_ptr, len: 0, cap: 0, hw: 0, too_deep: false, full: false }
     }
 }
 
@@ -363,10 +368,16 @@ impl Cols {
     fn at(r: &Region, base: u32, cap: usize) -> Cols {
         let n_ptr = unsafe { r.nodes.add(base as usize) };
         let u_ptr = unsafe { r.used.add(base as usize) };
-        Cols { base, n_ptr, u_ptr, len: 0, cap, hw: 0, too_deep: false, full: false }
+        let h_ptr = unsafe { r.hi.add(base as usize) };
+        Cols { base, n_ptr, u_ptr, h_ptr, len: 0, cap, hw: 0, too_deep: false, full: false }
     }
     #[inline(always)]
     pub fn push(&mut self, k: u8, a: u32, b: u32, p: u32, r: u32, u: u64) {
+        self.push_h(k, a, b, p, r, (u, 0))
+    }
+    /// `push` with the used mask's high word (kept only past range 63).
+    #[inline(always)]
+    pub fn push_h(&mut self, k: u8, a: u32, b: u32, p: u32, r: u32, (u, h): (u64, u64)) {
         if r >= u16::MAX as u32 {
             self.too_deep = true;
         }
@@ -376,6 +387,9 @@ impl Cols {
         }
         unsafe {
             self.u_ptr.add(self.len).write(u);
+            if r > 63 {
+                self.h_ptr.add(self.len).write(h);
+            }
             self.n_ptr.add(self.len).write(Node { a, b, p, rng: r.min(u16::MAX as u32) as u16, kind: k, _pad: 0 });
         }
         self.len += 1;
@@ -449,10 +463,41 @@ pub enum LitVal {
     Str(Box<str>),
 }
 
-/// Saturating range helpers.
+/// The used mask of a term as two words: `lo` has bit i for #i (i < 63)
+/// and bit 63 for any index of 63 or more; `hi` (meaningful only past
+/// range 63) has bit j for #(63 + j) (j < 63) and bit 63 for any index of
+/// 126 or more. Milestone 51: with one word, a binder shifted the "63 or
+/// more" bit down into bit 62, then 61, ..., so under a telescope of more
+/// than 63 binders every term's mask claimed nearly every variable (RH's
+/// pack_heq: 2.9 M bits set where 0.68 M are read). The inference keys,
+/// pruned environments and variables of the checker are built from these
+/// masks: equal subterms under different binders never met, and checking
+/// the 122 K-node type walked it as a tree.
+pub type Used = (u64, u64);
+
+/// The used mask of a binder's body seen from outside the binder.
 #[inline(always)]
-pub fn used_bind(body: u64) -> u64 {
-    (body >> 1) | (body & (1 << 63))
+pub fn used_bind((lo, hi): Used) -> Used {
+    let l = lo & !(1 << 63);
+    let h = hi & !(1 << 63);
+    let s = hi >> 63;
+    let low = (l >> 1) | ((h & 1) << 62);
+    let hi2 = (h >> 1) | (s << 62) | (s << 63);
+    (low | (((hi2 != 0) as u64) << 63), hi2)
+}
+#[inline(always)]
+fn used_or(a: Used, b: Used) -> Used {
+    (a.0 | b.0, a.1 | b.1)
+}
+#[inline(always)]
+fn used_var(i: u32) -> Used {
+    if i < 63 {
+        (1u64 << i, 0)
+    } else if i < 126 {
+        (1u64 << 63, 1u64 << (i - 63))
+    } else {
+        (1u64 << 63, 1u64 << 63)
+    }
 }
 
 pub fn rng_bind(body: u32) -> u32 {
@@ -489,21 +534,24 @@ pub fn push_expr(
             }
         }
     };
-    let us = |cols: &Cols, id: u32| -> u64 {
-        if id >= cols_base {
+    let us = |cols: &Cols, id: u32| -> Used {
+        let lo = if id >= cols_base {
             cols.used()[(id - cols_base) as usize]
         } else {
             match main_used {
                 Some(m) => m[id as usize],
                 None => cols.used()[id as usize],
             }
-        }
+        };
+        // the high word is written only past range 63 (ids are global)
+        let hi = if rg(cols, id) > 63 { unsafe { *region().hi.add(id as usize) } } else { 0 };
+        (lo, hi)
     };
     let lmap = |l: u32| -> u32 { if lvl_map.is_empty() { l } else { lvl_map[l as usize] } };
     match *e {
         Expr::BVar(i) => {
             let i = u32::try_from(i).unwrap_or(u32::MAX - 1);
-            cols.push(BVAR, 0, 0, i, i.saturating_add(1), if i < 63 { 1u64 << i } else { 1u64 << 63 })
+            cols.push_h(BVAR, 0, 0, i, i.saturating_add(1), used_var(i))
         }
         Expr::Sort(l) => cols.push(SORT, 0, 0, lmap(l), 0, 0),
         Expr::Const(n, ls) => {
@@ -520,28 +568,28 @@ pub fn push_expr(
         Expr::App(f, x) => {
             let (f, x) = (r(f), r(x));
             let rr = rg(cols, f).max(rg(cols, x));
-            let uu = us(cols, f) | us(cols, x);
-            cols.push(APP, f, x, 0, rr, uu)
+            let uu = used_or(us(cols, f), us(cols, x));
+            cols.push_h(APP, f, x, 0, rr, uu)
         }
         Expr::Lam(bi, n, t, b) => {
             let (t, b) = (r(t), r(b));
             let rr = rg(cols, t).max(rng_bind(rg(cols, b)));
-            let uu = us(cols, t) | used_bind(us(cols, b));
-            cols.push(LAM + bi, t, b, n, rr, uu)
+            let uu = used_or(us(cols, t), used_bind(us(cols, b)));
+            cols.push_h(LAM + bi, t, b, n, rr, uu)
         }
         Expr::Pi(bi, n, t, b) => {
             let (t, b) = (r(t), r(b));
             let rr = rg(cols, t).max(rng_bind(rg(cols, b)));
-            let uu = us(cols, t) | used_bind(us(cols, b));
-            cols.push(PI + bi, t, b, n, rr, uu)
+            let uu = used_or(us(cols, t), used_bind(us(cols, b)));
+            cols.push_h(PI + bi, t, b, n, rr, uu)
         }
         Expr::Let(n, t, v, b) => {
             let (t, v, b) = (r(t), r(v), r(b));
             let rr = rg(cols, t).max(rg(cols, v)).max(rng_bind(rg(cols, b)));
-            let uu = us(cols, t) | us(cols, v) | used_bind(us(cols, b));
+            let uu = used_or(used_or(us(cols, t), us(cols, v)), used_bind(us(cols, b)));
             let i = side.lets.len() as u32;
             side.lets.push((n, b));
-            cols.push(LET, t, v, i, rr, uu)
+            cols.push_h(LET, t, v, i, rr, uu)
         }
         Expr::Nat(bytes) => {
             let i = lit_base + lits.len() as u32;
@@ -557,7 +605,7 @@ pub fn push_expr(
             let x = r(x);
             let rr = rg(cols, x);
             let uu = us(cols, x);
-            cols.push(PROJ, x, u32::try_from(f).unwrap_or(u32::MAX), s, rr, uu)
+            cols.push_h(PROJ, x, u32::try_from(f).unwrap_or(u32::MAX), s, rr, uu)
         }
     }
 }
