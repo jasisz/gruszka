@@ -52,7 +52,6 @@ pub(super) enum Undo {
     Nat(u64),
     BigNat(u64),
     Eq(u64),
-    Fail(V, V),
     Infer((u64, u64)),
     InferU((u64, u64)),
     Uenv(Box<[u32]>),
@@ -880,7 +879,6 @@ impl Worker {
                 Undo::Nat(k) if !self.nat_map.contains_key(k) => continue,
                 Undo::BigNat(k) if !self.big_map.contains_key(k) => continue,
                 Undo::Eq(pk) if !self.eq_cache.contains_key(pk) => continue,
-                Undo::Fail(a, b) if !self.fail_cache.contains(&(*a, *b)) => continue,
                 Undo::Infer(k) if !self.infer_cache.contains_key(k) => continue,
                 Undo::InferU(k) if !self.infer_u.contains_key(k) => continue,
                 Undo::LamVar(k) if !self.lam_var.contains_key(k) => continue,
@@ -893,7 +891,6 @@ impl Worker {
                 Undo::Nat(k) => self.nat_map.get(k).is_some_and(|&x| self.dv(r, x)),
                 Undo::BigNat(k) => self.big_map.get(k).is_some_and(|&x| self.dv(r, x)),
                 Undo::Eq(pk) => self.dv(r, (pk >> 32) as u32) || self.dv(r, *pk as u32),
-                Undo::Fail(a, b) => self.dv(r, *a) || self.dv(r, *b),
                 Undo::Infer(k) => self.de(r, k.0 as u32) || self.infer_cache.get(k).is_some_and(|x| self.dv(r, x.0)),
                 Undo::InferU(k) => k.0 as u32 >= r.um || self.infer_u.get(k).is_some_and(|x| self.dv(r, x.0)),
                 Undo::LamVar(k) => self.de(r, k.1) || self.lam_var.get(k).is_some_and(|&x| self.dv(r, x)),
@@ -917,9 +914,6 @@ impl Worker {
                 }
                 Undo::Eq(pk) => {
                     self.eq_cache.remove(&pk);
-                }
-                Undo::Fail(a, b) => {
-                    self.fail_cache.remove(&(a, b));
                 }
                 Undo::Infer(k) => {
                     self.infer_cache.remove(&k);
@@ -1393,11 +1387,6 @@ impl Worker {
         for &pk in self.eq_cache.keys() {
             if dv((pk >> 32) as u32) || dv(pk as u32) {
                 bad("eq_cache");
-            }
-        }
-        for &(a, b) in self.fail_cache.iter() {
-            if dv(a) || dv(b) {
-                bad("fail_cache");
             }
         }
         for (k, x) in self.infer_cache.iter() {

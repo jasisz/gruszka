@@ -595,11 +595,30 @@ const SH_MATCH_SOME: u8 = 8;
 const EQ_KNOWN: u8 = 1;
 const EQ_TRUE: u8 = 2;
 const EQ_SAME_NO: u8 = 4;
-/// milestone 31: the pair was being compared when an argument probe ran out
-/// of budget; a later probe that reaches it stops at once (it would only
-/// spend its budget on the same walk). Only probes read it: a probe's stop
-/// is never an answer (both sides unfold, as after any exhausted probe).
-const EQ_PDEAD: u8 = 8;
+/// the pair's arguments were compared and found different (both sides
+/// unfold next); a finished result, as EQ_KNOWN (once `fail_cache`)
+const EQ_ARGS_NO: u8 = 8;
+/// The high four bits: the pair is undecided within a budget. An attempt
+/// entered it with `r` ticks left and its stop came before the pair was
+/// decided; `c = ceil(log2 r) + 1` is kept (the largest such). A later
+/// attempt that reaches the pair with at most `2^(c-1)` ticks left (less
+/// than twice `r`) stops at once: it would only spend them on the same
+/// walk; one with more (a budget doubled past `r`) tries again. Only
+/// attempts read it: an attempt's stop is never an answer (both sides
+/// unfold, as after any exhausted attempt). Milestone 31's EQ_PDEAD was
+/// this with one class for every budget, and unfolding first (milestone
+/// 48) did not read it.
+const EQ_UNDEC: u32 = 4;
+/// The class of `r >= 1` ticks left, `ceil(log2 r) + 1`, at most 15.
+#[inline(always)]
+fn undec_class(r: u32) -> u8 {
+    (33 - (r - 1).leading_zeros()).min(15) as u8
+}
+/// The ordered key of a pair of values in `eq_cache`.
+#[inline(always)]
+fn pair_key(a: V, b: V) -> u64 {
+    if a < b { (a as u64) << 32 | b as u64 } else { (b as u64) << 32 | a as u64 }
+}
 const CORE_FULL: u32 = 1 << 30;
 const UF_MASK: u32 = (1 << 30) - 1;
 const UF_NONE: u32 = UF_MASK;
@@ -850,7 +869,6 @@ pub struct Worker {
     /// both outcomes, keyed by the ordered pair of value ids (hash-consing
     /// makes a thunk's or closure's id stand for its (term, env, ls))
     eq_cache: CMap<u64, u8, 10>,
-    fail_cache: CSet<(V, V), 11>,
     uses0_memo: CMap<(u32, u32), bool, 20>,
     /// `uses_var` beyond the mask for MAIN terms: a property of the file, kept
     uses_main: CMap<(u32, u32), bool, 20>,
@@ -899,6 +917,8 @@ pub struct Worker {
     att_depth: u32,
     att_end: u32,
     att_own: bool,
+    /// the innermost attempt's kind
+    att_kind: Att,
     stack_base: usize,
     stack_limit: usize,
     pub stats: Stats,
@@ -932,9 +952,6 @@ pub struct Worker {
     head_probe: u32,
     /// milestone 48: the budget of unfolding first (DOVETAIL)
     dovetail: u32,
-    /// milestone 48: unfolding first runs: EQ_PDEAD is not read (a mark
-    /// left by an earlier probe would end it at once)
-    pdead_off: bool,
     /// milestone 48: unfolding first came past `deep_at` bytes of stack,
     /// where a probe does not hand comparisons up: it stops and the
     /// arguments are compared as before, outside any budget
@@ -1219,7 +1236,6 @@ struct Stash {
     unfold_memo: CMap<V, V, 14>,
     uenv_map: CMap<smallvec::SmallVec<[u32; 8]>, u32, 4>,
     eq_cache: CMap<u64, u8, 10>,
-    fail_cache: CSet<(V, V), 11>,
     uses0_memo: CMap<(u32, u32), bool, 20>,
     block_roots: CMap<u32, Option<u32>, 26>,
     vmap: CMap<(u64, u64), V, 0>,
@@ -1239,7 +1255,7 @@ struct Stash {
 
 macro_rules! sess_tables {
     ($m:ident) => {
-        $m!(blk, blk_side, wlits, vals, sp, projs, eloc, eslots, ftab, fv_ty, fv_busy, lam_var, var_slots, shash_memo, term_memo, infer_cache, infer_u, unfold_memo, uenv_map, eq_cache, fail_cache, uses0_memo, block_roots, vmap, env_map, proj_map, nat_map, big_map, prop_ind, canon_memo, stab, ctab, wlit_bytes, uenv_next)
+        $m!(blk, blk_side, wlits, vals, sp, projs, eloc, eslots, ftab, fv_ty, fv_busy, lam_var, var_slots, shash_memo, term_memo, infer_cache, infer_u, unfold_memo, uenv_map, eq_cache, uses0_memo, block_roots, vmap, env_map, proj_map, nat_map, big_map, prop_ind, canon_memo, stab, ctab, wlit_bytes, uenv_next)
     };
 }
 
@@ -1296,7 +1312,6 @@ impl Worker {
             unfold_memo: Default::default(),
             udm: vec![[0; 5]; dm_bits(1) + 1],
             eq_cache: Default::default(),
-            fail_cache: Default::default(),
             uses0_memo: Default::default(),
             uses_main: Default::default(),
             wide_main: FxHashMap::default(),
@@ -1326,6 +1341,7 @@ impl Worker {
             att_depth: 0,
             att_end: 0,
             att_own: false,
+            att_kind: Att::HeadFirst,
             stack_base: &x as *const u8 as usize,
             stack_limit,
             stats: Stats::default(),
@@ -1352,7 +1368,6 @@ impl Worker {
             pfirst: !(KNOBS && std::env::var("SK_PFIRST").is_ok_and(|s| s == "0")),
             head_probe: if KNOBS { std::env::var("SK_HEAD_PROBE").ok().and_then(|s| s.parse().ok()).unwrap_or(HEAD_PROBE) } else { HEAD_PROBE },
             dovetail: if KNOBS { std::env::var("SK_DOVETAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(DOVETAIL) } else { DOVETAIL },
-            pdead_off: false,
             dove_deep: false,
             nat_wait: !(KNOBS && std::env::var("SK_NATWAIT").is_ok_and(|s| s == "0")),
             ktrap: if KNOBS { std::env::var("SK_KTRAP").ok().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 },
@@ -1520,7 +1535,6 @@ impl Worker {
             + mb(&self.unfold_memo)
             + mb(&self.uenv_map)
             + mb(&self.eq_cache)
-            + sb(&self.fail_cache)
             + mb(&self.uses0_memo)
             + mb(&self.block_roots)
             + mb(&self.vmap)
@@ -1560,7 +1574,7 @@ impl Worker {
                 o.blk.bytes() + v(&o.wlits) + o.wlit_bytes + o.vals.held_bytes() + o.sp.held_bytes() + v(&o.projs)
                     + o.eloc.held_bytes() + o.eslots.held_bytes() + o.ftab.held_bytes() + v(&o.fv_ty) + v(&o.fv_busy)
                     + h(&o.lam_var) + h(&o.var_slots) + h(&o.shash_memo) + h(&o.term_memo) + h(&o.infer_cache)
-                    + h(&o.infer_u) + h(&o.unfold_memo) + h(&o.uenv_map) + h(&o.eq_cache) + hs(&o.fail_cache)
+                    + h(&o.infer_u) + h(&o.unfold_memo) + h(&o.uenv_map) + h(&o.eq_cache)
                     + h(&o.uses0_memo) + h(&o.block_roots) + h(&o.vmap) + h(&o.env_map) + h(&o.proj_map)
                     + h(&o.nat_map) + h(&o.big_map) + h(&o.prop_ind) + h(&o.canon_memo)
             }};
@@ -1642,10 +1656,10 @@ impl Worker {
     /// Milestone 36 (SK_DECL_INSTR): the sizes of the session's tables.
     pub fn table_report(&self) -> String {
         format!(
-            "redo_n {:?} gr {:?} pfirst {:?} ktrap {:?} natwait {:?} att {:?} reg {:?} redo {} pinkept {} skip {} seg {} undo {} vals {} eloc {} eslots {} sp_b {} ftab_b {} wlits {} wlit_b {} blk {} vmap {} env_map {} eq {} fail {} icache {} iu {} unf {} uenv {} fv {} sess_b {}",
+            "redo_n {:?} gr {:?} pfirst {:?} ktrap {:?} natwait {:?} att {:?} reg {:?} redo {} pinkept {} skip {} seg {} undo {} vals {} eloc {} eslots {} sp_b {} ftab_b {} wlits {} wlit_b {} blk {} vmap {} env_map {} eq {} icache {} iu {} unf {} uenv {} fv {} sess_b {}",
             self.redo_n, self.stats.gr, self.stats.pfirst, self.stats.ktrap, self.stats.natwait, self.stats.att, self.stats.reg, self.stats.reg_redo, self.stats.reg_pin_kept, self.stats.reg_skip, self.stats.reg_seg, self.undo.len(), self.vals.len(), self.eloc.len(), self.eslots.len(), self.sp.bytes(), self.ftab.bytes(),
             self.wlits.len(), self.wlit_bytes, self.blk.len(), self.vmap.len(), self.env_map.len(),
-            self.eq_cache.len(), self.fail_cache.len(), self.infer_cache.len(), self.infer_u.len(),
+            self.eq_cache.len(), self.infer_cache.len(), self.infer_u.len(),
             self.unfold_memo.len(), self.uenv_map.len(), self.fv_ty.len(), self.sess_bytes()
         )
     }
@@ -1730,7 +1744,6 @@ impl Worker {
         clear_map!(self.uenv_map);
         self.uenv_next = 0;
         clear_map!(self.eq_cache);
-        clear_map!(self.fail_cache);
         clear_map!(self.uses0_memo);
         clear_map!(self.block_roots);
         clear_map!(self.vmap);
@@ -2071,12 +2084,13 @@ impl Worker {
     fn attempt<T>(&mut self, kind: Att, budget: u32, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
         let t0 = self.ticks;
         let d0 = self.vdepth;
-        let (end0, own0) = (self.att_end, self.att_own);
+        let (end0, own0, kind0) = (self.att_end, self.att_own, self.att_kind);
         let own = self.att_depth == 0 || budget < end0.wrapping_sub(t0);
         if own {
             self.att_end = t0.wrapping_add(budget);
         }
         self.att_own = own;
+        self.att_kind = kind;
         self.att_depth += 1;
         self.set_alarm();
         let r = f(self);
@@ -2088,6 +2102,7 @@ impl Worker {
             self.att_end = end0;
         }
         self.att_own = own0;
+        self.att_kind = kind0;
         self.set_alarm();
         if STATS {
             let s = &mut self.stats.att[kind as usize];
@@ -6175,7 +6190,17 @@ impl Worker {
     fn eq_put(&mut self, pk: u64, r: bool) {
         self.ulog(Undo::Eq(pk));
         let f = self.eq_cache.entry(pk).or_insert(0);
-        *f = (*f & EQ_SAME_NO) | EQ_KNOWN | if r { EQ_TRUE } else { 0 };
+        *f = (*f & (EQ_SAME_NO | EQ_ARGS_NO)) | EQ_KNOWN | if r { EQ_TRUE } else { 0 };
+    }
+    /// Were the arguments of `a` and `b` (the same head) found different?
+    #[inline(always)]
+    fn args_no(&self, a: V, b: V) -> bool {
+        self.eq_cache.get(&pair_key(a, b)).is_some_and(|&f| f & EQ_ARGS_NO != 0)
+    }
+    fn put_args_no(&mut self, a: V, b: V) {
+        let pk = pair_key(a, b);
+        self.ulog(Undo::Eq(pk));
+        *self.eq_cache.entry(pk).or_insert(0) |= EQ_ARGS_NO;
     }
     /// Milestone 15: identity inlined at the call sites.
     #[inline(always)]
@@ -6197,7 +6222,7 @@ impl Worker {
     /// probe (its budget belongs to the probe's caller).
     #[inline(never)]
     fn defeq_ne(&mut self, a: V, b: V) -> R<bool> {
-        if self.deep_zone && self.attempting() && self.pdead_off {
+        if self.deep_zone && self.attempting() && self.att_kind == Att::Unfold {
             let x = 0u8;
             let sp = std::hint::black_box(&x) as *const u8 as usize;
             if self.stack_base.saturating_sub(sp) > self.deep_at {
@@ -6282,9 +6307,12 @@ impl Worker {
         }
         let key = [ia[0], ia[1], ia[2], ib[0], ib[1], ib[2]];
         let pk = if a < b { (a as u64) << 32 | b as u64 } else { (b as u64) << 32 | a as u64 };
-        if self.attempting() && !self.pdead_off {
+        // ticks the enclosing attempt has left (0: none open)
+        let left = if self.attempting() { self.att_end.wrapping_sub(self.ticks) } else { 0 };
+        if left != 0 {
             if let Some(&f) = self.eq_cache.get(&pk) {
-                if f & (EQ_KNOWN | EQ_PDEAD) == EQ_PDEAD {
+                let c = f >> EQ_UNDEC;
+                if f & EQ_KNOWN == 0 && c != 0 && left <= 1u32 << (c - 1) {
                     if STATS { self.stats.att_dead += 1; }
                     return self.attempt_stop();
                 }
@@ -6393,9 +6421,11 @@ impl Worker {
             }
             Err(e) => Err(e),
         };
-        if self.attempting() && matches!(r, Err(Stop::Budget)) {
+        if left != 0 && matches!(r, Err(Stop::Budget)) {
             self.ulog(Undo::Eq(pk));
-            *self.eq_cache.entry(pk).or_insert(0) |= EQ_PDEAD;
+            let f = self.eq_cache.entry(pk).or_insert(0);
+            let c = undec_class(left).max(*f >> EQ_UNDEC);
+            *f = (*f & ((1 << EQ_UNDEC) - 1)) | c << EQ_UNDEC;
         }
         let r = r?;
         if closed && r && self.cur_decl != u32::MAX {
@@ -7539,7 +7569,7 @@ impl Worker {
         if fa && fb || (self.nat_fold_head(a) && self.nat_fold_head(b)) {
             let (ra, la, sa) = self.const_head(a).unwrap();
             let (rb, lb, sb) = self.const_head(b).unwrap();
-            if self.canon_of_row(ra) == self.canon_of_row(rb) && !self.fail_cache.contains(&(a, b)) {
+            if self.canon_of_row(ra) == self.canon_of_row(rb) && !self.args_no(a, b) {
                 self.stats.natwait[0] += 1;
                 // under CommonHeadFirst's budget: two runs of one
                 // computation on different inputs agree in shape down to
@@ -7553,8 +7583,7 @@ impl Worker {
                     self.stats.natwait[1] += 1;
                     return Ok(NatWait::Equal);
                 }
-                self.fail_cache.insert((a, b));
-                self.ulog(Undo::Fail(a, b));
+                self.put_args_no(a, b);
             }
             return Ok(NatWait::Fold);
         }
@@ -7697,7 +7726,7 @@ impl Worker {
                     if ra == rb && matches!(ha, Hint::Regular(_)) {
                         let (_, la, sa) = self.const_head(a).unwrap();
                         let (_, lb, sb) = self.const_head(b).unwrap();
-                        if sa != EMPTY && sb != EMPTY && !self.fail_cache.contains(&(a, b)) {
+                        if sa != EMPTY && sb != EMPTY && !self.args_no(a, b) {
                             #[cfg(feature = "cnt")]
                             let tk0 = self.ticks;
                             let same = if !self.levels_equiv(la, lb) || self.args_refuted(sa, sb, ra, la)? {
@@ -7719,19 +7748,17 @@ impl Worker {
                             if same {
                                 return Ok(DStep::Equal);
                             }
-                            self.fail_cache.insert((a, b));
-                            self.ulog(Undo::Fail(a, b));
+                            self.put_args_no(a, b);
                         }
                     }
                     if ra == rb && !matches!(ha, Hint::Regular(_)) {
                         let (_, la, sa) = self.const_head(a).unwrap();
                         let (_, lb, sb) = self.const_head(b).unwrap();
-                        if sa != EMPTY && sb != EMPTY && !self.fail_cache.contains(&(a, b)) && self.probe_worth(sa, sb, ra) {
+                        if sa != EMPTY && sb != EMPTY && !self.args_no(a, b) && self.probe_worth(sa, sb, ra) {
                             if self.levels_equiv(la, lb) && self.probe_args(sa, sb, ra, la)? {
                                 return Ok(DStep::Equal);
                             }
-                            self.fail_cache.insert((a, b));
-                            self.ulog(Undo::Fail(a, b));
+                            self.put_args_no(a, b);
                         }
                     }
                     let ua = self.unfold(a)?;
@@ -7963,7 +7990,6 @@ impl Worker {
     }
 
     fn unfold_first(&mut self, a: V, b: V) -> R<Option<DStep>> {
-        self.pdead_off = true;
         self.dove_deep = false;
         let mut refused = false;
         // the unfolding itself is inside the budget: unfolding a matcher
@@ -7980,7 +8006,6 @@ impl Worker {
             let y = s.whnf_core_c(ub, true)?;
             s.defeq(x, y)
         });
-        self.pdead_off = false;
         if std::mem::take(&mut self.dove_deep) || refused {
             return Ok(None);
         }
