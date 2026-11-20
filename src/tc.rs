@@ -4217,11 +4217,13 @@ impl Worker {
                 let r = self.apply_elims(f, &elims[pi + 1..])?;
                 return Ok((r, true));
             }
-            if b == base {
-                return Ok((v, false));
-            }
-            let r = self.apply_elims(b, &elims[pi..])?;
-            return Ok((r, false));
+            // milestone 49: a structure that comes to no constructor leaves
+            // the projection as it was (Lean's reduce_proj gives none,
+            // Pestka keeps the term); the projection over the reduced
+            // structure turned `(forIn l s f).1` into the loop run to its
+            // first stuck step, compared step by step (CFSG's
+            // KernelRouteP.wordG_treeWord_of)
+            return Ok((v, false));
         }
         if let Head::Const(row, llr) = head {
             match &self.consts[row as usize].kind {
@@ -7982,18 +7984,25 @@ impl Worker {
     }
 
     fn unfold_first(&mut self, a: V, b: V) -> R<Option<DStep>> {
-        // a side whose unfolding is refused (a trapped Nat operation): the
-        // arguments alone, as before
-        let (Some(ua), Some(ub)) = (self.unfold(a)?, self.unfold(b)?) else { return Ok(None) };
         self.pdead_off = true;
         self.dove_deep = false;
+        let mut refused = false;
+        // the unfolding itself is inside the budget: unfolding a matcher
+        // or a casesOn evaluates its major premise (match_direct,
+        // cases_direct), which may be a whole computation
         let r = self.budgeted_n(self.dovetail, |s| {
+            // a side whose unfolding is refused (a trapped Nat operation):
+            // the arguments alone, as before
+            let (Some(ua), Some(ub)) = (s.unfold(a)?, s.unfold(b)?) else {
+                refused = true;
+                return Ok(false);
+            };
             let x = s.whnf_core_c(ua, true)?;
             let y = s.whnf_core_c(ub, true)?;
             s.defeq(x, y)
         });
         self.pdead_off = false;
-        if std::mem::take(&mut self.dove_deep) {
+        if std::mem::take(&mut self.dove_deep) || refused {
             return Ok(None);
         }
         Ok(r?.map(|r| if r { DStep::Equal } else { DStep::Differ }))
