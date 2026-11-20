@@ -741,8 +741,8 @@ fn main() {
                     if mem_report {
                         eprintln!("MEM worker {wi}: {} deep_up {} ckpts {} late {}/{}", w.mem_report(), w.stats.deep_up, w.stats.ckpts, w.stats.late, w.stats.late_ld);
                     }
-                    if tc::KNOBS && (w.stats.pfirst[0] > 0 || w.stats.ktrap[0] > 0 || w.stats.natwait[0] + w.stats.natwait[2] > 0) {
-                        eprintln!("PFIRST worker {wi}: taken {} equal {} ktrap {} ticks {} natwait {:?}", w.stats.pfirst[0], w.stats.pfirst[1], w.stats.ktrap[0], w.stats.ktrap[1], w.stats.natwait);
+                    if tc::KNOBS && (w.stats.pfirst[0] > 0 || w.stats.ktrap[0] > 0) {
+                        eprintln!("PFIRST worker {wi}: taken {} equal {} ktrap {} ticks {}", w.stats.pfirst[0], w.stats.pfirst[1], w.stats.ktrap[0], w.stats.ktrap[1]);
                     }
                     // attempts by kind: opened / answered / own stop / won / ticks
                     if tc::STATS && w.stats.att.iter().any(|a| a[0] > 0) {
@@ -754,7 +754,7 @@ fn main() {
                     }
                     if tc::STATS && w.stats.race[0] > 0 {
                         let r = w.stats.race;
-                        eprintln!("RACE worker {wi}: opened {} rounds {} won K {} M {} R {} R-past {} out K {} M {} ticks repeated {} values given back {}", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]);
+                        eprintln!("RACE worker {wi}: opened {} rounds {} won K {} M {} N {} R {} R-past {} out K {} M {} N undecided {} ticks repeated {} values given back {}", r[0], r[1], r[2], r[3], r[10], r[4], r[5], r[6], r[7], r[11], r[8], r[9]);
                     }
                     if w.stats.big_runs > 0 {
                         eprintln!("note: worker {wi}: {} declarations ran in the overflow arenas", w.stats.big_runs);
