@@ -345,15 +345,45 @@ const MENTION_FUEL: u32 = 256;
 /// Milestone 34: ticks the arguments of a literal fold over a let value
 /// may take before the fold is skipped (`let_skip_fold`).
 const LET_PROBE: u32 = 1024;
-/// Milestone 41: the budget of CommonHeadFirst in ticks (a lazy delta loop
-/// past it tries a common head). Sweep (con-leche / Init w1, G): off
-/// 45.72 / 22.49, 256: 50.59 / 24.93, 1024: 46.47 / 22.57, 4096: 45.40 /
-/// 22.47, 16384: 45.47 / 22.48; CFSG's three walls pass at each.
-const HEAD_PROBE: u32 = 4096;
-/// Milestone 48: the budget in ticks of comparing two applications of the
-/// same regular definition by unfolding both, before their arguments
-/// (knobs SK_DOVETAIL, 0: off); args_refuted's, the other way round
-const DOVETAIL: u32 = 256;
+/// The race of strategies (`lazy_delta`): round 0 is the reference loop
+/// alone under B0 ticks; each later round gives every live strategy twice
+/// the budget of the round before. (Milestone 41's CommonHeadFirst, the
+/// same first leg, swept con-leche / Init w1, G: off 45.72 / 22.49, 256:
+/// 50.59 / 24.93, 1024: 46.47 / 22.57, 4096: 45.40 / 22.47, 16384: 45.47 /
+/// 22.48.) Builds may set it (GRUSZKA_B0) for the constant sweeps.
+const RACE_B0: u32 = env_u32(option_env!("GRUSZKA_B0"), 4096);
+/// Races open inside other attempts too, under the nearest stop, when it
+/// leaves round 0 its whole budget. One level only (GRUSZKA_RACE_ONE, a
+/// build of the design's first form): inside a round every comparison
+/// runs the reference order with no shortcut of its own, and CFSG's lyLet
+/// ran past 8 GB (K never out on `Membership.mem`, R in rounds without
+/// the arguments' probes that end it in 4 G unbudgeted).
+const RACE_NEST: bool = option_env!("GRUSZKA_RACE_ONE").is_none();
+/// Strategies left out of the race (GRUSZKA_RACE_OFF, letters `k`, `m`):
+/// the mutants that show which walls each strategy carries.
+const RACE_OFF: &str = match option_env!("GRUSZKA_RACE_OFF") { Some(s) => s, None => "" };
+const fn env_u32(s: Option<&str>, d: u32) -> u32 {
+    let Some(s) = s else { return d };
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut n = 0u32;
+    while i < b.len() {
+        n = n * 10 + (b[i] - b'0') as u32;
+        i += 1;
+    }
+    n
+}
+const fn has_byte(s: &str, c: u8) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == c {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
 const LS_IDENT: bool = true;
 const LS_CLASS: bool = true;
 
@@ -563,8 +593,6 @@ enum DStep {
     Next(V, V),
     /// neither side unfolds
     Stuck,
-    /// milestone 48: both sides unfolded and compared: not equal
-    Differ,
 }
 
 #[derive(Clone, Copy)]
@@ -750,29 +778,40 @@ pub struct Stats {
     /// milestone 41: NatFoldWaits (same operation compared, equal by
     /// operands, other side unfolded)
     pub natwait: [u64; 3],
+    /// the race (`race`): opened, rounds, won by K, by M, by R in a round,
+    /// by R past the race (K and M out), K out, M out, ticks repeated
+    /// (restarted K and M rounds, and R's step cut by a stop), values given
+    /// back by abandoned rounds
+    pub race: [u64; 10],
 }
 
 /// The kinds of attempt (`attempt`): a cheaper order of the reference's
 /// steps tried under a budget of ticks, the reference's order after it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Att {
-    /// lazy delta's reference loop (CommonHeadFirst's first leg)
-    HeadFirst,
-    /// one side unfolded towards the other's head (`head_lookahead`)
-    Lookahead,
+    /// the race's round 0: the reference loop alone under B0
+    Round0,
+    /// the reference loop in a later round, resumed where it stopped
+    RaceR,
+    /// congruence: the arguments of a common head, cheapest first
+    RaceK,
+    /// the sides taking steps in turn until they meet
+    RaceM,
+    /// one argument pair of congruence (K) under its share
+    KPair,
+    /// a meeting under a common head: its arguments (M's allowance)
+    Meet,
     /// the same Nat operation compared by its operands (NatFoldWaits)
     NatArgs,
     /// a literal fold's arguments over a `let` value (`let_skip_fold`)
     LetFold,
     /// one argument pair under a regular head (`args_refuted`)
     Refute,
-    /// both sides unfolded before the arguments (`unfold_first`)
-    Unfold,
     /// the arguments under a non-regular head (`probe_args`)
     Args,
 }
-pub const ATT_KINDS: usize = 7;
-pub const ATT_NAMES: [&str; ATT_KINDS] = ["headfirst", "lookahead", "natargs", "letfold", "refute", "unfold", "args"];
+pub const ATT_KINDS: usize = 10;
+pub const ATT_NAMES: [&str; ATT_KINDS] = ["r0", "r", "k", "m", "kpair", "meet", "natargs", "letfold", "refute", "args"];
 
 pub(crate) enum NatWait {
     Fold,
@@ -947,15 +986,12 @@ pub struct Worker {
     ktrap: u8,
     /// milestone 41: NatFoldWaits on (knobs SK_NATWAIT=0: off)
     nat_wait: bool,
-    /// milestone 41: CommonHeadFirst's budget in ticks, also NatFoldWaits'
-    /// congruence (HEAD_PROBE; knobs SK_HEAD_PROBE, 0: off / unbudgeted)
-    head_probe: u32,
-    /// milestone 48: the budget of unfolding first (DOVETAIL)
-    dovetail: u32,
-    /// milestone 48: unfolding first came past `deep_at` bytes of stack,
-    /// where a probe does not hand comparisons up: it stops and the
-    /// arguments are compared as before, outside any budget
-    dove_deep: bool,
+    /// the race's first budget in ticks, also NatFoldWaits' congruence
+    /// (RACE_B0; knobs SK_B0, 0: no race, the reference loop unbudgeted)
+    race_b0: u32,
+    /// strategies K and M in the race (knobs SK_RACE_K=0 / SK_RACE_M=0)
+    race_k: bool,
+    race_m: bool,
     matchers: CMap<u32, Option<(u32, u32, u32)>, 29>,
     /// (type, k) -> the k-th variable of that type (`open_var`); per declaration
     var_slots: CMap<u64, V, 16>,
@@ -1341,7 +1377,7 @@ impl Worker {
             att_depth: 0,
             att_end: 0,
             att_own: false,
-            att_kind: Att::HeadFirst,
+            att_kind: Att::Round0,
             stack_base: &x as *const u8 as usize,
             stack_limit,
             stats: Stats::default(),
@@ -1366,9 +1402,9 @@ impl Worker {
             tnp_dm: vec![std::cell::Cell::new([0; 3]); TNP_MASK + 1],
             rec_msort: FxHashMap::default(),
             pfirst: !(KNOBS && std::env::var("SK_PFIRST").is_ok_and(|s| s == "0")),
-            head_probe: if KNOBS { std::env::var("SK_HEAD_PROBE").ok().and_then(|s| s.parse().ok()).unwrap_or(HEAD_PROBE) } else { HEAD_PROBE },
-            dovetail: if KNOBS { std::env::var("SK_DOVETAIL").ok().and_then(|s| s.parse().ok()).unwrap_or(DOVETAIL) } else { DOVETAIL },
-            dove_deep: false,
+            race_b0: if KNOBS { std::env::var("SK_B0").ok().and_then(|s| s.parse().ok()).unwrap_or(RACE_B0) } else { RACE_B0 },
+            race_k: !has_byte(RACE_OFF, b'k') && !(KNOBS && std::env::var("SK_RACE_K").is_ok_and(|s| s == "0")),
+            race_m: !has_byte(RACE_OFF, b'm') && !(KNOBS && std::env::var("SK_RACE_M").is_ok_and(|s| s == "0")),
             nat_wait: !(KNOBS && std::env::var("SK_NATWAIT").is_ok_and(|s| s == "0")),
             ktrap: if KNOBS { std::env::var("SK_KTRAP").ok().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 },
             matchers: Default::default(),
@@ -6222,14 +6258,6 @@ impl Worker {
     /// probe (its budget belongs to the probe's caller).
     #[inline(never)]
     fn defeq_ne(&mut self, a: V, b: V) -> R<bool> {
-        if self.deep_zone && self.attempting() && self.att_kind == Att::Unfold {
-            let x = 0u8;
-            let sp = std::hint::black_box(&x) as *const u8 as usize;
-            if self.stack_base.saturating_sub(sp) > self.deep_at {
-                self.dove_deep = true;
-                return self.attempt_stop();
-            }
-        }
         if self.deep_zone && !self.attempting() {
             let x = 0u8;
             let sp = std::hint::black_box(&x) as *const u8 as usize;
@@ -7291,77 +7319,312 @@ impl Worker {
         Ok(if w != v { Some(w) } else { None })
     }
 
-    /// Lean's lazy delta reduction. `Ok(r)` decided, `Err((a, b))` undecided.
+    /// Lean's lazy delta reduction, as a race of strategies. `Ok(r)`
+    /// decided, `Err((a, b))` undecided.
+    ///
+    /// Round 0 is the reference loop (R) alone under RACE_B0 ticks; almost
+    /// every comparison ends in it. Past it the race opens: in round k each
+    /// live strategy gets B0 * 2^k ticks, in the order K, M, R:
+    /// - K (congruence): a common head; its argument pairs, each first
+    ///   under an equal share of the round (the cheapest settle first),
+    ///   then all of them; `equal` or out (a pair found different);
+    /// - M (meeting): the sides take steps in turn (delta, a projection or
+    ///   a recursor on the head), each new form tested against the other
+    ///   side's forms: identity against all of them first, then the pair
+    ///   table against its origin and last 8 forms, structure against its
+    ///   origin and current form, then a common head by its arguments
+    ///   under a small allowance, doubled each time it runs out; `equal`
+    ///   or out (a side stuck);
+    /// - R (reference): the loop resumed at the pair where its last round
+    ///   stopped; the only one that answers `different`.
+    /// Every step of every strategy is one of the reference's (delta,
+    /// whnf_core, congruence), and a stop inside a round ends the whole
+    /// round, so an `equal` is an answer the reference gives and nothing
+    /// undecided becomes `different`. Once K and M are out, R goes on
+    /// without a budget. K and M start each round over (what they finished
+    /// stays in the pair table and the value memos), and an abandoned
+    /// round of theirs is a region that gives back what it made; R keeps
+    /// only its pair. A strategy applies only where it is not R's own
+    /// order: K under a common head, M while both sides can step (with
+    /// one side stuck, M's steps are R's).
+    ///
+    /// A comparison inside a round races too, under the round's stop
+    /// (RACE_NEST), when that stop leaves its round 0 the whole of B0. On
+    /// one race R and M spend at most twice the winner's ticks each, K
+    /// four times, plus B0; nested races multiply that bound by level, and
+    /// the stop of the outermost round still bounds them all.
     fn lazy_delta(&mut self, a: V, b: V) -> R<Result<bool, (V, V)>> {
-        if self.head_probe == 0 || self.attempting() {
-            return self.lazy_delta_r(a, b);
+        let mut st = (a, b, self.ticks);
+        // inside an attempt whose stop is nearer than round 0's budget the
+        // race could only run the reference under that stop
+        if self.race_b0 == 0 || (self.attempting() && (!RACE_NEST || self.att_end.wrapping_sub(self.ticks) <= self.race_b0)) {
+            return self.lazy_delta_r(a, b, &mut st);
         }
-        // milestone 41 (CommonHeadFirst): the reference loop under a budget;
-        // past it, each side unfolded a step at a time towards the other's
-        // head under the same budget; then the reference loop again
-        let budget = self.head_probe;
-        if let Some(r) = self.attempt(Att::HeadFirst, budget, |s| s.lazy_delta_r(a, b))? {
-            self.att_won(Att::HeadFirst);
+        if let Some(r) = self.attempt(Att::Round0, self.race_b0, |s| s.lazy_delta_r(a, b, &mut st))? {
+            self.att_won(Att::Round0);
             return Ok(r);
         }
-        for (x, y) in [(a, b), (b, a)] {
-            if self.attempt(Att::Lookahead, budget, |s| s.head_lookahead(x, y))? == Some(true) {
-                self.att_won(Att::Lookahead);
-                return Ok(Ok(true));
-            }
-        }
-        self.lazy_delta_r(a, b)
+        self.race(a, b, st)
     }
 
-    /// Milestone 41 (CommonHeadFirst): `x` unfolded a step at a time (a
-    /// projection application reduced, else delta and cheap whnf_core)
-    /// until its head is `y`'s constant; then the two compared by their
-    /// arguments (congruence). false: no such head reached, or the
-    /// arguments not shown equal.
-    fn head_lookahead(&mut self, x: V, y: V) -> R<bool> {
-        let Some((ry, ly, sy)) = self.const_head(y) else { return Ok(false) };
-        if self.spine_has_proj(sy) {
+    /// The race past round 0 (`lazy_delta`); `st`: R's pair and the tick
+    /// it was reached at.
+    #[inline(never)]
+    fn race(&mut self, a: V, b: V, mut st: (V, V, u32)) -> R<Result<bool, (V, V)>> {
+        if STATS {
+            self.stats.race[0] += 1;
+            self.stats.race[8] += self.ticks.wrapping_sub(st.2) as u64;
+        }
+        let mut k_on = self.race_k && self.k_applies(a, b);
+        let mut m_on = self.race_m && self.m_moves(a) && self.m_moves(b);
+        let mut budget = self.race_b0;
+        let mut allow = (self.race_b0 / 16).max(1);
+        let mut k_last = 0u64;
+        let nested = self.attempting();
+        while k_on || m_on {
+            budget = budget.saturating_mul(2).min(1 << 30);
+            // a race inside another attempt has one round past round 0,
+            // then R goes on under the enclosing stop: doubling at every
+            // level of a nested comparison multiplies, level by level
+            // (CFSG's interp_wV: a recursion 4000 comparisons deep, each
+            // redone in every round of the one above, past 300 s where M50
+            // takes 7 s); one round adds a constant per comparison
+            if nested && budget > 2 * self.race_b0 {
+                break;
+            }
+            if STATS { self.stats.race[1] += 1; }
+            if KNOBS && std::env::var("SK_RACE_TRACE").is_ok() {
+                eprintln!("RACE round budget {budget} k {k_on} m {m_on} allow {allow} ticks {} vals {} : {} =?= {}", self.ticks, self.vals.len(), self.vshow(a, 3), self.vshow(b, 3));
+            }
+            if k_on {
+                if STATS { self.stats.race[8] += k_last; }
+                let t0 = self.ticks;
+                match self.race_round(Att::RaceK, budget, a, |s| s.race_k(a, b, budget))? {
+                    Some(true) => {
+                        if STATS { self.stats.race[2] += 1; }
+                        self.att_won(Att::RaceK);
+                        return Ok(Ok(true));
+                    }
+                    Some(false) => {
+                        if STATS { self.stats.race[6] += 1; }
+                        k_on = false;
+                    }
+                    None => {}
+                }
+                k_last = self.ticks.wrapping_sub(t0) as u64;
+            }
+            if m_on {
+                let t0 = self.ticks;
+                match self.race_round(Att::RaceM, budget, a, |s| s.race_m(a, b, &mut allow))? {
+                    Some(true) => {
+                        if STATS { self.stats.race[3] += 1; }
+                        self.att_won(Att::RaceM);
+                        return Ok(Ok(true));
+                    }
+                    Some(false) => {
+                        if STATS { self.stats.race[7] += 1; }
+                        m_on = false;
+                    }
+                    None => {
+                        if STATS { self.stats.race[8] += self.ticks.wrapping_sub(t0) as u64; }
+                    }
+                }
+            }
+            let r = self.attempt(Att::RaceR, budget, |s| {
+                let (x, y, _) = st;
+                s.lazy_delta_r(x, y, &mut st)
+            })?;
+            match r {
+                Some(r) => {
+                    if STATS { self.stats.race[4] += 1; }
+                    self.att_won(Att::RaceR);
+                    return Ok(r);
+                }
+                None => {
+                    if STATS { self.stats.race[8] += self.ticks.wrapping_sub(st.2) as u64; }
+                }
+            }
+        }
+        if STATS { self.stats.race[5] += 1; }
+        let (x, y, _) = st;
+        self.lazy_delta_r(x, y, &mut st)
+    }
+
+    /// One round of a strategy that starts over (K, M): an attempt, and,
+    /// once the session wants regions, a region that an abandoned round
+    /// rolls back (what it finished elsewhere stays by the regions' rules).
+    fn race_round(&mut self, kind: Att, budget: u32, root: V, f: impl FnOnce(&mut Self) -> R<bool>) -> R<Option<bool>> {
+        if !self.reg_wanted() {
+            return self.attempt(kind, budget, f);
+        }
+        let g = self.reg_open_marks();
+        match self.attempt(kind, budget, f) {
+            Ok(None) => {
+                let n = self.vals.len();
+                self.reg_close(&g, root, root)?;
+                if STATS { self.stats.race[9] += n.saturating_sub(self.vals.len()) as u64; }
+                Ok(None)
+            }
+            r => {
+                self.reg_keep(&g);
+                r
+            }
+        }
+    }
+
+    /// Does K apply: a common head with as many arguments on both sides,
+    /// no projection among them, not already found to differ.
+    fn k_applies(&mut self, a: V, b: V) -> bool {
+        let (Some((ra, _, sa)), Some((rb, _, sb))) = (self.const_head(a), self.const_head(b)) else { return false };
+        sa != EMPTY
+            && sb != EMPTY
+            && self.canon_of_row(ra) == self.canon_of_row(rb)
+            && self.sp.len(sa) == self.sp.len(sb)
+            && !self.spine_has_proj(sa)
+            && !self.spine_has_proj(sb)
+            && !self.args_no(a, b)
+    }
+
+    /// Strategy K: every differing argument pair from the last first under
+    /// an equal share of the round, then all of them in order (finished
+    /// pairs answer from the pair table). false: a pair found different
+    /// (K is out).
+    fn race_k(&mut self, a: V, b: V, budget: u32) -> R<bool> {
+        let (ra, la, sa) = self.const_head(a).unwrap();
+        let (_, lb, sb) = self.const_head(b).unwrap();
+        if !self.levels_equiv(la, lb) {
             return Ok(false);
         }
-        let cy = self.canon_of_row(ry);
-        let mut x = x;
+        let n = self.sp.len(sa);
+        let share = (budget / (2 * n as u32).max(1)).max(1);
+        let skip = self.prop_positions(ra, la)?;
+        for i in (0..n).rev() {
+            if i < 64 && skip & (1u64 << i) != 0 {
+                continue;
+            }
+            let (x, y) = (self.sp.args(sa)[i], self.sp.args(sb)[i]);
+            if x == y {
+                continue;
+            }
+            if self.attempt(Att::KPair, share, |s| s.defeq(x, y))? == Some(false) {
+                return Ok(false);
+            }
+        }
+        let r = self.spines_defeq_skip(sa, sb, ra, la, true)?;
+        if !r {
+            self.put_args_no(a, b);
+        }
+        Ok(r)
+    }
+
+    /// Can a side take M's steps (a definition or a projection on its
+    /// head)? With one side that cannot, M's steps are R's own: the other
+    /// side unfolded and each form tested against it.
+    fn m_moves(&mut self, v: V) -> bool {
+        if self.delta_info(v).is_some() {
+            return true;
+        }
+        matches!(self.val(v), Val::Neu { spine, .. } if self.spine_has_proj(spine))
+    }
+
+    /// One step of a side in M: a projection application reduced, a Nat
+    /// operation on literals computed, or delta and cheap whnf_core.
+    /// None: stuck.
+    fn m_step(&mut self, v: V) -> R<Option<V>> {
+        if let Some(w) = self.proj_app_step(v)? {
+            return Ok(Some(w));
+        }
+        if self.nat_fold_head(v) && self.nat_args_lit(v) && !self.has_fvar(v) {
+            if let Some(n) = self.reduce_nat(v)? {
+                return Ok(Some(n));
+            }
+        }
+        if self.delta_info(v).is_none() {
+            return Ok(None);
+        }
+        let Some(u) = self.unfold(v)? else { return Ok(None) };
+        Ok(Some(self.whnf_core_c(u, true)?))
+    }
+
+    /// Strategy M: the sides take steps in turn until a form of one meets
+    /// a form of the other (`lazy_delta`). false: a side is stuck (M is
+    /// out: from there its steps are R's). `allow`: the budget of a meeting by arguments, doubled each
+    /// time one runs out.
+    fn race_m(&mut self, a: V, b: V, allow: &mut u32) -> R<bool> {
+        const RECENT: usize = 8;
+        let origin = [a, b];
+        let mut cur = [a, b];
+        let mut seen: [FxHashSet<V>; 2] = Default::default();
+        let mut recent: [smallvec::SmallVec<[V; RECENT]>; 2] = Default::default();
+        let mut side = 0;
         loop {
             self.tick()?;
-            let w = match self.proj_app_step(x)? {
-                Some(w) => w,
-                None => {
-                    if self.delta_info(x).is_none() {
-                        return Ok(false);
-                    }
-                    let Some(u) = self.unfold(x)? else { return Ok(false) };
-                    self.whnf_core_c(u, true)?
-                }
-            };
-            x = w;
-            if x == y {
+            let Some(w) = self.m_step(cur[side])? else { return Ok(false) };
+            cur[side] = w;
+            let o = side ^ 1;
+            // identity against every earlier form of the other side
+            if w == origin[o] || seen[o].contains(&w) {
                 return Ok(true);
             }
-            if let Some((rx, lx, sx)) = self.const_head(x) {
-                if self.canon_of_row(rx) == cy {
-                    // milestone 48: a constant without arguments on the
-                    // other side is reached when x comes to it (an `ite`
-                    // whose branch is that constant); before, such a `y`
-                    // ended the probe at once and the reference loop
-                    // unfolded the constant itself
-                    if sx == EMPTY && sy == EMPTY {
-                        return Ok(self.levels_equiv(lx, ly));
-                    }
-                    if sx != EMPTY && sy != EMPTY && !self.spine_has_proj(sx) {
-                        return Ok(self.levels_equiv(lx, ly) && self.spines_defeq_skip(sx, sy, rx, lx, true)?);
-                    }
+            seen[side].insert(w);
+            if recent[side].len() == RECENT {
+                recent[side].remove(0);
+            }
+            recent[side].push(w);
+            // the pair table against the other side's origin and last
+            // forms; structure (a walk under its own fuel) against its
+            // origin and its form now only, so a step walks at most twice
+            // that fuel
+            let others: smallvec::SmallVec<[V; RECENT + 1]> = std::iter::once(origin[o]).chain(recent[o].iter().copied()).collect();
+            for &y in others.iter() {
+                let pk = if w < y { (w as u64) << 32 | y as u64 } else { (y as u64) << 32 | w as u64 };
+                if self.eq_get(pk) == Some(true) {
+                    return Ok(true);
                 }
             }
+            if self.quick_parts(w, origin[o]) || self.quick_parts(w, cur[o]) {
+                return Ok(true);
+            }
+            // a common head: the arguments, under the allowance
+            let Some((rw, lw, sw)) = self.const_head(w) else {
+                side = o;
+                continue;
+            };
+            if self.spine_has_proj(sw) {
+                side = o;
+                continue;
+            }
+            let cw = self.canon_of_row(rw);
+            for &y in others.iter().rev() {
+                let Some((ry, ly, sy)) = self.const_head(y) else { continue };
+                if self.canon_of_row(ry) != cw || self.sp.len(sw) != self.sp.len(sy) || self.spine_has_proj(sy) {
+                    continue;
+                }
+                if sw == EMPTY {
+                    if self.levels_equiv(lw, ly) {
+                        return Ok(true);
+                    }
+                    continue;
+                }
+                if self.args_no(w, y) {
+                    continue;
+                }
+                match self.attempt(Att::Meet, *allow, |s| Ok(s.levels_equiv(lw, ly) && s.spines_defeq_skip(sw, sy, rw, lw, true)?))? {
+                    Some(true) => return Ok(true),
+                    Some(false) => self.put_args_no(w, y),
+                    None => *allow = allow.saturating_mul(2),
+                }
+                break;
+            }
+            side = o;
         }
     }
 
-    fn lazy_delta_r(&mut self, a: V, b: V) -> R<Result<bool, (V, V)>> {
+    /// The reference loop; `st`: the pair it is at (and the tick it came
+    /// there), where a later round of the race resumes it.
+    fn lazy_delta_r(&mut self, a: V, b: V, st: &mut (V, V, u32)) -> R<Result<bool, (V, V)>> {
         let mut reg: Option<region::Reg> = None;
-        let r = self.lazy_delta_loop(a, b, &mut reg);
+        let r = self.lazy_delta_loop(a, b, &mut reg, st);
         let Some(g) = reg else { return r };
         // milestone 38: the late region of a long lazy delta (see below)
         match r {
@@ -7384,7 +7647,7 @@ impl Worker {
     /// against `true`) unfolds here a step at a time, a million steps with
     /// nothing given back.
     #[inline(always)]
-    fn lazy_delta_loop(&mut self, mut a: V, mut b: V, reg: &mut Option<region::Reg>) -> R<Result<bool, (V, V)>> {
+    fn lazy_delta_loop(&mut self, mut a: V, mut b: V, reg: &mut Option<region::Reg>, st: &mut (V, V, u32)) -> R<Result<bool, (V, V)>> {
         // the region's root: older than it
         let a0 = a;
         loop {
@@ -7407,6 +7670,7 @@ impl Worker {
                     }
                 }
             }
+            *st = (a, b, self.ticks);
             self.tick()?;
             // offsets
             // milestone 23: both sides' shapes first, so a literal's
@@ -7447,7 +7711,6 @@ impl Worker {
             }
             match self.delta_step(a, b)? {
                 DStep::Equal => return Ok(Ok(true)),
-                DStep::Differ => return Ok(Ok(false)),
                 DStep::Stuck => return Ok(Err((a, b))),
                 DStep::Next(x, y) => {
                     a = x;
@@ -7517,7 +7780,6 @@ impl Worker {
             self.let_vals = n0;
             let d = match self.delta_step(a, b)? {
                 DStep::Equal => Some(true),
-                DStep::Differ => Some(false),
                 DStep::Next(x, y) => Some(self.defeq(x, y)?),
                 DStep::Stuck => None,
             };
@@ -7571,13 +7833,13 @@ impl Worker {
             let (rb, lb, sb) = self.const_head(b).unwrap();
             if self.canon_of_row(ra) == self.canon_of_row(rb) && !self.args_no(a, b) {
                 self.stats.natwait[0] += 1;
-                // under CommonHeadFirst's budget: two runs of one
+                // under the race's first budget: two runs of one
                 // computation on different inputs agree in shape down to
                 // where the inputs differ (CFSG traps' s2bad: `g 19 0`
                 // against `g 19 1`, congruence nested 2^19 deep), so a
                 // comparison past the budget folds, as the reference does
                 let eq = self.levels_equiv(la, lb)
-                    && self.attempt_in(Att::NatArgs, self.head_probe, |w| w.spines_defeq_skip(sa, sb, ra, la, true))? == Some(true);
+                    && self.attempt_in(Att::NatArgs, self.race_b0, |w| w.spines_defeq_skip(sa, sb, ra, la, true))? == Some(true);
                 if eq {
                     self.att_won(Att::NatArgs);
                     self.stats.natwait[1] += 1;
@@ -7731,13 +7993,8 @@ impl Worker {
                             let tk0 = self.ticks;
                             let same = if !self.levels_equiv(la, lb) || self.args_refuted(sa, sb, ra, la)? {
                                 false
-                            } else if self.dovetail == 0 || self.attempting() {
-                                self.spines_defeq_skip(sa, sb, ra, la, true)?
                             } else {
-                                match self.dovetail_args(a, b, sa, sb, ra, la)? {
-                                    Some(d) => return Ok(d),
-                                    None => false,
-                                }
+                                self.spines_defeq_skip(sa, sb, ra, la, true)?
                             };
                             #[cfg(feature = "cnt")]
                             {
@@ -7962,56 +8219,6 @@ impl Worker {
         Ok(false)
     }
 
-    /// Milestone 48: two applications `a`, `b` of the same regular
-    /// definition (arguments `sa`, `sb`) whose arguments were not refuted
-    /// (args_refuted). Lean's order compares the arguments, unbudgeted, and
-    /// unfolds both sides only when they differ; that can walk without end
-    /// where unfolding decides at once: `(false && A) && B =?= (false && A')
-    /// && B'`, `A`, `A'` open computations that differ (CFSG's
-    /// Batch27581.p2). So before the arguments, both sides unfolded and
-    /// compared under the budget args_refuted has (DOVETAIL ticks): an
-    /// answer within it decides, true or false (it is what the reference
-    /// loop comes to after unequal arguments); past it, the arguments as
-    /// before. `Some(Equal | Differ)`: decided; `None`: the arguments
-    /// differ (both sides unfold next).
-    ///
-    /// (Taking turns between the two ways under a doubling budget, tried
-    /// first, blew CFSG's lyLet and AlphaMc_SuzData slices past 6 GB: under
-    /// a budget no inner probe runs (CommonHeadFirst, args_refuted, the
-    /// hand-ups), and the arguments' way grew far dearer than unbudgeted.)
-    fn dovetail_args(&mut self, a: V, b: V, sa: u32, sb: u32, ra: u32, la: u32) -> R<Option<DStep>> {
-        match self.unfold_first(a, b)? {
-            Some(d) => {
-                self.att_won(Att::Unfold);
-                Ok(Some(d))
-            }
-            None => Ok(if self.spines_defeq_skip(sa, sb, ra, la, true)? { Some(DStep::Equal) } else { None }),
-        }
-    }
-
-    fn unfold_first(&mut self, a: V, b: V) -> R<Option<DStep>> {
-        self.dove_deep = false;
-        let mut refused = false;
-        // the unfolding itself is inside the budget: unfolding a matcher
-        // or a casesOn evaluates its major premise (match_direct,
-        // cases_direct), which may be a whole computation
-        let r = self.attempt(Att::Unfold, self.dovetail, |s| {
-            // a side whose unfolding is refused (no value to unfold):
-            // the arguments alone, as before
-            let (Some(ua), Some(ub)) = (s.unfold(a)?, s.unfold(b)?) else {
-                refused = true;
-                return Ok(false);
-            };
-            let x = s.whnf_core_c(ua, true)?;
-            let y = s.whnf_core_c(ub, true)?;
-            s.defeq(x, y)
-        });
-        if std::mem::take(&mut self.dove_deep) || refused {
-            return Ok(None);
-        }
-        Ok(r?.map(|r| if r { DStep::Equal } else { DStep::Differ }))
-    }
-
     fn probe_args(&mut self, sa: u32, sb: u32, row: u32, llr: u32) -> R<bool> {
         // past the budget: binders opened inside are gone (in depth mode
         // their depths are free again; otherwise their variables stay
@@ -8103,7 +8310,7 @@ impl Worker {
             }
             match self.delta_step(a, b)? {
                 DStep::Equal => return Ok(true),
-                DStep::Stuck | DStep::Differ => break,
+                DStep::Stuck => break,
                 DStep::Next(x, y) => {
                     a = x;
                     b = y;

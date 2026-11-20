@@ -752,6 +752,10 @@ fn main() {
                         }).collect();
                         eprintln!("ATTEMPTS worker {wi}: {} dead {}", kinds.join(", "), w.stats.att_dead);
                     }
+                    if tc::STATS && w.stats.race[0] > 0 {
+                        let r = w.stats.race;
+                        eprintln!("RACE worker {wi}: opened {} rounds {} won K {} M {} R {} R-past {} out K {} M {} ticks repeated {} values given back {}", r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]);
+                    }
                     if w.stats.big_runs > 0 {
                         eprintln!("note: worker {wi}: {} declarations ran in the overflow arenas", w.stats.big_runs);
                     }

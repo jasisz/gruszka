@@ -188,7 +188,7 @@ impl Worker {
         r.pin = pin;
         r
     }
-    fn reg_open_marks(&mut self) -> Reg {
+    pub(super) fn reg_open_marks(&mut self) -> Reg {
         let r = Reg {
             t0: self.ticks,
             pin: false,

@@ -696,6 +696,21 @@ is refused, only delayed, so lazy delta's answers stay the reference's.
   Init w1, G): off 45.72 / 22.49, 256 50.59 / 24.93, 1024 46.47 / 22.57,
   4096 45.40 / 22.47, 16384 45.47 / 22.48; the three walls pass at each.
   inv_get 0.43 G, invol_eq 2.5 G (most of it reading the slice).
+- *The race (cleanup).* CommonHeadFirst, the lookahead and milestone 48's
+  unfolding first are now one race of strategies in `lazy_delta`: round 0
+  is the reference loop (R) alone under `RACE_B0` = 4096 ticks; past it
+  each round doubles the budget of K (congruence under a common head, the
+  argument pairs cheapest first), M (the sides step in turn, each form
+  met against the other side's: identity against all, the pair table
+  against the last 8, structure against the origin and current form, a
+  common head by its arguments under a doubling allowance) and R resumed
+  at the pair where it stopped, the only one that answers `different`.
+  K applies only under a common head, M only while both sides can step;
+  once both are out R runs on without a budget. A comparison inside a
+  round races too under that round's stop, with one round past round 0:
+  doubling at every level multiplied (interp_wV, a recursion 4000
+  comparisons deep, past 300 s), and with no race inside rounds R lost
+  the nested shortcuts that end lyLet (past 8 GB).
 
 Vectors (`tests/adv-base/m41.lean`, Lean 4.35 + olean-export):
 good/bad_m41_natwait_sum (`[w, 1].sum = w + (1 + 0)` and `+ (2 + 0)`),
