@@ -2055,6 +2055,13 @@ impl Worker {
         let next = (t | (TICK_STACK - 1)).wrapping_add(1);
         self.tick_alarm = if self.att_depth != 0 && self.att_end.wrapping_sub(t) < next.wrapping_sub(t) { self.att_end } else { next };
     }
+    /// Is the reference loop running as itself: outside every attempt, or
+    /// inside one of its own rounds of the race (round 0, R resumed)?
+    /// There `args_refuted` opens its attempts under the round's stop.
+    #[inline(always)]
+    fn in_reference(&self) -> bool {
+        self.att_depth == 0 || matches!(self.att_kind, Att::Round0 | Att::RaceR)
+    }
     /// Is an attempt open?
     #[inline(always)]
     fn attempting(&self) -> bool {
@@ -7331,9 +7338,17 @@ impl Worker {
     /// without a budget. K and M start each round over (what they finished
     /// stays in the pair table and the value memos), and an abandoned
     /// round of theirs is a region that gives back what it made; R keeps
-    /// only its pair. A strategy applies only where it is not R's own
-    /// order: K under a common head, M while both sides can step (with
-    /// one side stuck, M's steps are R's).
+    /// only its pair. A difference a strategy found stays for the others:
+    /// K's pair found different marks the arguments different, and R in a
+    /// round (round 0 too) refutes arguments as the loop past the race
+    /// does (`in_reference`). Without both, R in a round compared in full
+    /// arguments R past the race would refute or skip, and while M, never
+    /// out, kept the rounds going R never left them (CFSG's M12Dc.hS:
+    /// `getElem? sl i` against `getElem? [m12a, ..] j`, two lists of
+    /// permutations compared element by element in every round). A
+    /// strategy applies only where it is not R's own order: K under a
+    /// common head, M while both sides can step (with one side stuck, M's
+    /// steps are R's).
     ///
     /// A comparison inside a round races too, under the round's stop
     /// (RACE_NEST), when that stop leaves its round 0 the whole of B0. On
@@ -7514,7 +7529,7 @@ impl Worker {
     /// Strategy K: every differing argument pair from the last first under
     /// an equal share of the round, then all of them in order (finished
     /// pairs answer from the pair table). false: a pair found different
-    /// (K is out).
+    /// (K is out; the arguments are marked different, `put_args_no`).
     fn race_k(&mut self, a: V, b: V, budget: u32) -> R<bool> {
         let (ra, la, sa) = self.const_head(a).unwrap();
         let (_, lb, sb) = self.const_head(b).unwrap();
@@ -7533,6 +7548,7 @@ impl Worker {
                 continue;
             }
             if self.attempt(Att::KPair, share, |s| s.defeq(x, y))? == Some(false) {
+                self.put_args_no(a, b);
                 return Ok(false);
             }
         }
@@ -8071,7 +8087,7 @@ impl Worker {
     /// only skips the shortcut: both sides are unfolded as after any
     /// failed argument comparison, so verdicts cannot depend on it.
     fn args_refuted(&mut self, sa: u32, sb: u32, row: u32, llr: u32) -> R<bool> {
-        if self.attempting() || !self.args_refute || self.spine_has_proj(sa) || self.spine_has_proj(sb) {
+        if !self.in_reference() || !self.args_refute || self.spine_has_proj(sa) || self.spine_has_proj(sb) {
             return Ok(false);
         }
         let n = self.sp.len(sa);
