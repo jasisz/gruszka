@@ -148,6 +148,11 @@ impl Region {
     pub fn used(&self) -> *const u64 {
         self.used
     }
+    /// The used masks' high words (see `Used`; written past range 63 only).
+    #[inline(always)]
+    pub fn used_hi(&self) -> *const u64 {
+        self.hi
+    }
     /// MAIN's arena (ids from 0), room for `cap` nodes.
     pub fn main_cols(&self, cap: usize) -> Cols {
         Cols::at(self, 0, cap.min(ID_LIMIT as usize / 2))
@@ -543,8 +548,9 @@ pub fn push_expr(
                 None => cols.used()[id as usize],
             }
         };
-        // the high word is written only past range 63 (ids are global)
-        let hi = if rg(cols, id) > 63 { unsafe { *region().hi.add(id as usize) } } else { 0 };
+        // the high word is written only past range 63, which is when the
+        // low word's bit 63 is set (ids are global)
+        let hi = if lo >> 63 != 0 { unsafe { *region().hi.add(id as usize) } } else { 0 };
         (lo, hi)
     };
     let lmap = |l: u32| -> u32 { if lvl_map.is_empty() { l } else { lvl_map[l as usize] } };

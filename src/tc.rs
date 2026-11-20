@@ -747,6 +747,9 @@ pub struct Worker {
     /// nodes ids [m, m + blk.len()) (m = blk.base, mlen <= m)
     nb: *const crate::env::Node,
     ub: *const u64,
+    /// milestone 51: the used masks' high words (#63 to #125), at `hb + t`
+    /// for terms of range past 63
+    hb: *const u64,
     mlen: u32,
     /// `env.consts`, `env.row_of_name` without going through `env`
     consts: &'static [ConstInfo],
@@ -1226,6 +1229,7 @@ impl Worker {
             m: blk.base,
             nb: crate::env::region().nodes(),
             ub: crate::env::region().used(),
+            hb: crate::env::region().used_hi(),
             mlen: env.main.len() as u32,
             consts: &env.consts,
             rows: &env.row_of_name,
@@ -2469,6 +2473,15 @@ impl Worker {
         debug_assert!(self.term_live(t), "term {t} read outside MAIN and the current arena");
         // SAFETY: the region maps 8 bytes at every u32 id
         unsafe { *self.ub.add(t as usize) }
+    }
+    /// Milestone 51: the used mask's high word of a term of range past 63:
+    /// bit j for #(63 + j), j < 63 (exact), bit 63 for any index of 126 or
+    /// more.
+    #[inline(always)]
+    fn used_hi(&self, t: u32) -> u64 {
+        debug_assert!(self.term_live(t) && self.trng(t) > 63, "high mask word of term {t}");
+        // SAFETY: as used_mask; written for every term of range past 63
+        unsafe { *self.hb.add(t as usize) }
     }
     /// Milestone 13: environment `env` cut to the entries term `t` reads,
     /// as a frame hash-consed by content (unread entries HOLE, ending at
@@ -5735,6 +5748,10 @@ impl Worker {
             let u = self.used_mask(t);
             return u & (1 << d) != 0;
         }
+        // milestone 51: exact up to #125 (r > d >= 63)
+        if d < 126 {
+            return self.used_hi(t) & (1 << (d - 63)) != 0;
+        }
         let memo = if t < self.mlen { &self.uses_main } else { &self.uses0_memo };
         if let Some(&x) = memo.get(&(t, d)) {
             return x;
@@ -5780,6 +5797,12 @@ impl Worker {
             }
             if d < 63 {
                 if self.used_mask(t) & (1 << d) != 0 {
+                    return true;
+                }
+                continue;
+            }
+            if d < 126 {
+                if self.used_hi(t) & (1 << (d - 63)) != 0 {
                     return true;
                 }
                 continue;
