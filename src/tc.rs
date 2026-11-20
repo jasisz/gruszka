@@ -1793,7 +1793,7 @@ impl Worker {
         // milestone 36: no region is open between declarations
         self.reg_vm = 0;
         self.reg_kmax = 0;
-        self.undo.clear();
+        clear_vec(&mut self.undo);
         // milestone 10: the arena and its tables live for a session
         let lvl_big = self.ll.len() + self.lss.len() + self.lv.len() > self.lvl_flush;
         let end = d == u32::MAX
