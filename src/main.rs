@@ -695,10 +695,8 @@ fn main() {
                                 Ok(Err(Stop::Decline)) => (ST_DECLINE, Some(tc::stop_msg())),
                                 Ok(Err(Stop::Cancel)) => (ST_CANCEL, None),
                                 Ok(Err(Stop::Budget)) => (ST_DECLINE, Some("probe budget escaped".into())),
-                                Ok(Err(Stop::Deep)) => (ST_DECLINE, Some("deep whnf escaped".into())),
+                                Ok(Err(Stop::Deep)) => (ST_DECLINE, Some("deep work escaped".into())),
                                 Ok(Err(Stop::Ground)) => (ST_DECLINE, Some("ground machine stop escaped".into())),
-                                Ok(Err(Stop::DeepInfer)) => (ST_DECLINE, Some("deep inference escaped".into())),
-                                Ok(Err(Stop::DeepDefeq)) => (ST_DECLINE, Some("deep comparison escaped".into())),
                                 Err(p) => {
                                     w.after_panic();
                                     let m = p

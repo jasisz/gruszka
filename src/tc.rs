@@ -96,22 +96,30 @@ pub enum Stop {
     /// milestone 17: an attempt ran out of its step budget (caught by the
     /// attempt whose stop it is, `attempt`; never leaves the outermost)
     Budget,
-    /// milestone 38: a whnf too deeply nested in other whnfs, handed up to
-    /// the outermost (`deep_v`; caught there, never leaves it)
+    /// milestones 38, 45: work too deeply nested (`deep_job`: a whnf, a
+    /// closed term's inference, a comparison of closed values), handed up
+    /// to the trampoline that takes it (`trampoline`; never leaves the
+    /// declaration's)
     Deep,
     /// milestone 39: the ground machine gives a comparison or a whnf back
     /// to the kernel (caught where the run began; never leaves it)
     Ground,
-    /// milestone 45: a closed term's inference too deeply nested in other
-    /// inferences, handed up to the outermost (`deep_inf`; caught there,
-    /// never leaves it)
-    DeepInfer,
-    /// milestone 45: a comparison of closed values too deeply nested in
-    /// other comparisons, handed up to the outermost (`deep_eq`; caught
-    /// there, never leaves it)
-    DeepDefeq,
 }
 pub type R<T> = Result<T, Stop>;
+
+/// Work handed up from too deep (`Stop::Deep`, `trampoline`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Job {
+    /// a whnf nested in other whnfs (milestone 38)
+    Whnf(V),
+    /// a closed term's inference: term, level substitution, check (milestone 45)
+    Infer(u32, u32, bool),
+    /// a comparison of two values without free variables (milestone 45)
+    Eq(V, V),
+}
+/// Whnf jobs go to the declaration's trampoline too, with no outermost
+/// whnf of their own (GRUSZKA_DEEP_DECL, a build for the measurement)
+const DEEP_DECL: bool = option_env!("GRUSZKA_DEEP_DECL").is_some();
 
 thread_local! {
     /// The message of the latest reject or decline made on this thread.
@@ -1102,12 +1110,8 @@ pub struct Worker {
     /// past this many bytes of stack a nested whnf miss is handed up
     /// (stack limit / SK_DEEP_DIV; 0: never)
     deep_at: usize,
-    /// the value handed up with `Stop::Deep`
-    deep_v: V,
-    /// milestone 45: the closed term (term, level substitution, check)
-    /// handed up with `Stop::DeepInfer`, the pair with `Stop::DeepDefeq`
-    deep_inf: (u32, u32, bool),
-    deep_eq: (V, V),
+    /// the work handed up with `Stop::Deep`
+    deep_job: Job,
     /// past `deep_at` when the stack was last measured (tick_slow)
     deep_zone: bool,
     /// milestone 38: an outermost attempt that handed up is rolled back (SK_DEEP_ROLL=1)
@@ -1468,9 +1472,7 @@ impl Worker {
                 0 => 0,
                 d => stack_limit / d,
             },
-            deep_v: NONE,
-            deep_inf: (NONE, 0, false),
-            deep_eq: (NONE, NONE),
+            deep_job: Job::Whnf(NONE),
             deep_zone: false,
             deep_n: if KNOBS { std::env::var("SK_DEEP_WHNF").ok().and_then(|s| s.parse().ok()).unwrap_or(DEEP_WHNF) } else { DEEP_WHNF },
             deep_cur: u32::MAX,
@@ -5057,13 +5059,13 @@ impl Worker {
         }
         if STATS { self.stats.whnf_misses += 1; }
         if self.deep_at != 0 {
-            if self.wdepth == 0 {
+            if self.wdepth == 0 && !DEEP_DECL {
                 return self.whnf_outer(v);
             }
             let x = 0u8;
             let sp = std::hint::black_box(&x) as *const u8 as usize;
             if self.stack_base.saturating_sub(sp) > self.deep_at || self.wdepth >= self.deep_cur {
-                self.deep_v = v;
+                self.deep_job = Job::Whnf(v);
                 return Err(Stop::Deep);
             }
         }
@@ -5089,38 +5091,72 @@ impl Worker {
     /// 73 G instead of 19), so it waits for the stack to be at risk.
     #[inline(never)]
     fn whnf_outer(&mut self, v: V) -> R<V> {
+        self.trampoline(true, |s| s.whnf_job(v))
+    }
+    /// A whnf as the outermost one (a job, or `whnf_outer`'s root).
+    fn whnf_job(&mut self, x: V) -> R<V> {
+        self.wdepth = 1;
+        self.deep_half = 0;
+        let r = self.whnf_body(x);
+        self.wdepth = 0;
+        r
+    }
+
+    /// The one trampoline (milestones 38, 45): `root` runs, and the work it
+    /// hands up from too deep (`Stop::Deep`, `deep_job`) is worked out
+    /// here from a shallow stack (its own deep work handed up the same
+    /// way, so the deepest first), its result kept in the memos, and the
+    /// one that handed it up tried again, finding it. Two take jobs: the
+    /// declaration's (`check_decl_deep`), every kind, and the outermost
+    /// whnf's (`whnf_level`), whnfs only, the others going on up. A whnf
+    /// job keeps its free variables (the outermost whnf runs under the
+    /// binders it was called under); an inference or a comparison is
+    /// handed up only without free variables, since on the way to the
+    /// declaration the binders they would need are closed (Pestka's
+    /// `Fail` carries its local context instead).
+    fn trampoline<T>(&mut self, whnf_level: bool, mut root: impl FnMut(&mut Self) -> R<T>) -> R<T> {
         let (a0, d0) = (self.argstack.len(), self.vdepth);
-        let mut pend: Vec<V> = Vec::new();
-        let mut x = v;
+        let mut pend: Vec<Job> = Vec::new();
         loop {
-            self.wdepth = 1;
-            self.deep_half = 0;
-            let r = self.whnf_body(x);
-            self.wdepth = 0;
+            let r = match pend.last() {
+                None => root(self).map(Some),
+                Some(&Job::Whnf(x)) => self.whnf_job(x).map(|_| None),
+                Some(&Job::Infer(t, ls, c)) => self.infer(t, EMPTY, ls, c).map(|_| None),
+                Some(&Job::Eq(a, b)) => self.defeq(a, b).map(|_| None),
+            };
             match r {
-                Ok(r) => match pend.pop() {
-                    None => return Ok(r),
-                    Some(y) => x = y,
-                },
-                Err(Stop::Deep) => {
-                    // the frames between were unwound: their stacks too
-                    self.argstack.truncate(a0);
-                    self.vdepth_to(d0);
-                    self.stats.deep_up += 1;
-                    // an attempt whose deeper half cost `deep_ticks` or more
-                    // per level is costly to try again: the bound doubles
-                    // (CFSG's hD, a deep tree of levels of ~84 ticks, took
-                    // 3.7x its work at a fixed bound; a lazy accumulator's
-                    // levels take ~8 and keep it)
-                    let per = if self.deep_half == 0 { 0 } else { self.ticks.wrapping_sub(self.deep_half) / (self.deep_cur / 2).max(1) };
-                    if per >= self.deep_ticks {
-                        self.deep_cur = self.deep_cur.saturating_mul(2);
-                    }
-                    pend.push(x);
-                    x = self.deep_v;
+                Ok(Some(x)) => return Ok(x),
+                Ok(None) => {
+                    pend.pop();
+                    continue;
                 }
+                Err(Stop::Deep) => {}
                 Err(e) => return Err(e),
             }
+            let j = self.deep_job;
+            if whnf_level && !matches!(j, Job::Whnf(_)) {
+                return Err(Stop::Deep);
+            }
+            // the frames between were unwound: their stacks too
+            self.argstack.truncate(a0);
+            self.vdepth_to(d0);
+            self.wdepth = 0;
+            self.stats.deep_up += 1;
+            if let Job::Whnf(_) = j {
+                // an attempt whose deeper half cost `deep_ticks` or more
+                // per level is costly to try again: the bound doubles
+                // (CFSG's hD, a deep tree of levels of ~84 ticks, took
+                // 3.7x its work at a fixed bound; a lazy accumulator's
+                // levels take ~8 and keep it)
+                let per = if self.deep_half == 0 { 0 } else { self.ticks.wrapping_sub(self.deep_half) / (self.deep_cur / 2).max(1) };
+                if per >= self.deep_ticks {
+                    self.deep_cur = self.deep_cur.saturating_mul(2);
+                }
+            }
+            if pend.len() >= DEEP_PEND_CAP {
+                return decline("recursion too deep (hand-ups)");
+            }
+            pend.push(j);
         }
     }
 
@@ -5195,12 +5231,13 @@ impl Worker {
                             (t, g) = self.reg_checkpoint(&g, v, t)?;
                         }
                     }
-                    Err(Stop::Deep) if self.wdepth == 1 && self.deep_roll => {
+                    Err(Stop::Deep) if self.wdepth == 1 && self.deep_roll && matches!(self.deep_job, Job::Whnf(_)) => {
                         // milestone 38: the outermost whnf's attempt ended
                         // at a miss handed up from too deep: what it made is
                         // given back but the handed-up value (it is tried
                         // again after that value is worked out)
-                        self.deep_v = self.reg_close(&g, v, self.deep_v)?;
+                        let Job::Whnf(x) = self.deep_job else { unreachable!() };
+                        self.deep_job = Job::Whnf(self.reg_close(&g, v, x)?);
                         return Err(Stop::Deep);
                     }
                     Err(e) => {
@@ -5315,7 +5352,7 @@ impl Worker {
         self.infer_full(t, env, ls, check)
     }
     /// Milestone 45: an inference past `deep_at` bytes of stack of a
-    /// closed term that misses its cache is handed up (`Stop::DeepInfer`)
+    /// closed term that misses its cache is handed up (`Stop::Deep`)
     /// to the declaration (`check_decl`), worked out there from a shallow
     /// stack (its own deep misses handed up the same way, so the deepest
     /// first), cached, and the declaration tried again, finding it. CFSG's
@@ -5336,8 +5373,8 @@ impl Worker {
                 && self.tk(t) != BVAR
                 && icache_hit(self.infer_cache.get(&ikey2(t, EMPTY, ls)), check, self.cur_lp).is_none()
             {
-                self.deep_inf = (t, ls, check);
-                return Err(Stop::DeepInfer);
+                self.deep_job = Job::Infer(t, ls, check);
+                return Err(Stop::Deep);
             }
         }
         #[cfg(feature = "cnt")]
@@ -6196,7 +6233,7 @@ impl Worker {
     }
     /// Milestone 45: a comparison past `deep_at` bytes of stack of two
     /// values without free variables whose pair is not cached is handed up
-    /// (`Stop::DeepDefeq`) to the declaration, worked out there from a
+    /// (`Stop::Deep`) to the declaration, worked out there from a
     /// shallow stack, cached (`eq_cache` keeps both outcomes), and the
     /// declaration tried again. CFSG's RG.eq compares a 913 K-character
     /// string literal with String.ofList of a list literal: one nested
@@ -6211,8 +6248,8 @@ impl Worker {
             if self.stack_base.saturating_sub(sp) > self.deep_at {
                 let pk = if a < b { (a as u64) << 32 | b as u64 } else { (b as u64) << 32 | a as u64 };
                 if self.eq_get(pk).is_none() && !self.has_fvar(a) && !self.has_fvar(b) {
-                    self.deep_eq = (a, b);
-                    return Err(Stop::DeepDefeq);
+                    self.deep_job = Job::Eq(a, b);
+                    return Err(Stop::Deep);
                 }
             }
         }
@@ -8699,46 +8736,13 @@ impl Worker {
         r
     }
 
-    /// Milestone 45: the declaration, with the inferences and comparisons
-    /// handed up from too deep (`Stop::DeepInfer`, `Stop::DeepDefeq`)
-    /// worked out here, deepest first, and the declaration tried again.
+    /// Milestone 45: the declaration under the trampoline, which works out
+    /// what is handed up from too deep and tries the declaration again.
     fn check_decl_deep(&mut self, d: u32) -> R<()> {
-        enum Up {
-            Inf(u32, u32, bool),
-            Eq(V, V),
-        }
-        let (a0, d0) = (self.argstack.len(), self.vdepth);
-        let mut pend: Vec<Up> = Vec::new();
-        loop {
-            let r = match pend.last() {
-                None => self.check_decl_in(d),
-                Some(&Up::Inf(t, ls, c)) => self.infer(t, EMPTY, ls, c).map(|_| ()),
-                Some(&Up::Eq(a, b)) => self.defeq(a, b).map(|_| ()),
-            };
-            let up = match r {
-                Ok(()) => {
-                    if pend.pop().is_none() {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                Err(Stop::DeepInfer) => {
-                    let (t, ls, c) = self.deep_inf;
-                    Up::Inf(t, ls, c)
-                }
-                Err(Stop::DeepDefeq) => Up::Eq(self.deep_eq.0, self.deep_eq.1),
-                Err(e) => return Err(e),
-            };
-            // the frames between were unwound: their stacks too
-            self.argstack.truncate(a0);
-            self.vdepth_to(d0);
-            self.wdepth = 0;
-            self.stats.deep_up += 1;
-            if pend.len() >= DEEP_PEND_CAP {
-                return decline("recursion too deep (hand-ups)");
-            }
-            pend.push(up);
-        }
+        self.trampoline(false, |s| {
+            s.deep_half = 0;
+            s.check_decl_in(d)
+        })
     }
 
     fn check_decl_in(&mut self, d: u32) -> R<()> {
