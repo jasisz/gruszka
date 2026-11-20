@@ -4827,37 +4827,6 @@ impl Worker {
         Some((row, hint))
     }
 
-    /// A Nat operation the kernel computes on literals, applied to a large
-    /// literal and to something with free variables: unfolding it would peel
-    /// the literal one successor at a time. It is computed when its
-    /// arguments come to literals, else it stays stuck (less reduction is
-    /// never unsound, but it makes a check fail: only where the arguments
-    /// are not literals).
-    fn nat_op_unfold_trap(&mut self, row: u32, spine: u32) -> R<bool> {
-        let c = self.canon_of_row(row);
-        let k = self.env.known;
-        if !k.nat_ops.contains(&c) && c != k.nat_succ {
-            return Ok(false);
-        }
-        let Some(args) = self.app_args(spine) else { return Ok(false) };
-        let mut big = false;
-        let mut open = false;
-        for &a in args {
-            if self.has_fvar(a) {
-                open = true;
-                continue;
-            }
-            // closed: evaluates to a literal through the GMP operations
-            // (milestone 48: its errors are the caller's; they were
-            // swallowed, a probe's stop and a refusal past Lean's bound too)
-            let w = self.whnf(a)?;
-            if matches!(self.val(w), Val::Lit(i) if matches!(self.lit(i), LitVal::Nat(n) if n.bits() > 16)) {
-                big = true;
-            }
-        }
-        Ok(big && open)
-    }
-
     fn unfold(&mut self, v: V) -> R<Option<V>> {
         if true {
             let r = self.memo_at(v).unfold();
@@ -4887,15 +4856,12 @@ impl Worker {
                 return Ok(Some(n));
             }
         }
-        if self.nat_op_unfold_trap(row, spine)? {
-            // milestone 47: an argument with free variables may still come
-            // to a literal (`Bool.rec 0 (n + 1) false`: the variable in a
-            // branch not taken); then the operation is computed, as whnf
-            // computes it. The trap left it stuck and the comparison with
-            // the literal on the other side failed (CFSG's PtCnt.dJ_mod:
-            // `X % 1048576 =?= 0`).
-            return self.reduce_nat(v);
-        }
+        // milestone 50: a Nat operation over a large literal and a free
+        // variable is unfolded like any definition (Lean's lazy delta:
+        // reduce_nat is a shortcut, never a refusal). It used to stay
+        // stuck: `Nat.ble 131072 =?= fun m => Nat.ble 131072 m` unfolded
+        // the left side and left the right one, and the two never met
+        // (CFSG KernelCensus.Fi22K.T2.walkT2).
         let Some(body) = self.decl_value(row)? else { return Ok(None) };
         if self.trng(body) != 0 {
             return Ok(None);
@@ -7658,9 +7624,8 @@ impl Worker {
             },
             (Some((ra, ha)), Some((rb, hb))) => {
                 let c = Self::hint_cmp(ha, hb);
-                // a side whose unfolding is refused (a Nat operation
-                // that would peel a large literal) leaves the other side
-                // to unfold
+                // a side whose unfolding is refused (no value to
+                // unfold) leaves the other side to unfold
                 if c < 0 {
                     match self.unfold(a)? {
                         Some(u) => a = self.whnf_core_c(u, true)?,
@@ -7991,7 +7956,7 @@ impl Worker {
         // or a casesOn evaluates its major premise (match_direct,
         // cases_direct), which may be a whole computation
         let r = self.budgeted_n(self.dovetail, |s| {
-            // a side whose unfolding is refused (a trapped Nat operation):
+            // a side whose unfolding is refused (no value to unfold):
             // the arguments alone, as before
             let (Some(ua), Some(ub)) = (s.unfold(a)?, s.unfold(b)?) else {
                 refused = true;
