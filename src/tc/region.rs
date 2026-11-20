@@ -304,16 +304,20 @@ impl Worker {
         }
     }
     /// Milestone 37: forgets the redone-work tables (a new session: the
-    /// keys name its values).
+    /// keys name its values). Between declarations every table keeps at
+    /// most `keep_bytes` of room, as the session's own (`clear_vec`,
+    /// `clear_table`): a heavy declaration's content keys by id (`mkv`, 8
+    /// bytes per value: 1 GiB at 2^27 values), its undo log and its
+    /// redone-work sets were held by the worker to the end of the run.
     pub(super) fn reg_forget(&mut self) {
-        self.mkv.clear();
-        self.mke.clear();
-        self.redo_seen.clear();
-        self.ghost.clear();
-        self.ghost_shape.clear();
-        self.pinned.clear();
-        self.reg_done.clear();
-        self.pin_ids.clear();
+        clear_vec(&mut self.mkv);
+        clear_vec(&mut self.mke);
+        clear_table(&mut self.redo_seen);
+        clear_table(&mut self.ghost);
+        clear_table(&mut self.ghost_shape);
+        clear_table(&mut self.pinned);
+        clear_vec(&mut self.reg_done);
+        clear_vec(&mut self.pin_ids);
     }
 
     /// Milestone 37: a key of `v` by content: values older than any
