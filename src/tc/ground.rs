@@ -819,41 +819,42 @@ impl Worker {
     /// the kernel's own way has made 2^22 values). Lazy delta would unfold
     /// the computing side until its head is a constructor too: the same
     /// weak head normal form the machine computes.
-    pub(super) fn ground_try(&mut self, a: V, b: V) -> R<Option<bool>> {
-        if !self.ground || self.ground_busy || !self.ground_wanted() {
-            return Ok(None);
-        }
+    pub(super) fn n_applies(&mut self, a: V, b: V) -> bool {
         let (da, db) = (self.g_data(a), self.g_data(b));
         let (x, y) = if da { (b, a) } else { (a, b) };
         if self.ground_all {
             if da && db || !matches!(self.val(x), Val::Neu { head: Head::Const(..), .. }) {
-                return Ok(None);
+                return false;
             }
         } else {
             if da == db {
-                return Ok(None);
+                return false;
             }
             if !matches!(self.val(x), Val::Neu { head: Head::Const(..), .. }) {
-                return Ok(None);
+                return false;
             }
         }
-        if self.has_fvar(x) || self.has_fvar(y) || !self.ground_may_run() {
-            return Ok(None);
-        }
-        self.ground_defeq(x, y)
+        !self.has_fvar(x) && !self.has_fvar(y)
+    }
+    /// N's run on a pair `n_applies` took, under `fuel` steps.
+    pub(super) fn ground_try(&mut self, a: V, b: V, fuel: u64) -> R<Option<bool>> {
+        let (x, y) = if self.g_data(a) { (b, a) } else { (a, b) };
+        self.ground_defeq(x, y, fuel)
     }
 
     /// Milestone 39: the weak head normal form of a closed value by the
     /// ground machine, once the session wants regions (a heavy
     /// declaration). None: not taken.
     pub(super) fn ground_whnf(&mut self, v: V) -> R<Option<V>> {
-        if !self.ground || self.ground_busy || !self.ground_wanted() || self.has_fvar(v) || !self.ground_may_run() {
+        if !self.ground || self.ground_busy || !self.ground_wanted() || self.has_fvar(v) {
             return Ok(None);
         }
         self.ground_busy = true;
         self.stats.gr[0] += 1;
         let mut m = self.gm_take();
-        m.fuel = self.ground_fuel_now();
+        // a whnf is no comparison of a race: the machine runs to the end
+        // (a heavy declaration, or the gate mode)
+        m.fuel = u64::MAX;
         let f0 = m.fuel;
         let trace = KNOBS && std::env::var_os("SK_GROUND_TRACE").is_some();
         if trace {
@@ -871,7 +872,6 @@ impl Worker {
             dstack_pop();
         }
         self.ground_busy = false;
-        let m_out = m.out;
         let ok = r.is_ok();
         if trace {
             let h = match self.val(v) {
@@ -885,9 +885,6 @@ impl Worker {
         let r = match r {
             Err(Stop::Ground) => {
                 self.stats.gr[2] += 1;
-                if m_out {
-                    self.ground_ran_out();
-                }
                 return Ok(None);
             }
             r => r?,
@@ -951,34 +948,15 @@ impl Worker {
     pub(super) fn ground_wanted(&self) -> bool {
         self.ground_heavy() || self.ground_all
     }
-    fn ground_heavy(&self) -> bool {
+    pub(super) fn ground_heavy(&self) -> bool {
         self.vals.len() >= self.ground_at && !self.scratch
     }
 
-    /// The budget of a run: none in a heavy declaration (the session wants
-    /// regions: the declaration is a computation, and the kernel's way is
-    /// the one that ran out of memory), else `ground_fuel`.
-    fn ground_fuel_now(&mut self) -> u64 {
-        if self.ground_heavy() { u64::MAX } else { self.ground_fuel }
-    }
-    /// May a run start? Not until the kernel has worked as many ticks as
-    /// the budget since a run last ran out.
-    fn ground_may_run(&mut self) -> bool {
-        match self.ground_out_at {
-            Some(t) if !self.ground_heavy() => self.ticks.wrapping_sub(t as u32) as u64 >= self.ground_fuel.min(u32::MAX as u64 / 2),
-            _ => true,
-        }
-    }
-    fn ground_ran_out(&mut self) {
-        self.ground_fuel = self.ground_fuel.saturating_mul(2);
-        self.ground_out_at = Some(self.ticks as u64);
-    }
-
-    fn ground_defeq(&mut self, a: V, b: V) -> R<Option<bool>> {
+    fn ground_defeq(&mut self, a: V, b: V, fuel: u64) -> R<Option<bool>> {
         self.ground_busy = true;
         self.stats.gr[0] += 1;
         let mut m = self.gm_take();
-        m.fuel = self.ground_fuel_now();
+        m.fuel = fuel;
         let f0 = m.fuel;
         if KNOBS && std::env::var_os("SK_GROUND_TRACE").is_some() {
             eprintln!("GD-start {} =?= {}", self.vshow(a, 6), self.vshow(b, 3));
@@ -991,7 +969,6 @@ impl Worker {
             dstack_pop();
         }
         self.ground_busy = false;
-        let m_out = m.out;
         let ok = r.is_ok();
         if KNOBS && std::env::var_os("SK_GROUND_TRACE").is_some() {
             eprintln!("GD steps {} {} =?= {} -> {:?}", f0 - m.fuel, self.vshow(a, 3), self.vshow(b, 2), r);
@@ -1000,9 +977,6 @@ impl Worker {
         match r {
             Err(Stop::Ground) => {
                 self.stats.gr[2] += 1;
-                if m_out {
-                    self.ground_ran_out();
-                }
                 Ok(None)
             }
             r => r.map(Some),

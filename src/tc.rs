@@ -291,9 +291,6 @@ const REGION_GROW: usize = 2;
 /// the worker's stack is handed up to the outermost whnf (`whnf_outer`),
 /// which has the rest of the stack to work it out
 const DEEP_DIV: usize = 2;
-/// milestone 39: a ground machine run's first step budget (a declaration
-/// doubles it at every run that runs out)
-const GROUND_FUEL: u64 = 1 << 20;
 /// milestone 39: session values past which closed computations go to the
 /// ground machine (16 x REGION_AT)
 const GROUND_AT: usize = 1 << 26;
@@ -339,12 +336,6 @@ const LSUB_MASK: usize = (1 << 12) - 1;
 /// milestone 25: an argument a binder body never reads is not made a value
 const ARG_SKIP: bool = true;
 const PF_HOLE: bool = true;
-/// Milestone 34: values the walks through environments and spines
-/// (`over_let`, `mentions_fv`) visit before they give up.
-const MENTION_FUEL: u32 = 256;
-/// Milestone 34: ticks the arguments of a literal fold over a let value
-/// may take before the fold is skipped (`let_skip_fold`).
-const LET_PROBE: u32 = 1024;
 /// The race of strategies (`lazy_delta`): round 0 is the reference loop
 /// alone under B0 ticks; each later round gives every live strategy twice
 /// the budget of the round before. (Milestone 41's CommonHeadFirst, the
@@ -775,14 +766,11 @@ pub struct Stats {
     /// major whose type is not the constructor's syntactically (count,
     /// kernel ticks spent in their comparisons)
     pub ktrap: [u64; 2],
-    /// milestone 41: NatFoldWaits (same operation compared, equal by
-    /// operands, other side unfolded)
-    pub natwait: [u64; 3],
     /// the race (`race`): opened, rounds, won by K, by M, by R in a round,
     /// by R past the race (K and M out), K out, M out, ticks repeated
     /// (restarted K and M rounds, and R's step cut by a stop), values given
-    /// back by abandoned rounds
-    pub race: [u64; 10],
+    /// back by abandoned rounds, won by N, N runs that did not decide
+    pub race: [u64; 12],
 }
 
 /// The kinds of attempt (`attempt`): a cheaper order of the reference's
@@ -801,23 +789,15 @@ pub(crate) enum Att {
     KPair,
     /// a meeting under a common head: its arguments (M's allowance)
     Meet,
-    /// the same Nat operation compared by its operands (NatFoldWaits)
-    NatArgs,
-    /// a literal fold's arguments over a `let` value (`let_skip_fold`)
-    LetFold,
+    /// a closed computation by the ground machine (N)
+    RaceN,
     /// one argument pair under a regular head (`args_refuted`)
     Refute,
     /// the arguments under a non-regular head (`probe_args`)
     Args,
 }
-pub const ATT_KINDS: usize = 10;
-pub const ATT_NAMES: [&str; ATT_KINDS] = ["r0", "r", "k", "m", "kpair", "meet", "natargs", "letfold", "refute", "args"];
-
-pub(crate) enum NatWait {
-    Fold,
-    Equal,
-    Next(V, V),
-}
+pub const ATT_KINDS: usize = 9;
+pub const ATT_NAMES: [&str; ATT_KINDS] = ["r0", "r", "k", "m", "kpair", "meet", "n", "refute", "args"];
 
 pub struct Worker {
     pub env: &'static Env<'static>,
@@ -862,12 +842,6 @@ pub struct Worker {
     pub fv_ty: Vec<V>,
     /// argument terms of the applications being evaluated (see `eval`)
     argstack: Vec<u32>,
-    /// milestone 34: values of the `let`s whose bodies are being inferred
-    /// (Lean's let variables in the local context; see `over_let`)
-    let_vals: Vec<V>,
-    /// milestone 34: `let_vals` below this index skip the fold without a
-    /// probe: one over them ran out of budget in their scope
-    let_skip: usize,
     /// free variables in scope (bound by a check or by a reuse below)
     fv_busy: Vec<bool>,
     /// the variable a lambda `(term, env, ls)` was checked under: comparing
@@ -981,9 +955,7 @@ pub struct Worker {
     /// the first
     pfirst: bool,
     ktrap: u8,
-    /// milestone 41: NatFoldWaits on (knobs SK_NATWAIT=0: off)
-    nat_wait: bool,
-    /// the race's first budget in ticks, also NatFoldWaits' congruence
+    /// the race's first budget in ticks
     /// (RACE_B0; knobs SK_B0, 0: no race, the reference loop unbudgeted)
     race_b0: u32,
     /// strategies K and M in the race (knobs SK_RACE_K=0 / SK_RACE_M=0)
@@ -1106,16 +1078,10 @@ pub struct Worker {
     /// knobs, gates (SK_GROUND=2): every closed pair with a side that
     /// reduces and every closed whnf goes to the ground machine
     ground_all: bool,
-    /// milestone 39: machine steps a run may take before it gives the work
-    /// back to the kernel; doubles per declaration at every run that ran
-    /// out (`GROUND_FUEL`, SK_GROUND_FUEL)
-    ground_fuel: u64,
-    ground_fuel0: u64,
+    /// milestone 39: session values past which the machine takes closed
+    /// computations (`GROUND_AT`); its runs in comparisons are strategy N
+    /// of the race, under the round's budget below it (gate mode)
     ground_at: usize,
-    /// ticks when a run last ran out: the next run waits until the kernel
-    /// has done as much work as that run's budget (the machine's waste
-    /// stays below the kernel's own work)
-    ground_out_at: Option<u64>,
     /// milestone 40: the machine's heap kept from one run to the next
     /// (a declaration's runs share what they import twice and the
     /// constants they force), and the lowest marks of the rollbacks since
@@ -1326,8 +1292,6 @@ impl Worker {
             pbuf: Vec::new(),
             fv_ty: Vec::new(),
             argstack: Vec::new(),
-            let_vals: Vec::new(),
-            let_skip: 0,
             fv_busy: Vec::new(),
             lam_var: Default::default(),
             lam_dm: vec![[0; 6]; LAM_DM_MASK + 1],
@@ -1401,7 +1365,6 @@ impl Worker {
             race_b0: if KNOBS { std::env::var("SK_B0").ok().and_then(|s| s.parse().ok()).unwrap_or(RACE_B0) } else { RACE_B0 },
             race_k: !has_byte(RACE_OFF, b'k') && !(KNOBS && std::env::var("SK_RACE_K").is_ok_and(|s| s == "0")),
             race_m: !has_byte(RACE_OFF, b'm') && !(KNOBS && std::env::var("SK_RACE_M").is_ok_and(|s| s == "0")),
-            nat_wait: !(KNOBS && std::env::var("SK_NATWAIT").is_ok_and(|s| s == "0")),
             ktrap: if KNOBS { std::env::var("SK_KTRAP").ok().and_then(|s| s.parse().ok()).unwrap_or(0) } else { 0 },
             matchers: Default::default(),
             var_slots: Default::default(),
@@ -1515,14 +1478,11 @@ impl Worker {
             reg_lategate: KNOBS && std::env::var("SK_REGION_LATEGATE").is_ok_and(|s| s == "1"),
             ground: !(KNOBS && std::env::var("SK_GROUND").is_ok_and(|s| s == "0")),
             ground_all: KNOBS && std::env::var("SK_GROUND").is_ok_and(|s| s == "2"),
-            ground_fuel: GROUND_FUEL,
             ground_at: if KNOBS { std::env::var("SK_GROUND_AT").ok().and_then(|s| s.parse().ok()).unwrap_or(GROUND_AT) } else { GROUND_AT },
-            ground_out_at: None,
             gm: None,
             ground_cut: (u32::MAX, u32::MAX, u32::MAX),
             ground_memo: !(KNOBS && std::env::var("SK_GROUND_MEMO").is_ok_and(|s| s == "0")),
             memo_cost: if KNOBS { std::env::var("SK_MEMO_COST").ok().and_then(|s| s.parse().ok()).unwrap_or(MEMO_COST) } else { MEMO_COST },
-            ground_fuel0: if KNOBS { std::env::var("SK_GROUND_FUEL").ok().and_then(|s| s.parse().ok()).unwrap_or(GROUND_FUEL) } else { GROUND_FUEL },
             ground_busy: false,
             uenv_next: 0,
         }
@@ -1688,8 +1648,8 @@ impl Worker {
     /// Milestone 36 (SK_DECL_INSTR): the sizes of the session's tables.
     pub fn table_report(&self) -> String {
         format!(
-            "redo_n {:?} gr {:?} pfirst {:?} ktrap {:?} natwait {:?} att {:?} reg {:?} redo {} pinkept {} skip {} seg {} undo {} vals {} eloc {} eslots {} sp_b {} ftab_b {} wlits {} wlit_b {} blk {} vmap {} env_map {} eq {} icache {} iu {} unf {} uenv {} fv {} sess_b {}",
-            self.redo_n, self.stats.gr, self.stats.pfirst, self.stats.ktrap, self.stats.natwait, self.stats.att, self.stats.reg, self.stats.reg_redo, self.stats.reg_pin_kept, self.stats.reg_skip, self.stats.reg_seg, self.undo.len(), self.vals.len(), self.eloc.len(), self.eslots.len(), self.sp.bytes(), self.ftab.bytes(),
+            "redo_n {:?} gr {:?} pfirst {:?} ktrap {:?} att {:?} reg {:?} redo {} pinkept {} skip {} seg {} undo {} vals {} eloc {} eslots {} sp_b {} ftab_b {} wlits {} wlit_b {} blk {} vmap {} env_map {} eq {} icache {} iu {} unf {} uenv {} fv {} sess_b {}",
+            self.redo_n, self.stats.gr, self.stats.pfirst, self.stats.ktrap, self.stats.att, self.stats.reg, self.stats.reg_redo, self.stats.reg_pin_kept, self.stats.reg_skip, self.stats.reg_seg, self.undo.len(), self.vals.len(), self.eloc.len(), self.eslots.len(), self.sp.bytes(), self.ftab.bytes(),
             self.wlits.len(), self.wlit_bytes, self.blk.len(), self.vmap.len(), self.env_map.len(),
             self.eq_cache.len(), self.infer_cache.len(), self.infer_u.len(),
             self.unfold_memo.len(), self.uenv_map.len(), self.fv_ty.len(), self.sess_bytes()
@@ -1828,8 +1788,6 @@ impl Worker {
         self.reg_vm = 0;
         self.reg_kmax = 0;
         self.undo.clear();
-        self.let_vals.clear();
-        self.let_skip = 0;
         // milestone 10: the arena and its tables live for a session
         let lvl_big = self.ll.len() + self.lss.len() + self.lv.len() > self.lvl_flush;
         let end = d == u32::MAX
@@ -3813,7 +3771,7 @@ impl Worker {
         // the entries the lambda reads (its used mask); in a wide context
         // every entry (no used-variable walk there). Each must be closed
         // or a variable other than y; anything else is not walked (a walk
-        // of MENTION_FUEL values per entry cost con-leche +3%) and the
+        // of 256 values per entry cost con-leche +3%) and the
         // type is not kept.
         let mut fuel = 0;
         let rng = self.trng(lam);
@@ -5118,7 +5076,7 @@ impl Worker {
     /// 73 G instead of 19), so it waits for the stack to be at risk.
     #[inline(never)]
     fn whnf_outer(&mut self, v: V) -> R<V> {
-        let (a0, l0, d0) = (self.argstack.len(), self.let_vals.len(), self.vdepth);
+        let (a0, d0) = (self.argstack.len(), self.vdepth);
         let mut pend: Vec<V> = Vec::new();
         let mut x = v;
         loop {
@@ -5134,7 +5092,6 @@ impl Worker {
                 Err(Stop::Deep) => {
                     // the frames between were unwound: their stacks too
                     self.argstack.truncate(a0);
-                    self.let_vals.truncate(l0);
                     self.vdepth_to(d0);
                     self.stats.deep_up += 1;
                     // an attempt whose deeper half cost `deep_ticks` or more
@@ -5665,19 +5622,9 @@ impl Worker {
                     let e = self.push_arg(val, env, ls, env, lb)?;
                     return self.infer(lb, e, ls, check);
                 }
-                // milestone 34: Lean checks the body with the variable in
-                // the local context; its value is pushed as before and
-                // remembered as a let variable's (`over_let`)
                 let av = self.thunk(val, env, ls)?;
                 let e = self.push_env(av, env);
-                let n0 = self.let_vals.len();
-                if !matches!(self.val(av), Val::Lit(_) | Val::Sort(_)) {
-                    self.let_vals.push(av);
-                }
-                let r = self.infer(lb, e, ls, check);
-                self.let_vals.truncate(n0);
-                self.let_skip = self.let_skip.min(n0);
-                r
+                self.infer(lb, e, ls, check)
             }
             NAT | STR => {
                 // Lean's infer_lit: literals entering the kernel are bounded too
@@ -6962,11 +6909,6 @@ impl Worker {
         if let Some(r) = self.proof_irrel(a1, b1)? {
             return Ok(r);
         }
-        if self.ground && (self.vals.len() >= self.ground_at || self.ground_all) {
-            if let Some(r) = self.ground_try(a1, b1)? {
-                return Ok(r);
-            }
-        }
         let (a2, b2) = match self.lazy_delta(a1, b1)? {
             Ok(r) => return Ok(r),
             Err(p) => p,
@@ -7301,7 +7243,7 @@ impl Worker {
     ///
     /// Round 0 is the reference loop (R) alone under RACE_B0 ticks; almost
     /// every comparison ends in it. Past it the race opens: in round k each
-    /// live strategy gets B0 * 2^k ticks, in the order K, M, R:
+    /// live strategy gets B0 * 2^k ticks, in the order K, M, N, R:
     /// - K (congruence): a common head; its argument pairs, each first
     ///   under an equal share of the round (the cheapest settle first),
     ///   then all of them; `equal` or out (a pair found different);
@@ -7310,12 +7252,20 @@ impl Worker {
     ///   side's forms: identity against all of them first, then the pair
     ///   table against its origin and last 8 forms, structure against its
     ///   origin and current form, then a common head by its arguments
-    ///   under a small allowance, doubled each time it runs out; `equal`
-    ///   or out (a side stuck);
+    ///   under a small allowance, doubled each time it runs out; a closed
+    ///   Nat operation over operands not yet literals waits while the
+    ///   other side steps; `equal` or out (a side stuck, or both waiting);
+    /// - N (computation): R's pair, when one side is data and the other a
+    ///   closed computation, by the ground machine (once the declaration
+    ///   is heavy, or in the gate mode), its fuel the round's budget (in a
+    ///   heavy declaration none); the rounds go on while the machine is
+    ///   there, so R's pair is offered to N as R moves;
     /// - R (reference): the loop resumed at the pair where its last round
     ///   stopped; the only one that answers `different`.
     /// Every step of every strategy is one of the reference's (delta,
-    /// whnf_core, congruence), and a stop inside a round ends the whole
+    /// whnf_core, congruence, a Nat operation on literals computed; N's
+    /// machine computes the same weak head normal forms and hands them to
+    /// the kernel to compare), and a stop inside a round ends the whole
     /// round, so an `equal` is an answer the reference gives and nothing
     /// undecided becomes `different`. Once K and M are out, R goes on
     /// without a budget. K and M start each round over (what they finished
@@ -7358,16 +7308,21 @@ impl Worker {
         let mut allow = (self.race_b0 / 16).max(1);
         let mut k_last = 0u64;
         let nested = self.attempting();
-        while k_on || m_on {
+        while k_on || m_on || self.n_live() {
             budget = budget.saturating_mul(2).min(1 << 30);
-            // a race inside another attempt has one round past round 0,
-            // then R goes on under the enclosing stop: doubling at every
-            // level of a nested comparison multiplies, level by level
-            // (CFSG's interp_wV: a recursion 4000 comparisons deep, each
-            // redone in every round of the one above, past 300 s where M50
-            // takes 7 s); one round adds a constant per comparison
+            // a race inside another attempt has one round of K and M past
+            // round 0, then R goes on under the enclosing stop (with N's
+            // rounds while the machine may take its pair): doubling K and
+            // M at every level of a nested comparison multiplies, level by
+            // level (CFSG's interp_wV: a recursion 4000 comparisons deep,
+            // each redone in every round of the one above, past 300 s
+            // where M50 takes 7 s); one round adds a constant per comparison
             if nested && budget > 2 * self.race_b0 {
-                break;
+                k_on = false;
+                m_on = false;
+                if !self.n_live() {
+                    break;
+                }
             }
             if STATS { self.stats.race[1] += 1; }
             if KNOBS && std::env::var("SK_RACE_TRACE").is_ok() {
@@ -7407,6 +7362,21 @@ impl Worker {
                     }
                 }
             }
+            // N: R's pair, a closed computation against data, by the
+            // ground machine; its `different` is the kernel's own on the
+            // two weak head normal forms the machine reached (`g_top`)
+            if self.n_live() && self.n_applies(st.0, st.1) {
+                match self.race_n(st.0, st.1, budget)? {
+                    Some(r) => {
+                        if STATS { self.stats.race[10] += 1; }
+                        self.att_won(Att::RaceN);
+                        return Ok(Ok(r));
+                    }
+                    None => {
+                        if STATS { self.stats.race[11] += 1; }
+                    }
+                }
+            }
             let r = self.attempt(Att::RaceR, budget, |s| {
                 let (x, y, _) = st;
                 s.lazy_delta_r(x, y, &mut st)
@@ -7425,6 +7395,25 @@ impl Worker {
         if STATS { self.stats.race[5] += 1; }
         let (x, y, _) = st;
         self.lazy_delta_r(x, y, &mut st)
+    }
+
+    /// Is the ground machine there for this race's pairs (`ground_wanted`:
+    /// a heavy declaration, or the gate mode)?
+    #[inline]
+    fn n_live(&self) -> bool {
+        self.ground && !self.ground_busy && self.ground_wanted()
+    }
+    /// Strategy N: a round of the ground machine on R's pair under the
+    /// round's budget in machine steps, started over each round (the
+    /// machine's heap stays from run to run: `gm_take`). In a heavy
+    /// declaration the machine runs to the end, under no stop of its own:
+    /// there the kernel's own way is what outgrew the arena (milestone 39).
+    /// None: undecided (out of budget, or a step the machine does not take).
+    fn race_n(&mut self, a: V, b: V, budget: u32) -> R<Option<bool>> {
+        if self.ground_heavy() {
+            return self.ground_try(a, b, u64::MAX);
+        }
+        Ok(self.attempt(Att::RaceN, budget, |s| s.ground_try(a, b, budget as u64))?.flatten())
     }
 
     /// One round of a strategy that starts over (K, M): an attempt, and,
@@ -7506,12 +7495,20 @@ impl Worker {
 
     /// One step of a side in M: a projection application reduced, a Nat
     /// operation on literals computed, or delta and cheap whnf_core.
-    /// None: stuck.
+    /// None: stuck. A closed Nat operation whose operands are not literals
+    /// yet waits (`MWAIT`): it takes no step while the other side does
+    /// (milestone 41's NatFoldWaits: in CFSG's totalC, `List.sum [x, y]
+    /// =?= x + (y + 0)` with `x` a closed count over a whole enumeration,
+    /// unfolding `List.sum` reaches the same `x` where computing it costs
+    /// the enumeration; R computes it, as Lean does).
     fn m_step(&mut self, v: V) -> R<Option<V>> {
         if let Some(w) = self.proj_app_step(v)? {
             return Ok(Some(w));
         }
-        if self.nat_fold_head(v) && self.nat_args_lit(v) && !self.has_fvar(v) {
+        if self.nat_fold_head(v) && !self.has_fvar(v) {
+            if !self.nat_args_lit(v) {
+                return Ok(Some(MWAIT));
+            }
             if let Some(n) = self.reduce_nat(v)? {
                 return Ok(Some(n));
             }
@@ -7521,6 +7518,28 @@ impl Worker {
         }
         let Some(u) = self.unfold(v)? else { return Ok(None) };
         Ok(Some(self.whnf_core_c(u, true)?))
+    }
+
+    /// A meeting of two forms under a common head by their arguments, under
+    /// M's allowance (doubled when it runs out: None). Some(false): not
+    /// the same head, or arguments found different.
+    fn m_meet(&mut self, w: V, y: V, allow: &mut u32) -> R<Option<bool>> {
+        let (Some((rw, lw, sw)), Some((ry, _, sy))) = (self.const_head(w), self.const_head(y)) else { return Ok(Some(false)) };
+        if self.canon_of_row(rw) != self.canon_of_row(ry) || self.sp.len(sw) != self.sp.len(sy) || self.spine_has_proj(sw) || self.spine_has_proj(sy) || self.args_no(w, y) {
+            return Ok(Some(false));
+        }
+        let ly = self.const_head(y).unwrap().1;
+        match self.attempt(Att::Meet, *allow, |s| Ok(s.levels_equiv(lw, ly) && s.spines_defeq_skip(sw, sy, rw, lw, true)?))? {
+            Some(true) => Ok(Some(true)),
+            Some(false) => {
+                self.put_args_no(w, y);
+                Ok(Some(false))
+            }
+            None => {
+                *allow = allow.saturating_mul(2);
+                Ok(None)
+            }
+        }
     }
 
     /// Strategy M: the sides take steps in turn until a form of one meets
@@ -7534,11 +7553,34 @@ impl Worker {
         let mut seen: [FxHashSet<V>; 2] = Default::default();
         let mut recent: [smallvec::SmallVec<[V; RECENT]>; 2] = Default::default();
         let mut side = 0;
+        let mut waits = [false; 2];
         loop {
             self.tick()?;
-            let Some(w) = self.m_step(cur[side])? else { return Ok(false) };
-            cur[side] = w;
             let o = side ^ 1;
+            if waits[side] {
+                side = o;
+                continue;
+            }
+            let Some(w) = self.m_step(cur[side])? else { return Ok(false) };
+            if w == MWAIT {
+                waits[side] = true;
+                if waits[o] {
+                    // both waiting: the same operation meets by its
+                    // operands, under the allowance, doubled each time it
+                    // runs out, until the round's stop (CFSG's totalC: the
+                    // sides come to `x * c + List.sum ..` and `x * c + (..
+                    // + 0)`, the second operands a comparison of the same
+                    // shape one element shorter); another operation, or
+                    // operands found different: M's steps are R's
+                    match self.m_meet(cur[0], cur[1], allow)? {
+                        Some(r) => return Ok(r),
+                        None => continue,
+                    }
+                }
+                side = o;
+                continue;
+            }
+            cur[side] = w;
             // identity against every earlier form of the other side
             if w == origin[o] || seen[o].contains(&w) {
                 return Ok(true);
@@ -7660,25 +7702,10 @@ impl Worker {
             if self.is_nat_zero(a) && self.is_nat_zero(b) {
                 return Ok(Ok(true));
             }
-            if !self.has_fvar(a) && !self.has_fvar(b) && !self.let_skip_fold(a, b)? {
-                // milestone 41: a Nat operation whose operands are not
-                // literals yet waits while the other side can unfold or
-                // the two are the same operation (NatFoldWaits)
-                match self.nat_fold_wait(a, b)? {
-                    NatWait::Fold => {}
-                    NatWait::Equal => return Ok(Ok(true)),
-                    NatWait::Next(x, y) => {
-                        a = x;
-                        b = y;
-                        if let Some(r) = self.quick(a, b)? {
-                            return Ok(Ok(r));
-                        }
-                        if self.quick_parts(a, b) {
-                            return Ok(Ok(true));
-                        }
-                        continue;
-                    }
-                }
+            // a closed Nat operation is computed (Lean's order); waiting
+            // for the other side (M) or comparing the operands of the same
+            // operation (K) are the race's, under its budgets
+            if !self.has_fvar(a) && !self.has_fvar(b) {
                 if let Some(an) = self.reduce_nat(a)? {
                     return Ok(Ok(self.defeq(an, b)?));
                 }
@@ -7701,151 +7728,9 @@ impl Worker {
             if self.quick_parts(a, b) {
                 return Ok(Ok(true));
             }
-            // milestone 39: one side came to data
-            if self.ground && (self.vals.len() >= self.ground_at || self.ground_all) {
-                if let Some(r) = self.ground_try(a, b)? {
-                    return Ok(Ok(r));
-                }
-            }
         }
     }
 
-    /// Milestone 34: Lean folds `Nat` arithmetic in lazy delta only on
-    /// terms without free variables, and a `let` body is checked with the
-    /// bound variable free (in the local context, with its value). Here the
-    /// value itself is in the environment, so a side built over it looks
-    /// closed and the fold evaluates the value (let-fold: `let d := bits 16
-    /// 0; d + 0 =?= Nat.add d 0` made 2^16 calls, where Lean unfolds
-    /// `HAdd.hAdd`). Is the fold to be skipped? When a side `reduce_nat`
-    /// would fold reads the value of a `let` whose body is being inferred,
-    /// the fold's arguments are evaluated first as a probe of LET_PROBE
-    /// ticks: within it the fold runs as before; past it the fold is
-    /// skipped and lazy delta unfolds (complete without the fold; Lean's
-    /// order), and so for every later pair over these lets in their scope.
-    /// Always skipping costs where folding small values is cheaper than
-    /// unfolding: Init's Char.ofOrdinal proofs (lets over 0xD800, unary
-    /// unfolding) ran out of memory; delta first as a probe made Mathlib's
-    /// Nat.clog_of_one_lt._proof_1_4 16 -> 103 M. Inside another probe the
-    /// fold runs (its budget bounds the work). release-da, on a skip, folds
-    /// as well and asserts lazy delta's answer after one step the same.
-    fn let_skip_fold(&mut self, a: V, b: V) -> R<bool> {
-        if self.let_vals.is_empty() || self.attempting() || !(self.nat_fold_head(a) || self.nat_fold_head(b)) {
-            return Ok(false);
-        }
-        let mut fuel = MENTION_FUEL;
-        if self.over_let(a, &mut fuel) != Some(true) && self.over_let(b, &mut fuel) != Some(true) {
-            return Ok(false);
-        }
-        let skip = if self.let_skip >= self.let_vals.len() {
-            true
-        } else if self.attempt(Att::LetFold, LET_PROBE, |s| s.fold_args_whnf(a).and_then(|_| s.fold_args_whnf(b)))?.is_some() {
-            false
-        } else {
-            self.let_skip = self.let_vals.len();
-            true
-        };
-        #[cfg(debug_assertions)]
-        if skip {
-            let n0 = std::mem::take(&mut self.let_vals);
-            let folded = match self.reduce_nat(a)? {
-                Some(an) => Some(self.defeq(an, b)?),
-                None => match self.reduce_nat(b)? {
-                    Some(bn) => Some(self.defeq(a, bn)?),
-                    None => None,
-                },
-            };
-            self.let_vals = n0;
-            let d = match self.delta_step(a, b)? {
-                DStep::Equal => Some(true),
-                DStep::Next(x, y) => Some(self.defeq(x, y)?),
-                DStep::Stuck => None,
-            };
-            if let (Some(f), Some(d)) = (folded, d) {
-                assert_eq!(d, f, "literal folding over a let value: lazy delta and the fold disagree");
-            }
-        }
-        Ok(skip)
-    }
-    /// The arguments `reduce_nat` brings to weak head normal form for `v`.
-    fn fold_args_whnf(&mut self, v: V) -> R<()> {
-        if !self.nat_fold_head(v) {
-            return Ok(());
-        }
-        let Some((_, _, spine)) = self.const_head(v) else { return Ok(()) };
-        let Some(args) = self.app_args(spine) else { return Ok(()) };
-        let args = ArgVec::from_slice(args);
-        for &x in args.iter() {
-            self.whnf(x)?;
-        }
-        Ok(())
-    }
-    /// Milestone 41 (NatFoldWaits). Lean's lazy delta folds a Nat
-    /// operation as soon as a side is one, bringing its operands to weak
-    /// head normal form: in CFSG's totalC, `List.sum [x, y] =?= x + (y + 0)`
-    /// with `x` a closed count over a whole enumeration computed `x`, where
-    /// unfolding `List.sum` on the other side reaches the same `x` by
-    /// congruence. A side `Nat.op x y` whose operands are not literals
-    /// already (no whnf is asked) waits:
-    /// - the other side the same operation: the operands are compared
-    ///   first (congruence; equal operands give equal results), and fold
-    ///   only if they are not shown equal;
-    /// - the other side unfolds (a definition, not a Nat operation, or a
-    ///   projection application that reduces): it takes one step, and the
-    ///   loop goes on;
-    /// - otherwise (a literal, a constructor, a stuck term) the fold
-    ///   happens as before.
-    /// The steps are the kernel's own (delta, whnf_core, congruence) in
-    /// another order; a fold is never refused, only delayed while the
-    /// other side still unfolds, so the answer is the one lazy delta gives.
-    fn nat_fold_wait(&mut self, a: V, b: V) -> R<NatWait> {
-        if !self.nat_wait {
-            return Ok(NatWait::Fold);
-        }
-        let (fa, fb) = (self.nat_fold_head(a) && !self.nat_args_lit(a), self.nat_fold_head(b) && !self.nat_args_lit(b));
-        if !fa && !fb {
-            return Ok(NatWait::Fold);
-        }
-        if fa && fb || (self.nat_fold_head(a) && self.nat_fold_head(b)) {
-            let (ra, la, sa) = self.const_head(a).unwrap();
-            let (rb, lb, sb) = self.const_head(b).unwrap();
-            if self.canon_of_row(ra) == self.canon_of_row(rb) && !self.args_no(a, b) {
-                self.stats.natwait[0] += 1;
-                // under the race's first budget: two runs of one
-                // computation on different inputs agree in shape down to
-                // where the inputs differ (CFSG traps' s2bad: `g 19 0`
-                // against `g 19 1`, congruence nested 2^19 deep), so a
-                // comparison past the budget folds, as the reference does
-                let eq = self.levels_equiv(la, lb)
-                    && self.attempt_in(Att::NatArgs, self.race_b0, |w| w.spines_defeq_skip(sa, sb, ra, la, true))? == Some(true);
-                if eq {
-                    self.att_won(Att::NatArgs);
-                    self.stats.natwait[1] += 1;
-                    return Ok(NatWait::Equal);
-                }
-                self.put_args_no(a, b);
-            }
-            return Ok(NatWait::Fold);
-        }
-        // one side waits; the other unfolds if it can
-        let o = if fa { b } else { a };
-        if self.nat_fold_head(o) {
-            return Ok(NatWait::Fold);
-        }
-        // a projection application first (as delta_step's
-        // try_unfold_proj_app), else one unfolding
-        let u = match self.proj_app_step(o)? {
-            Some(w) => w,
-            None => {
-                if self.delta_info(o).is_none() {
-                    return Ok(NatWait::Fold);
-                }
-                let Some(u) = self.unfold(o)? else { return Ok(NatWait::Fold) };
-                self.whnf_core_c(u, true)?
-            }
-        };
-        self.stats.natwait[2] += 1;
-        Ok(if fa { NatWait::Next(a, u) } else { NatWait::Next(u, b) })
-    }
     /// Are all of the operation's operands literals already (or values
     /// whose weak head normal form, already known, is one)?
     fn nat_args_lit(&mut self, v: V) -> bool {
@@ -7866,52 +7751,6 @@ impl Worker {
         match self.const_head(v) {
             Some((row, _, spine)) => spine != EMPTY && self.env.nat_op[row as usize] != 0,
             None => false,
-        }
-    }
-    /// Does `v` read one of `let_vals` (entries terms read, spines)? None
-    /// when `fuel` runs out.
-    fn over_let(&mut self, v: V, fuel: &mut u32) -> Option<bool> {
-        if v == HOLE {
-            return Some(false);
-        }
-        if self.let_vals.contains(&v) {
-            return Some(true);
-        }
-        if *fuel == 0 {
-            return None;
-        }
-        *fuel -= 1;
-        match self.val(v) {
-            Val::Sort(_) | Val::Lit(_) => Some(false),
-            Val::Thunk { term, env, .. } | Val::Clo { term, env, .. } | Val::CloI { term, env, .. } => {
-                if self.trng(term) > 63 {
-                    return None;
-                }
-                for i in 0..self.trng(term) {
-                    if !self.uses_var(term, i) {
-                        continue;
-                    }
-                    let Some(x) = self.env_at(env, i) else { break };
-                    if self.over_let(x, fuel)? {
-                        return Some(true);
-                    }
-                }
-                Some(false)
-            }
-            Val::Neu { head, spine } => {
-                if let Head::Stuck(x) = head {
-                    if self.over_let(x, fuel)? {
-                        return Some(true);
-                    }
-                }
-                for i in 0..self.sp.len(spine) {
-                    let e = self.sp.args(spine)[i];
-                    if e & PROJ_BIT == 0 && self.over_let(e, fuel)? {
-                        return Some(true);
-                    }
-                }
-                Some(false)
-            }
         }
     }
 
@@ -8684,8 +8523,6 @@ impl Worker {
         self.cur_lp_list = NONE;
         self.cur_lp = self.lp_list();
         self.lp_ok.clear();
-        self.ground_fuel = self.ground_fuel0;
-        self.ground_out_at = None;
         self.gm = None;
     }
 
@@ -8847,7 +8684,7 @@ impl Worker {
             Inf(u32, u32, bool),
             Eq(V, V),
         }
-        let (a0, l0, d0) = (self.argstack.len(), self.let_vals.len(), self.vdepth);
+        let (a0, d0) = (self.argstack.len(), self.vdepth);
         let mut pend: Vec<Up> = Vec::new();
         loop {
             let r = match pend.last() {
@@ -8871,7 +8708,6 @@ impl Worker {
             };
             // the frames between were unwound: their stacks too
             self.argstack.truncate(a0);
-            self.let_vals.truncate(l0);
             self.vdepth_to(d0);
             self.wdepth = 0;
             self.stats.deep_up += 1;
@@ -8979,6 +8815,8 @@ fn dm_bits(k: usize) -> usize {
 /// an entry of a frame the term never reads (not a value id: `intern`
 /// stops below it)
 pub const HOLE: u32 = PROJ_BIT - 1;
+/// `m_step`'s answer for a side that waits (never a value id)
+const MWAIT: u32 = PROJ_BIT - 2;
 /// milestone 27: ticks between two stack measurements (a power of two
 /// dividing 4096, the cancellation period)
 const TICK_STACK: u32 = 256;
