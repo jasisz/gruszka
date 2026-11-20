@@ -741,8 +741,16 @@ fn main() {
                     if mem_report {
                         eprintln!("MEM worker {wi}: {} deep_up {} ckpts {} late {}/{}", w.mem_report(), w.stats.deep_up, w.stats.ckpts, w.stats.late, w.stats.late_ld);
                     }
-                    if tc::KNOBS && (w.stats.pfirst[0] > 0 || w.stats.ktrap[0] > 0 || w.stats.natwait[0] + w.stats.natwait[2] + w.stats.headprobe[0] + w.stats.dovetail[0] > 0) {
-                        eprintln!("PFIRST worker {wi}: taken {} equal {} ktrap {} ticks {} natwait {:?} headprobe {:?} dovetail {:?}", w.stats.pfirst[0], w.stats.pfirst[1], w.stats.ktrap[0], w.stats.ktrap[1], w.stats.natwait, w.stats.headprobe, w.stats.dovetail);
+                    if tc::KNOBS && (w.stats.pfirst[0] > 0 || w.stats.ktrap[0] > 0 || w.stats.natwait[0] + w.stats.natwait[2] > 0) {
+                        eprintln!("PFIRST worker {wi}: taken {} equal {} ktrap {} ticks {} natwait {:?}", w.stats.pfirst[0], w.stats.pfirst[1], w.stats.ktrap[0], w.stats.ktrap[1], w.stats.natwait);
+                    }
+                    // attempts by kind: opened / answered / own stop / won / ticks
+                    if tc::STATS && w.stats.att.iter().any(|a| a[0] > 0) {
+                        let kinds: Vec<String> = (0..tc::ATT_KINDS).filter(|&k| w.stats.att[k][0] > 0).map(|k| {
+                            let a = w.stats.att[k];
+                            format!("{} {}/{}/{}/{}/{}", tc::ATT_NAMES[k], a[0], a[1], a[2], a[3], a[4])
+                        }).collect();
+                        eprintln!("ATTEMPTS worker {wi}: {} dead {}", kinds.join(", "), w.stats.att_dead);
                     }
                     if w.stats.big_runs > 0 {
                         eprintln!("note: worker {wi}: {} declarations ran in the overflow arenas", w.stats.big_runs);

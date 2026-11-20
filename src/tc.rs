@@ -93,8 +93,8 @@ pub enum Stop {
     Reject,
     Decline,
     Cancel,
-    /// milestone 17: an argument probe ran out of its step budget (caught
-    /// by the probe; never leaves it)
+    /// milestone 17: an attempt ran out of its step budget (caught by the
+    /// attempt whose stop it is, `attempt`; never leaves the outermost)
     Budget,
     /// milestone 38: a whnf too deeply nested in other whnfs, handed up to
     /// the outermost (`deep_v`; caught there, never leaves it)
@@ -315,6 +315,8 @@ const DEEP_TICKS: u32 = region::GHOST_TICKS / 4;
 /// milestone 36: `args_refuted` on, and its budget per argument pair
 const ARGS_REFUTE: bool = true;
 const REFUTE_TICKS: u32 = 256;
+/// milestone 17: the budget of `probe_args` (nano-lean's)
+const ARGS_PROBE: u32 = 1024;
 /// knobs builds: SK_TABLE_CAP=n caps every slab at n entries (to test the
 /// full path: the declaration declines, the run goes on)
 fn slab_cap(c: usize) -> usize {
@@ -649,8 +651,12 @@ pub struct Rec {
 
 #[derive(Default, Debug, Clone)]
 pub struct Stats {
-    /// milestone 17: argument probes under non-regular heads (made, equal, out of budget, ticks)
-    pub probe: [u64; 5],
+    /// attempts by kind (`Att`): opened, answered within the budget, ended
+    /// by their own stop, won (the attempt's answer decided the
+    /// comparison), ticks spent
+    pub att: [[u64; 5]; ATT_KINDS],
+    /// attempts ended at once on a pair an earlier attempt left undecided
+    pub att_dead: u64,
     pub values: u64,
     pub infer_hits: u64,
     pub infer_misses: u64,
@@ -725,13 +731,29 @@ pub struct Stats {
     /// milestone 41: NatFoldWaits (same operation compared, equal by
     /// operands, other side unfolded)
     pub natwait: [u64; 3],
-    /// milestone 41: CommonHeadFirst (lazy delta past its budget, decided
-    /// by a common head)
-    pub headprobe: [u64; 6],
-    /// milestone 48: same-head comparisons unfolded first (runs, arguments
-    /// after, -, decided by unfolding, ticks)
-    pub dovetail: [u64; 5],
 }
+
+/// The kinds of attempt (`attempt`): a cheaper order of the reference's
+/// steps tried under a budget of ticks, the reference's order after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Att {
+    /// lazy delta's reference loop (CommonHeadFirst's first leg)
+    HeadFirst,
+    /// one side unfolded towards the other's head (`head_lookahead`)
+    Lookahead,
+    /// the same Nat operation compared by its operands (NatFoldWaits)
+    NatArgs,
+    /// a literal fold's arguments over a `let` value (`let_skip_fold`)
+    LetFold,
+    /// one argument pair under a regular head (`args_refuted`)
+    Refute,
+    /// both sides unfolded before the arguments (`unfold_first`)
+    Unfold,
+    /// the arguments under a non-regular head (`probe_args`)
+    Args,
+}
+pub const ATT_KINDS: usize = 7;
+pub const ATT_NAMES: [&str; ATT_KINDS] = ["headfirst", "lookahead", "natargs", "letfold", "refute", "unfold", "args"];
 
 pub(crate) enum NatWait {
     Fold,
@@ -868,9 +890,12 @@ pub struct Worker {
     /// milestone 17: `tick` takes its slow path when `ticks` reaches this
     /// (the next multiple of 4096: cancellation; or the end of a probe's budget)
     tick_alarm: u32,
-    /// an argument probe under a non-regular head is running; it ends at `probe_end`
-    probe_on: bool,
-    probe_end: u32,
+    /// attempts open (`attempt`); the nearest of their stops is `att_end`
+    /// (the stack of stops lives in `attempt`'s frames, combined by
+    /// minimum), `att_own`: that stop is the innermost attempt's
+    att_depth: u32,
+    att_end: u32,
+    att_own: bool,
     stack_base: usize,
     stack_limit: usize,
     pub stats: Stats,
@@ -1294,8 +1319,9 @@ impl Worker {
             first_fail,
             ticks: 0,
             tick_alarm: 0x1000,
-            probe_on: false,
-            probe_end: 0,
+            att_depth: 0,
+            att_end: 0,
+            att_own: false,
             stack_base: &x as *const u8 as usize,
             stack_limit,
             stats: Stats::default(),
@@ -1612,8 +1638,8 @@ impl Worker {
     /// Milestone 36 (SK_DECL_INSTR): the sizes of the session's tables.
     pub fn table_report(&self) -> String {
         format!(
-            "redo_n {:?} gr {:?} pfirst {:?} ktrap {:?} natwait {:?} headprobe {:?} reg {:?} redo {} pinkept {} skip {} seg {} undo {} vals {} eloc {} eslots {} sp_b {} ftab_b {} wlits {} wlit_b {} blk {} vmap {} env_map {} eq {} fail {} icache {} iu {} unf {} uenv {} fv {} sess_b {}",
-            self.redo_n, self.stats.gr, self.stats.pfirst, self.stats.ktrap, self.stats.natwait, self.stats.headprobe, self.stats.reg, self.stats.reg_redo, self.stats.reg_pin_kept, self.stats.reg_skip, self.stats.reg_seg, self.undo.len(), self.vals.len(), self.eloc.len(), self.eslots.len(), self.sp.bytes(), self.ftab.bytes(),
+            "redo_n {:?} gr {:?} pfirst {:?} ktrap {:?} natwait {:?} att {:?} reg {:?} redo {} pinkept {} skip {} seg {} undo {} vals {} eloc {} eslots {} sp_b {} ftab_b {} wlits {} wlit_b {} blk {} vmap {} env_map {} eq {} fail {} icache {} iu {} unf {} uenv {} fv {} sess_b {}",
+            self.redo_n, self.stats.gr, self.stats.pfirst, self.stats.ktrap, self.stats.natwait, self.stats.att, self.stats.reg, self.stats.reg_redo, self.stats.reg_pin_kept, self.stats.reg_skip, self.stats.reg_seg, self.undo.len(), self.vals.len(), self.eloc.len(), self.eslots.len(), self.sp.bytes(), self.ftab.bytes(),
             self.wlits.len(), self.wlit_bytes, self.blk.len(), self.vmap.len(), self.env_map.len(),
             self.eq_cache.len(), self.fail_cache.len(), self.infer_cache.len(), self.infer_u.len(),
             self.unfold_memo.len(), self.uenv_map.len(), self.fv_ty.len(), self.sess_bytes()
@@ -1848,7 +1874,7 @@ impl Worker {
     pub fn after_panic(&mut self) {
         // milestone 24: a panic inside an argument probe left the probe on,
         // and the worker's next declaration declined ("probe budget escaped")
-        self.probe_on = false;
+        self.att_depth = 0;
         self.ground_busy = false;
         // milestone 28: an inductive block's memo names its scratch ids
         self.ind_memo = Default::default();
@@ -1969,7 +1995,7 @@ impl Worker {
         Ok(())
     }
     /// Every 4096 ticks: cancellation. Under an argument probe also its
-    /// budget: past `probe_end` every tick stops (`Stop::Budget`) until the
+    /// budget: past `att_end` every tick stops (`Stop::Budget`) until the
     /// probe returns, so a caller that swallows one error still stops.
     #[cold]
     #[inline(never)]
@@ -1996,9 +2022,9 @@ impl Worker {
             return decline("a worker table is full");
         }
         let t = self.ticks;
-        if self.probe_on && t == self.probe_end {
-            self.probe_end = t.wrapping_add(1);
-            self.tick_alarm = self.probe_end;
+        if self.att_depth != 0 && t == self.att_end {
+            self.att_end = t.wrapping_add(1);
+            self.tick_alarm = self.att_end;
             return Err(Stop::Budget);
         }
         self.set_alarm();
@@ -2014,7 +2040,82 @@ impl Worker {
     fn set_alarm(&mut self) {
         let t = self.ticks;
         let next = (t | (TICK_STACK - 1)).wrapping_add(1);
-        self.tick_alarm = if self.probe_on && self.probe_end.wrapping_sub(t) < next.wrapping_sub(t) { self.probe_end } else { next };
+        self.tick_alarm = if self.att_depth != 0 && self.att_end.wrapping_sub(t) < next.wrapping_sub(t) { self.att_end } else { next };
+    }
+    /// Is an attempt open?
+    #[inline(always)]
+    fn attempting(&self) -> bool {
+        self.att_depth != 0
+    }
+    /// Ends the innermost attempt now: this and every later tick of it
+    /// stops (`Stop::Budget`, caught by that attempt).
+    #[cold]
+    fn attempt_stop<T>(&mut self) -> R<T> {
+        self.att_own = true;
+        self.att_end = self.ticks.wrapping_add(1);
+        self.tick_alarm = self.att_end;
+        Err(Stop::Budget)
+    }
+    /// One attempt: `f` under a stop `budget` ticks away. `None` when its
+    /// own stop ended it (binders opened inside are closed again). Stops
+    /// form a stack combined by minimum: inside another attempt whose stop
+    /// is nearer, that stop stays, and a `Budget` it raises is not this
+    /// attempt's: it goes on up to the attempt it belongs to. Every caller
+    /// decides first whether it opens an attempt inside another one (all
+    /// of them today: no, they run unbudgeted under the outer stop or
+    /// skip their shortcut).
+    fn attempt<T>(&mut self, kind: Att, budget: u32, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
+        let t0 = self.ticks;
+        let d0 = self.vdepth;
+        let (end0, own0) = (self.att_end, self.att_own);
+        let own = self.att_depth == 0 || budget < end0.wrapping_sub(t0);
+        if own {
+            self.att_end = t0.wrapping_add(budget);
+        }
+        self.att_own = own;
+        self.att_depth += 1;
+        self.set_alarm();
+        let r = f(self);
+        self.att_depth -= 1;
+        let mine = self.att_own;
+        // an own stop, or a stop of this attempt's (`attempt_stop`), gives
+        // the enclosing stop back; the enclosing one, reached, stays
+        if mine {
+            self.att_end = end0;
+        }
+        self.att_own = own0;
+        self.set_alarm();
+        if STATS {
+            let s = &mut self.stats.att[kind as usize];
+            s[0] += 1;
+            s[4] += self.ticks.wrapping_sub(t0) as u64;
+        }
+        match r {
+            Ok(x) => {
+                if STATS { self.stats.att[kind as usize][1] += 1; }
+                Ok(Some(x))
+            }
+            Err(Stop::Budget) if mine => {
+                if STATS { self.stats.att[kind as usize][2] += 1; }
+                self.vdepth_to(d0);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+    /// `attempt`, but inside another attempt (or with no budget, 0) `f`
+    /// runs under the enclosing stop alone, without one of its own.
+    fn attempt_in<T>(&mut self, kind: Att, budget: u32, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
+        if self.attempting() || budget == 0 {
+            return f(self).map(Some);
+        }
+        self.attempt(kind, budget, f)
+    }
+    /// The attempt of `kind` decided its comparison (report only; not
+    /// counted when it ran under an enclosing attempt's stop, `attempt_in`).
+    #[inline(always)]
+    fn att_won(&mut self, kind: Att) {
+        if STATS && !self.attempting() { self.stats.att[kind as usize][3] += 1; }
     }
 
     // -----------------------------------------------------------------------
@@ -6073,17 +6174,15 @@ impl Worker {
     /// probe (its budget belongs to the probe's caller).
     #[inline(never)]
     fn defeq_ne(&mut self, a: V, b: V) -> R<bool> {
-        if self.deep_zone && self.probe_on && self.pdead_off {
+        if self.deep_zone && self.attempting() && self.pdead_off {
             let x = 0u8;
             let sp = std::hint::black_box(&x) as *const u8 as usize;
             if self.stack_base.saturating_sub(sp) > self.deep_at {
                 self.dove_deep = true;
-                self.probe_end = self.ticks.wrapping_add(1);
-                self.tick_alarm = self.probe_end;
-                return Err(Stop::Budget);
+                return self.attempt_stop();
             }
         }
-        if self.deep_zone && !self.probe_on {
+        if self.deep_zone && !self.attempting() {
             let x = 0u8;
             let sp = std::hint::black_box(&x) as *const u8 as usize;
             if self.stack_base.saturating_sub(sp) > self.deep_at {
@@ -6160,14 +6259,11 @@ impl Worker {
         }
         let key = [ia[0], ia[1], ia[2], ib[0], ib[1], ib[2]];
         let pk = if a < b { (a as u64) << 32 | b as u64 } else { (b as u64) << 32 | a as u64 };
-        if self.probe_on && !self.pdead_off {
+        if self.attempting() && !self.pdead_off {
             if let Some(&f) = self.eq_cache.get(&pk) {
                 if f & (EQ_KNOWN | EQ_PDEAD) == EQ_PDEAD {
-                    self.stats.probe[4] += 1;
-                    // every later tick of this probe stops too
-                    self.probe_end = self.ticks.wrapping_add(1);
-                    self.tick_alarm = self.probe_end;
-                    return Err(Stop::Budget);
+                    if STATS { self.stats.att_dead += 1; }
+                    return self.attempt_stop();
                 }
             }
         }
@@ -6274,7 +6370,7 @@ impl Worker {
             }
             Err(e) => Err(e),
         };
-        if self.probe_on && matches!(r, Err(Stop::Budget)) {
+        if self.attempting() && matches!(r, Err(Stop::Budget)) {
             self.ulog(Undo::Eq(pk));
             *self.eq_cache.entry(pk).or_insert(0) |= EQ_PDEAD;
         }
@@ -7144,53 +7240,24 @@ impl Worker {
 
     /// Lean's lazy delta reduction. `Ok(r)` decided, `Err((a, b))` undecided.
     fn lazy_delta(&mut self, a: V, b: V) -> R<Result<bool, (V, V)>> {
-        if self.head_probe == 0 || self.probe_on {
+        if self.head_probe == 0 || self.attempting() {
             return self.lazy_delta_r(a, b);
         }
         // milestone 41 (CommonHeadFirst): the reference loop under a budget;
         // past it, each side unfolded a step at a time towards the other's
         // head under the same budget; then the reference loop again
         let budget = self.head_probe;
-        let t0 = self.ticks;
-        let d0 = self.vdepth;
-        self.probe_on = true;
-        self.probe_end = t0.wrapping_add(budget);
-        self.set_alarm();
-        let r = self.lazy_delta_r(a, b);
-        self.probe_on = false;
-        self.set_alarm();
-        match r {
-            Err(Stop::Budget) => self.vdepth_to(d0),
-            r => return r,
+        if let Some(r) = self.attempt(Att::HeadFirst, budget, |s| s.lazy_delta_r(a, b))? {
+            self.att_won(Att::HeadFirst);
+            return Ok(r);
         }
-        self.stats.headprobe[2] += self.ticks.wrapping_sub(t0) as u64;
-        self.stats.headprobe[0] += 1;
-        let tl = self.ticks;
         for (x, y) in [(a, b), (b, a)] {
-            let t0 = self.ticks;
-            let d0 = self.vdepth;
-            self.probe_on = true;
-            self.probe_end = t0.wrapping_add(budget);
-            self.set_alarm();
-            let r = self.head_lookahead(x, y);
-            self.probe_on = false;
-            self.set_alarm();
-            match r {
-                Ok(true) => {
-                    self.stats.headprobe[1] += 1;
-                    self.stats.headprobe[3] += self.ticks.wrapping_sub(tl) as u64;
-                    return Ok(Ok(true));
-                }
-                Ok(false) => self.stats.headprobe[5] += 1,
-                Err(Stop::Budget) => self.vdepth_to(d0),
-                Err(e) => return Err(e),
+            if self.attempt(Att::Lookahead, budget, |s| s.head_lookahead(x, y))? == Some(true) {
+                self.att_won(Att::Lookahead);
+                return Ok(Ok(true));
             }
         }
-        self.stats.headprobe[3] += self.ticks.wrapping_sub(tl) as u64;
-        let tr = self.ticks;
-        let r = self.lazy_delta_r(a, b);
-        self.stats.headprobe[4] += self.ticks.wrapping_sub(tr) as u64;
-        r
+        self.lazy_delta_r(a, b)
     }
 
     /// Milestone 41 (CommonHeadFirst): `x` unfolded a step at a time (a
@@ -7369,7 +7436,7 @@ impl Worker {
     /// fold runs (its budget bounds the work). release-da, on a skip, folds
     /// as well and asserts lazy delta's answer after one step the same.
     fn let_skip_fold(&mut self, a: V, b: V) -> R<bool> {
-        if self.let_vals.is_empty() || self.probe_on || !(self.nat_fold_head(a) || self.nat_fold_head(b)) {
+        if self.let_vals.is_empty() || self.attempting() || !(self.nat_fold_head(a) || self.nat_fold_head(b)) {
             return Ok(false);
         }
         let mut fuel = MENTION_FUEL;
@@ -7378,24 +7445,11 @@ impl Worker {
         }
         let skip = if self.let_skip >= self.let_vals.len() {
             true
+        } else if self.attempt(Att::LetFold, LET_PROBE, |s| s.fold_args_whnf(a).and_then(|_| s.fold_args_whnf(b)))?.is_some() {
+            false
         } else {
-            let t0 = self.ticks;
-            let d0 = self.vdepth;
-            self.probe_on = true;
-            self.probe_end = t0.wrapping_add(LET_PROBE);
-            self.set_alarm();
-            let r = self.fold_args_whnf(a).and_then(|_| self.fold_args_whnf(b));
-            self.probe_on = false;
-            self.set_alarm();
-            match r {
-                Ok(()) => false,
-                Err(Stop::Budget) => {
-                    self.vdepth_to(d0);
-                    self.let_skip = self.let_vals.len();
-                    true
-                }
-                Err(e) => return Err(e),
-            }
+            self.let_skip = self.let_vals.len();
+            true
         };
         #[cfg(debug_assertions)]
         if skip {
@@ -7469,8 +7523,10 @@ impl Worker {
                 // where the inputs differ (CFSG traps' s2bad: `g 19 0`
                 // against `g 19 1`, congruence nested 2^19 deep), so a
                 // comparison past the budget folds, as the reference does
-                let eq = self.levels_equiv(la, lb) && self.budgeted(|w| w.spines_defeq_skip(sa, sb, ra, la, true))? == Some(true);
+                let eq = self.levels_equiv(la, lb)
+                    && self.attempt_in(Att::NatArgs, self.head_probe, |w| w.spines_defeq_skip(sa, sb, ra, la, true))? == Some(true);
                 if eq {
+                    self.att_won(Att::NatArgs);
                     self.stats.natwait[1] += 1;
                     return Ok(NatWait::Equal);
                 }
@@ -7499,34 +7555,6 @@ impl Worker {
         self.stats.natwait[2] += 1;
         Ok(if fa { NatWait::Next(a, u) } else { NatWait::Next(u, b) })
     }
-    /// Milestone 41: `f` under a budget of `head_probe` ticks (the argument
-    /// probes' machinery); None past it. Inside another probe, `f` shares
-    /// that probe's budget.
-    fn budgeted<T>(&mut self, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
-        if self.probe_on {
-            return f(self).map(Some);
-        }
-        if self.head_probe == 0 {
-            return f(self).map(Some);
-        }
-        let t0 = self.ticks;
-        let d0 = self.vdepth;
-        self.probe_on = true;
-        self.probe_end = t0.wrapping_add(self.head_probe);
-        self.set_alarm();
-        let r = f(self);
-        self.probe_on = false;
-        self.set_alarm();
-        match r {
-            Ok(x) => Ok(Some(x)),
-            Err(Stop::Budget) => {
-                self.vdepth_to(d0);
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     /// Are all of the operation's operands literals already (or values
     /// whose weak head normal form, already known, is one)?
     fn nat_args_lit(&mut self, v: V) -> bool {
@@ -7651,7 +7679,7 @@ impl Worker {
                             let tk0 = self.ticks;
                             let same = if !self.levels_equiv(la, lb) || self.args_refuted(sa, sb, ra, la)? {
                                 false
-                            } else if self.dovetail == 0 || self.probe_on {
+                            } else if self.dovetail == 0 || self.attempting() {
                                 self.spines_defeq_skip(sa, sb, ra, la, true)?
                             } else {
                                 match self.dovetail_args(a, b, sa, sb, ra, la)? {
@@ -7860,7 +7888,7 @@ impl Worker {
     /// only skips the shortcut: both sides are unfolded as after any
     /// failed argument comparison, so verdicts cannot depend on it.
     fn args_refuted(&mut self, sa: u32, sb: u32, row: u32, llr: u32) -> R<bool> {
-        if self.probe_on || !self.args_refute || self.spine_has_proj(sa) || self.spine_has_proj(sb) {
+        if self.attempting() || !self.args_refute || self.spine_has_proj(sa) || self.spine_has_proj(sb) {
             return Ok(false);
         }
         let n = self.sp.len(sa);
@@ -7876,42 +7904,12 @@ impl Worker {
             if x == y {
                 continue;
             }
-            let t0 = self.ticks;
-            let d0 = self.vdepth;
-            self.probe_on = true;
-            self.probe_end = t0.wrapping_add(REFUTE_TICKS);
-            self.set_alarm();
-            let r = self.defeq(x, y);
-            self.probe_on = false;
-            self.set_alarm();
-            match r {
-                Ok(false) => return Ok(true),
-                Ok(true) => {}
-                Err(Stop::Budget) => self.vdepth_to(d0),
-                Err(e) => return Err(e),
+            if self.attempt(Att::Refute, REFUTE_TICKS, |s| s.defeq(x, y))? == Some(false) {
+                self.att_won(Att::Refute);
+                return Ok(true);
             }
         }
         Ok(false)
-    }
-
-    /// Milestone 48: `f` under a budget of `budget` ticks; `None` when the
-    /// budget ran out (binders opened inside are closed again).
-    fn budgeted_n(&mut self, budget: u32, f: impl FnOnce(&mut Self) -> R<bool>) -> R<Option<bool>> {
-        let d0 = self.vdepth;
-        self.probe_on = true;
-        self.probe_end = self.ticks.wrapping_add(budget);
-        self.set_alarm();
-        let r = f(self);
-        self.probe_on = false;
-        self.set_alarm();
-        match r {
-            Ok(r) => Ok(Some(r)),
-            Err(Stop::Budget) => {
-                self.vdepth_to(d0);
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
     }
 
     /// Milestone 48: two applications `a`, `b` of the same regular
@@ -7932,19 +7930,12 @@ impl Worker {
     /// a budget no inner probe runs (CommonHeadFirst, args_refuted, the
     /// hand-ups), and the arguments' way grew far dearer than unbudgeted.)
     fn dovetail_args(&mut self, a: V, b: V, sa: u32, sb: u32, ra: u32, la: u32) -> R<Option<DStep>> {
-        let t0 = self.ticks;
-        self.stats.dovetail[0] += 1;
-        let r = self.unfold_first(a, b);
-        self.stats.dovetail[4] += self.ticks.wrapping_sub(t0) as u64;
-        match r? {
+        match self.unfold_first(a, b)? {
             Some(d) => {
-                self.stats.dovetail[3] += 1;
+                self.att_won(Att::Unfold);
                 Ok(Some(d))
             }
-            None => {
-                self.stats.dovetail[1] += 1;
-                Ok(if self.spines_defeq_skip(sa, sb, ra, la, true)? { Some(DStep::Equal) } else { None })
-            }
+            None => Ok(if self.spines_defeq_skip(sa, sb, ra, la, true)? { Some(DStep::Equal) } else { None }),
         }
     }
 
@@ -7955,7 +7946,7 @@ impl Worker {
         // the unfolding itself is inside the budget: unfolding a matcher
         // or a casesOn evaluates its major premise (match_direct,
         // cases_direct), which may be a whole computation
-        let r = self.budgeted_n(self.dovetail, |s| {
+        let r = self.attempt(Att::Unfold, self.dovetail, |s| {
             // a side whose unfolding is refused (no value to unfold):
             // the arguments alone, as before
             let (Some(ua), Some(ub)) = (s.unfold(a)?, s.unfold(b)?) else {
@@ -7974,35 +7965,14 @@ impl Worker {
     }
 
     fn probe_args(&mut self, sa: u32, sb: u32, row: u32, llr: u32) -> R<bool> {
-        if self.probe_on {
-            return self.spines_defeq_skip(sa, sb, row, llr, true);
+        // past the budget: binders opened inside are gone (in depth mode
+        // their depths are free again; otherwise their variables stay
+        // marked in scope: fewer reuses, never a sharing)
+        let r = self.attempt_in(Att::Args, ARGS_PROBE, |s| s.spines_defeq_skip(sa, sb, row, llr, true))? == Some(true);
+        if r {
+            self.att_won(Att::Args);
         }
-        self.stats.probe[0] += 1;
-        let t0 = self.ticks;
-        let d0 = self.vdepth;
-        self.probe_on = true;
-        self.probe_end = t0.wrapping_add(1024);
-        self.set_alarm();
-        let r = self.spines_defeq_skip(sa, sb, row, llr, true);
-        self.probe_on = false;
-        self.set_alarm();
-        self.stats.probe[3] += self.ticks.wrapping_sub(t0) as u64;
-        match r {
-            Ok(true) => {
-                self.stats.probe[1] += 1;
-                Ok(true)
-            }
-            Ok(false) => Ok(false),
-            Err(Stop::Budget) => {
-                self.stats.probe[2] += 1;
-                // binders opened inside the probe are gone (in depth mode
-                // their depths are free again; otherwise their variables
-                // stay marked in scope: fewer reuses, never a sharing)
-                self.vdepth_to(d0);
-                Ok(false)
-            }
-            Err(e) => Err(e),
-        }
+        Ok(r)
     }
 
     /// The last projection in a neutral value's spine: (position, elim).
