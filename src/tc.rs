@@ -7966,10 +7966,13 @@ impl Worker {
                             self.put_args_no(a, b);
                         }
                     }
+                    // an abbreviation's arguments first is not Lean's order
+                    // (it unfolds): R resumed in a round leaves it to K
+                    // (round 0 and R past the race keep the probe)
                     if ra == rb && !matches!(ha, Hint::Regular(_)) {
                         let (_, la, sa) = self.const_head(a).unwrap();
                         let (_, lb, sb) = self.const_head(b).unwrap();
-                        if sa != EMPTY && sb != EMPTY && !self.args_no(a, b) && self.probe_worth(sa, sb, ra) {
+                        if sa != EMPTY && sb != EMPTY && !self.args_no(a, b) && !(self.attempting() && self.att_kind == Att::RaceR) && self.probe_worth(sa, sb, ra) {
                             if self.levels_equiv(la, lb) && self.probe_args(sa, sb, ra, la)? {
                                 return Ok(DStep::Equal);
                             }
