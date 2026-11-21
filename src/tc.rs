@@ -21,8 +21,7 @@
 
 use crate::env::*;
 use crate::level::{Levels, ZERO};
-use num_bigint::BigUint;
-use num_traits::{One, ToPrimitive, Zero};
+use crate::nat::{BigUint, NatExt};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -390,7 +389,7 @@ const LS_IDENT: bool = true;
 const LS_CLASS: bool = true;
 
 pub type V = u32;
-static BIG_ZERO: BigUint = BigUint::ZERO;
+static BIG_ZERO: BigUint = crate::nat::ZERO;
 /// Milestone 37: the content key of a big Nat literal: its length and a
 /// few digits (both ends and the middle). Equal contents, equal keys;
 /// numbers that differ only elsewhere share a key.
@@ -7351,7 +7350,7 @@ impl Worker {
             Val::Lit(i) => {
                 if let LitVal::Nat(n) = self.lit(i) {
                     if !n.is_zero() {
-                        let p = n - BigUint::one();
+                        let p = n - 1u32;
                         return Ok(Some(self.mk_nat(p)?));
                     }
                 }

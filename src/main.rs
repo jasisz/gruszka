@@ -27,6 +27,7 @@
 mod env;
 mod induct;
 mod level;
+mod nat;
 mod quot;
 mod tc;
 

@@ -9,7 +9,7 @@
 //! - Literals are copied out of the file into owned tables.
 //! - Proof blocks stay lazy (`BlockRef`), decoded per worker.
 
-use num_bigint::BigUint;
+use crate::nat::{BigUint, NatExt};
 use rustc_hash::FxHashMap;
 use susz::read::{BlockRef, Component, Decl, Expr, Hints, Level, Ref, State, Visit};
 
@@ -599,7 +599,7 @@ pub fn push_expr(
         }
         Expr::Nat(bytes) => {
             let i = lit_base + lits.len() as u32;
-            lits.push(LitVal::Nat(BigUint::from_bytes_le(bytes)));
+            lits.push(LitVal::Nat(<BigUint as NatExt>::from_bytes_le(bytes)));
             cols.push(NAT, 0, 0, i, 0, 0)
         }
         Expr::Str(s) => {

@@ -637,7 +637,7 @@ pub(super) fn nat_fold(op: usize, x: &BigUint, y: &BigUint) -> Result<NatR, &'st
                 x % y
             }
         }
-        "gcd" => num_integer::Integer::gcd(x, y),
+        "gcd" => x.nat_gcd(y),
         "beq" => return Ok(NatR::B(x == y)),
         "ble" => return Ok(NatR::B(x <= y)),
         "land" => x & y,
@@ -655,11 +655,11 @@ pub(super) fn nat_fold(op: usize, x: &BigUint, y: &BigUint) -> Result<NatR, &'st
                 if nat_bytes(x) + k as u64 / 8 + 1 > NAT_MAX_BYTES {
                     return Err(NAT_SIZE_MSG);
                 }
-                x << k
+                x << k as usize
             }
         }
         "shiftRight" => match y.to_u64() {
-            Some(s) => x >> s,
+            Some(s) => x >> s as usize,
             None => BigUint::zero(),
         },
         "pow" => {
@@ -670,7 +670,7 @@ pub(super) fn nat_fold(op: usize, x: &BigUint, y: &BigUint) -> Result<NatR, &'st
             if k != 0 && *x > BigUint::from(1u32) && nat_bytes(x) > NAT_MAX_BYTES / k as u64 {
                 return Err("the kernel refused to evaluate `Nat.pow` because the result would exceed the maximum numeral size; increase the LEAN_NAT_MAX_SIZE environment variable to allow it");
             }
-            x.pow(k)
+            x.nat_pow(k)
         }
         _ => unreachable!("NAT_OPS"),
     }))
