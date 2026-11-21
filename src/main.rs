@@ -748,7 +748,7 @@ fn main() {
                             let a = w.stats.att[k];
                             format!("{} {}/{}/{}/{}/{}", tc::ATT_NAMES[k], a[0], a[1], a[2], a[3], a[4])
                         }).collect();
-                        eprintln!("ATTEMPTS worker {wi}: {} dead {}", kinds.join(", "), w.stats.att_dead);
+                        eprintln!("ATTEMPTS worker {wi}: {} dead {} deep {}", kinds.join(", "), w.stats.att_dead, w.stats.att_deep);
                     }
                     if tc::STATS && w.stats.race[0] > 0 {
                         let r = w.stats.race;

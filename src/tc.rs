@@ -703,6 +703,8 @@ pub struct Stats {
     pub att: [[u64; 5]; ATT_KINDS],
     /// attempts ended at once on a pair an earlier attempt left undecided
     pub att_dead: u64,
+    /// attempts ended too deep (`att_too_deep`)
+    pub att_deep: u64,
     pub values: u64,
     pub infer_hits: u64,
     pub infer_misses: u64,
@@ -940,6 +942,14 @@ pub struct Worker {
     att_own: bool,
     /// the innermost attempt's kind
     att_kind: Att,
+    /// too deep inside an attempt: the stop raised there ends every open
+    /// attempt, not the innermost (`att_too_deep`); `att_deep_ended`: the
+    /// outermost attempt that last ended was ended so
+    att_deep: bool,
+    att_deep_ended: bool,
+    /// races whose reference went too deep in this declaration: compared by
+    /// the reference alone when the declaration is tried again
+    deep_races: std::collections::HashSet<u64>,
     stack_base: usize,
     stack_limit: usize,
     pub stats: Stats,
@@ -1346,6 +1356,9 @@ impl Worker {
             att_end: 0,
             att_own: false,
             att_kind: Att::Round0,
+            att_deep: false,
+            att_deep_ended: false,
+            deep_races: Default::default(),
             stack_base: &x as *const u8 as usize,
             stack_limit,
             stats: Stats::default(),
@@ -2117,14 +2130,41 @@ impl Worker {
                 if STATS { self.stats.att[kind as usize][1] += 1; }
                 Ok(Some(x))
             }
-            Err(Stop::Budget) if mine => {
+            Err(Stop::Budget) if mine && !(self.att_deep && self.att_depth != 0) => {
                 if STATS { self.stats.att[kind as usize][2] += 1; }
                 self.vdepth_to(d0);
+                if self.att_deep {
+                    self.att_deep = false;
+                    self.att_deep_ended = true;
+                }
                 Ok(None)
             }
             Err(e) => Err(e),
         }
     }
+    /// Too deep inside an attempt (a comparison past `deep_at` bytes of
+    /// stack): every open attempt ends now, undecided. Handing the work up
+    /// (`Stop::Deep`) would do it in full, unbudgeted, at the declaration;
+    /// ending only the innermost attempt would leave the frames below the
+    /// outer ones on the stack. More budget does not make the stack
+    /// shallower, so a race whose round ended so takes that strategy out
+    /// (`take_deep_ended`) and, once R's round did, goes on as the
+    /// reference past the race, which hands deep work up as before.
+    #[cold]
+    fn att_too_deep<T>(&mut self) -> R<T> {
+        if STATS { self.stats.att_deep += 1; }
+        if KNOBS && std::env::var_os("SK_DEEP_TRACE").is_some() {
+            eprintln!("ATTDEEP ticks {} depth {} kind {:?}", self.ticks, self.att_depth, self.att_kind);
+        }
+        self.att_deep = true;
+        self.attempt_stop()
+    }
+    /// Did the outermost attempt that ended last end too deep (and clear it)?
+    #[inline(always)]
+    fn take_deep_ended(&mut self) -> bool {
+        std::mem::replace(&mut self.att_deep_ended, false)
+    }
+
     /// `attempt`, but inside another attempt (or with no budget, 0) `f`
     /// runs under the enclosing stop alone, without one of its own.
     fn attempt_in<T>(&mut self, kind: Att, budget: u32, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
@@ -5160,6 +5200,9 @@ impl Worker {
                     self.deep_cur = self.deep_cur.saturating_mul(2);
                 }
             }
+            if KNOBS && std::env::var_os("SK_DEEP_TRACE").is_some() {
+                eprintln!("DEEPUP {} ticks {} pend {} job {:?} lvl {} vals {}", self.stats.deep_up, self.ticks, pend.len(), j, whnf_level, self.vals.len());
+            }
             if pend.len() >= DEEP_PEND_CAP {
                 return decline("recursion too deep (hand-ups)");
             }
@@ -6249,12 +6292,16 @@ impl Worker {
     /// probe (its budget belongs to the probe's caller).
     #[inline(never)]
     fn defeq_ne(&mut self, a: V, b: V) -> R<bool> {
-        if self.deep_zone && !self.attempting() {
+        if self.deep_zone {
             let x = 0u8;
             let sp = std::hint::black_box(&x) as *const u8 as usize;
             if self.stack_base.saturating_sub(sp) > self.deep_at {
                 let pk = if a < b { (a as u64) << 32 | b as u64 } else { (b as u64) << 32 | a as u64 };
-                if self.eq_get(pk).is_none() && !self.has_fvar(a) && !self.has_fvar(b) {
+                if self.attempting() {
+                    if self.eq_get(pk).is_none() {
+                        return self.att_too_deep();
+                    }
+                } else if self.eq_get(pk).is_none() && !self.has_fvar(a) && !self.has_fvar(b) {
                     self.deep_job = Job::Eq(a, b);
                     return Err(Stop::Deep);
                 }
@@ -6440,7 +6487,7 @@ impl Worker {
             }
             Err(e) => Err(e),
         };
-        if left != 0 && matches!(r, Err(Stop::Budget)) {
+        if left != 0 && matches!(r, Err(Stop::Budget)) && !self.att_deep {
             self.ulog(Undo::Eq(pk));
             let f = self.eq_cache.entry(pk).or_insert(0);
             let c = undec_class(left).max(*f >> EQ_UNDEC);
@@ -7362,9 +7409,20 @@ impl Worker {
         if self.race_b0 == 0 || (self.attempting() && (!RACE_NEST || self.att_end.wrapping_sub(self.ticks) <= self.race_b0)) {
             return self.lazy_delta_r(a, b, &mut st);
         }
+        if !self.deep_races.is_empty() && self.deep_races.contains(&pair_key(a, b)) {
+            return self.lazy_delta_r(a, b, &mut st);
+        }
+        self.att_deep_ended = false;
         if let Some(r) = self.attempt(Att::Round0, self.race_b0, |s| s.lazy_delta_r(a, b, &mut st))? {
             self.att_won(Att::Round0);
             return Ok(r);
+        }
+        if self.take_deep_ended() {
+            // round 0 went too deep: so would every round (`att_too_deep`)
+            if STATS { self.stats.race[5] += 1; }
+            self.deep_races.insert(pair_key(a, b));
+            let (x, y, _) = st;
+            return self.lazy_delta_r(x, y, &mut st);
         }
         self.race(a, b, st)
     }
@@ -7406,6 +7464,7 @@ impl Worker {
             if k_on {
                 if STATS { self.stats.race[8] += k_last; }
                 let t0 = self.ticks;
+                self.att_deep_ended = false;
                 match self.race_round(Att::RaceK, budget, a, |s| s.race_k(a, b, budget))? {
                     Some(true) => {
                         if STATS { self.stats.race[2] += 1; }
@@ -7416,12 +7475,13 @@ impl Worker {
                         if STATS { self.stats.race[6] += 1; }
                         k_on = false;
                     }
-                    None => {}
+                    None => k_on = !self.take_deep_ended(),
                 }
                 k_last = self.ticks.wrapping_sub(t0) as u64;
             }
             if m_on {
                 let t0 = self.ticks;
+                self.att_deep_ended = false;
                 match self.race_round(Att::RaceM, budget, a, |s| s.race_m(a, b, &mut allow))? {
                     Some(true) => {
                         if STATS { self.stats.race[3] += 1; }
@@ -7434,6 +7494,7 @@ impl Worker {
                     }
                     None => {
                         if STATS { self.stats.race[8] += self.ticks.wrapping_sub(t0) as u64; }
+                        m_on = !self.take_deep_ended();
                     }
                 }
             }
@@ -7452,6 +7513,7 @@ impl Worker {
                     }
                 }
             }
+            self.att_deep_ended = false;
             let r = self.attempt(Att::RaceR, budget, |s| {
                 let (x, y, _) = st;
                 s.lazy_delta_r(x, y, &mut st)
@@ -7464,6 +7526,10 @@ impl Worker {
                 }
                 None => {
                     if STATS { self.stats.race[8] += self.ticks.wrapping_sub(st.2) as u64; }
+                    if self.take_deep_ended() {
+                        self.deep_races.insert(pair_key(a, b));
+                        break;
+                    }
                 }
             }
         }
@@ -8730,6 +8796,7 @@ impl Worker {
 
     pub fn check_decl(&mut self, d: u32) -> R<()> {
         self.reset(d);
+        self.deep_races.clear();
         let (first, _) = self.env.decl_rows[d as usize];
         // quotient, inductive groups, unsafe and partial declarations run in
         // the scratch arena (see STATUS.md, milestone 10)
