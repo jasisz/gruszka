@@ -357,6 +357,9 @@ const RACE_B0: u32 = env_u32(option_env!("GRUSZKA_B0"), 4096);
 /// runs the reference order with no shortcut of its own, and CFSG's lyLet
 /// ran past 8 GB (K never out on `Membership.mem`, R in rounds without
 /// the arguments' probes that end it in 4 G unbudgeted).
+/// Chains of applications inferred from the innermost link out
+/// (`infer_chain`) from this many links (GRUSZKA_CHAIN_MIN; 0: never)
+const CHAIN_MIN: usize = env_u32(option_env!("GRUSZKA_CHAIN_MIN"), 256) as usize;
 const RACE_NEST: bool = option_env!("GRUSZKA_RACE_ONE").is_none();
 /// Strategies left out of the race (GRUSZKA_RACE_OFF, letters `k`, `m`):
 /// the mutants that show which walls each strategy carries.
@@ -705,6 +708,8 @@ pub struct Stats {
     pub att_dead: u64,
     /// attempts ended too deep (`att_too_deep`)
     pub att_deep: u64,
+    /// chains inferred from the innermost link out (`infer_chain`)
+    pub chains: u64,
     pub values: u64,
     pub infer_hits: u64,
     pub infer_misses: u64,
@@ -5524,6 +5529,9 @@ impl Worker {
             self.ulog(Undo::Infer(ikey2(t, env, ls)));
             return Ok(r);
         }
+        if env == EMPTY && CHAIN_MIN != 0 && self.tk(t) == APP {
+            self.infer_chain(t, ls, check)?;
+        }
         let tk0 = self.ticks;
         let r = if env == self.kb_env && check && ls == 0 { self.infer_known(t, env)? } else { self.infer_core(t, env, ls, check)? };
         if nkey != u64::MAX {
@@ -5541,6 +5549,53 @@ impl Worker {
         icache_put(&mut self.infer_cache, ikey2(t, env, ls), r, check, self.cur_lp);
             self.ulog(Undo::Infer(ikey2(t, env, ls)));
         Ok(r)
+    }
+
+    /// The head of an application term and its number of arguments.
+    #[inline]
+    fn app_head(&self, t: u32) -> (u32, u32) {
+        let (mut f, mut n) = (t, 0);
+        while self.tk(f) == APP {
+            f = self.ta(f);
+            n += 1;
+        }
+        (f, n)
+    }
+    /// A closed application whose last argument is an application of the
+    /// same constant with as many arguments, and so on (a list or string
+    /// literal: `cons a (cons b ..)`), is inferred from its innermost link
+    /// out, each link finding its tail's type cached: an iteration, not a
+    /// recursion as deep as the chain (Pestka builds deep closures from
+    /// the bottom the same way). Only chains of CHAIN_MIN links or more
+    /// not already cached; the inner links' inferences are those the
+    /// recursion would make, in the order it would finish them.
+    #[inline(never)]
+    fn infer_chain(&mut self, t: u32, ls: u32, check: bool) -> R<()> {
+        let (h, n) = self.app_head(t);
+        if self.tk(h) != CONST {
+            return Ok(());
+        }
+        let same = |s: &Self, u: u32| -> bool {
+            if s.tk(u) != APP || s.trng(u) != 0 {
+                return false;
+            }
+            let (g, m) = s.app_head(u);
+            m == n && s.tk(g) == CONST && (g == h || (s.ta(g) == s.ta(h) && s.tp(g) == s.tp(h)))
+        };
+        let mut links: Vec<u32> = Vec::new();
+        let mut u = self.tb(t);
+        while same(self, u) && icache_hit(self.infer_cache.get(&ikey2(u, EMPTY, ls)), check, self.cur_lp).is_none() {
+            links.push(u);
+            u = self.tb(u);
+        }
+        if links.len() < CHAIN_MIN {
+            return Ok(());
+        }
+        if STATS { self.stats.chains += 1; }
+        for &u in links.iter().rev() {
+            self.infer(u, EMPTY, ls, check)?;
+        }
+        Ok(())
     }
 
     fn infer_core(&mut self, t: u32, env: u32, ls: u32, check: bool) -> R<V> {
