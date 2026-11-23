@@ -30,6 +30,7 @@ mod frames;
 mod ground;
 mod names;
 mod region;
+mod rules;
 mod spines;
 use region::Undo;
 use spines::Spines;
@@ -785,6 +786,9 @@ pub struct Stats {
     /// (restarted K and M rounds, and R's step cut by a stop), values given
     /// back by abandoned rounds, won by N, N runs that did not decide
     pub race: [u64; 12],
+    /// milestone 53: rules derived, derivations without a rule, fires,
+    /// fires whose guards found no branch
+    pub rules: [u64; 4],
 }
 
 /// The kinds of attempt (`attempt`): a cheaper order of the reference's
@@ -809,9 +813,11 @@ pub(crate) enum Att {
     Refute,
     /// the arguments under a non-regular head (`probe_args`)
     Args,
+    /// milestone 53: a derivation of a definition's rule
+    Derive,
 }
-pub const ATT_KINDS: usize = 9;
-pub const ATT_NAMES: [&str; ATT_KINDS] = ["r0", "r", "k", "m", "kpair", "meet", "n", "refute", "args"];
+pub const ATT_KINDS: usize = 10;
+pub const ATT_NAMES: [&str; ATT_KINDS] = ["r0", "r", "k", "m", "kpair", "meet", "n", "refute", "args", "derive"];
 
 pub struct Worker {
     pub env: &'static Env<'static>,
@@ -1229,6 +1235,13 @@ pub struct Worker {
     loop_states: u8,
     /// SK_REGION_PIN (knobs): 0 off, 1 on (default)
     reg_pin: bool,
+    /// milestone 53: derived rules of the session's hot definitions
+    /// (`rules.rs`); SK_RULES=0 (knobs) off, SK_RULE_HOT the unfoldings
+    /// before a derivation
+    rl: rules::Rules,
+    rules_on: bool,
+    rule_hot: u32,
+    rule_check: bool,
     /// milestone 36: `args_refuted` on (SK_ARGS_REFUTE=0 in knobs: off)
     args_refute: bool,
     /// regions open past this many bytes of big literals (SK_REGION_LIT_AT, MiB)
@@ -1481,6 +1494,10 @@ impl Worker {
             pin_ids: Vec::new(),
             wstates: Vec::new(),
             wfront: Vec::new(),
+            rl: rules::Rules::default(),
+            rules_on: !(KNOBS && std::env::var("SK_RULES").is_ok_and(|s| s == "0")),
+            rule_check: KNOBS && std::env::var("SK_RULE_CHECK").is_ok_and(|s| s == "1"),
+            rule_hot: if KNOBS { std::env::var("SK_RULE_HOT").ok().and_then(|s| s.parse().ok()).unwrap_or(rules::RULE_HOT) } else { rules::RULE_HOT },
             loop_states: if KNOBS { std::env::var("SK_LOOP_STATES").ok().and_then(|s| s.parse().ok()).unwrap_or(2) } else { 2 },
             reg_pin: REGION_PIN && !(KNOBS && std::env::var("SK_REGION_PIN").is_ok_and(|s| s == "0")),
             reg_logk: if KNOBS { std::env::var("SK_REGION_LOGK").ok().and_then(|s| s.parse().ok()).unwrap_or(REGION_LOGK) } else { REGION_LOGK },
@@ -1544,6 +1561,7 @@ impl Worker {
         }
         self.blk.len() * 23
             + self.wlit_bytes
+            + self.rl.bytes()
             + vb(&self.blk_side.lets)
             + vb(&self.blk_side.lvls)
             + vb(&self.wlits)
@@ -1805,6 +1823,9 @@ impl Worker {
     /// Ends the session: every table keyed by arena ids is emptied.
     fn new_session(&mut self, d: u32) {
         self.gm = None;
+        // milestone 53: rules name level ids, block terms and the session's
+        // projections
+        self.rl.clear();
         self.count_values();
         self.clear_sess_tables();
         self.reg_forget();
@@ -5057,6 +5078,11 @@ impl Worker {
         if self.trng(body) != 0 {
             return Ok(None);
         }
+        // milestone 53: a derivation that unfolds an operation the kernel
+        // computes on literals makes no rule
+        if self.env.nat_op[row as usize] != 0 {
+            self.rl_nat_unfolded();
+        }
         Ok(Some(self.unfold_body(v, row, llr, spine, body)?))
     }
 
@@ -5244,24 +5270,27 @@ impl Worker {
         // milestone 36: past `reg_at` values the call is a region
         // (SK_REGION_LATEGATE=1, knobs, gates: every region opens late)
         let base = self.wstates.len();
+        let fb = self.rl.fstates.len();
         let r = if self.reg_wanted() && !self.reg_lategate {
-            self.whnf_region(v, v, base)
+            self.whnf_region(v, v, base, fb)
         } else {
             match self.whnf_loop(v) {
                 Ok(Ok(r)) => {
                     self.wstates_settle(base, r);
+                    self.fstates_settle(fb, r);
                     Ok(r)
                 }
                 // milestone 38: the session passed `reg_at` while this
                 // loop ran: the rest of it is a region (a late region)
                 Ok(Err(t)) => {
                     self.stats.late += 1;
-                    self.whnf_region(v, t, base)
+                    self.whnf_region(v, t, base, fb)
                 }
                 Err(e) => Err(e),
             }
         };
         self.wstates.truncate(base);
+        self.rl.fstates.truncate(fb);
         let r = r?;
         self.memo_w(v).whnf = r;
         // only real steps: a value in normal form found again under another
@@ -5274,7 +5303,7 @@ impl Worker {
     /// at `v`'s call, or late: at a step of the loop, which keeps only its
     /// current term from one step to the next, as at a checkpoint).
     #[inline(never)]
-    fn whnf_region(&mut self, v: V, t: V, base: usize) -> R<V> {
+    fn whnf_region(&mut self, v: V, t: V, base: usize, fb: usize) -> R<V> {
         Ok({
             let mut g = self.reg_open(v);
             // milestone 37: the loop's current term is all it keeps from
@@ -5297,7 +5326,7 @@ impl Worker {
                     if let Some(n) = self.reduce_nat(c)? {
                         return Ok(Ok(n));
                     }
-                    Ok(match self.unfold(c)? {
+                    Ok(match self.unfold_w(c)? {
                         Some(u) => Err(u),
                         None => Ok(c),
                     })
@@ -5305,6 +5334,7 @@ impl Worker {
                 match step {
                     Ok(Ok(r)) => {
                         self.wstates_settle(base, r);
+                        self.fstates_settle(fb, r);
                         break self.reg_close(&g, v, r)?;
                     }
                     Ok(Err(u)) => {
@@ -5312,6 +5342,7 @@ impl Worker {
                         if self.reg_ckpt && self.reg_due(&g) {
                             // the states so far may die at the checkpoint
                             self.wstates.truncate(base);
+                            self.rl.fstates.truncate(fb);
                             (t, g) = self.reg_checkpoint(&g, v, t)?;
                         }
                     }
@@ -5446,7 +5477,7 @@ impl Worker {
             if let Some(n) = self.reduce_nat(c)? {
                 break Ok(n);
             }
-            match self.unfold(c)? {
+            match self.unfold_w(c)? {
                 Some(u) => {
                     t = u;
                     if self.reg_late && self.reg_wanted() {

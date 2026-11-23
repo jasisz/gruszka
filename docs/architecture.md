@@ -776,6 +776,98 @@ variable of their type that is not in scope, allowing a binder opened again
 to find its caches. Literal Nat arithmetic in whnf ignores free variables
 elsewhere in the value, as Lean's whnf does.
 
+**Derived rules (milestone 53).** Arena's magma-list-deep-n36 looks into
+a list of 1296 entries 5184 times; each step down the list unfolded four
+definitions (the structural recursion's `_f`, its matcher, the matcher's
+`_sparseCasesOn` and `Nat.casesOn`) and made about twelve values, where
+nano-lean takes one rule (23 G, Pestka 8.6 G, nano-lean 2.5-2.9 G).
+nano-lean's `derive.rs` and Pestka's DerivedRules, ported
+(`src/tc/rules.rs`): reduction commutes with substitution, so if
+`f x1 .. xn` reduces to `r` with the `xi` variables, `f a1 .. an` reduces
+to `r` with the `ai` put in.
+
+- *Which definitions.* A safe definition of MAIN with 1 to 16 leading
+  lambdas, not a casesOn (`cases_direct` takes those) nor a Nat operation
+  the kernel computes, whose body under the lambdas is headed, past
+  projections, by a recursor, a casesOn or such a definition, applied to
+  one of the lambdas' variables (Pestka's reachesRecursor; read from the
+  value once per row, a shared flag). Unfoldings of such a constant at a
+  level list are counted in whnf's loop (memo misses only); at `RULE_HOT`
+  = 32 in a session its rule is derived.
+- *Derivation.* The constant is applied to fresh variables (of a type that
+  is a variable of `Type`: nothing can be read from it, no K, no structure
+  eta, no literal; not of `Prop`, where proof irrelevance would find any
+  two of the variables equal) and brought to whnf by the kernel's own whnf. Where a
+  recursor in the result (through recursors waiting on recursors) waits on
+  one of the variables, the variable is split into each constructor
+  applied to fresh variables and the same is done again: at most 3 splits
+  deep, 8 constructors, 64 forms. K-like recursors and structures are not
+  split on (they reach their rule without bringing the major to a
+  constructor, and a guard would bring it there; Lean's structure eta
+  before the major is reduced, lean4#15351). A derivation runs as an
+  attempt of 2^16 ticks; it fails (no rule, `Never`) at that budget, at a
+  reject or decline met on variables, or when it unfolds a Nat operation
+  the kernel computes on literals (with literals the call would be
+  computed, not unfolded). A stop that is not its own (an enclosing
+  attempt's, work handed up, cancellation) goes on up and the count starts
+  again. All derivations of a worker take at most an eighth of its ticks
+  (`RULE_SHARE`): past that a hot constant waits.
+- *Rules that save* (Pestka's RulesThatSave): a rule is kept only when its
+  derivation unfolded more than once per form it met (a definition that is
+  a recursor on its argument would only trade one unfolding for its
+  guard), and only when its form waits on one of its variables (a split at
+  the root). A single leaf only jumps steps ahead and makes its leaf's
+  closures at every fire, where unfolding walks the lambdas without making
+  them: CFSG's m6c took 13% more instructions with such rules (`ite`,
+  `List.brecOn`, a `Fin.rec` leaf fired 1.5 M times), 8% fewer without.
+- *Templates.* A leaf is not a value but a template: the value's shape
+  with every id replaced by what makes it again (MAIN or block terms with
+  their level substitution and the template of their environment, constant
+  heads at level lists, sorts, Nat literals of one word, MAIN literals,
+  projections of the session; at most 256 nodes). Each variable, and each
+  split variable's constructor application, is its slot: the call's
+  argument itself, as the reference holds it at the other occurrences. A
+  rule names no value of the arena, so no region's rollback can cut it and
+  nothing in the region machinery changes. Rules live for the session
+  (block terms, projections and level ids are session facts; a session
+  only moves forward in file order, so every constant a derivation
+  unfolded stays visible) and are never used in scratch declarations.
+- *Firing.* In whnf's loop, a state whose unfolding is not memoized and
+  whose constant has a rule follows the tree: each split brings its slot
+  to whnf and matches a constructor as the recursor's rule does (a Nat
+  literal as `Nat.zero` or `Nat.succ` of the one before, a string literal
+  expanded; the same constructor at the same levels and number of
+  arguments), binding its parameters and fields; the leaf is made with the
+  slots and applied to the arguments past the rule's. A guard that finds
+  no branch lets the state unfold as before. Lazy delta never takes rules
+  (it compares states with the same head by their arguments) and a fired
+  result is not kept as the state's unfolding. Instead, when the loop
+  ends, the states it fired on get its result as their whnf (as milestone
+  52's loop states do, before a rollback or checkpoint), and a state with
+  a whnf memo is answered by it: without this a later lookup at the same
+  index fired again at every step where unfoldings found their memos
+  (3.37 M fires against 0.84 M distinct steps).
+
+Soundness: each guard does what the recursor's rule would do with the
+same major at the same point of the reference's reduction, and a leaf is
+a reduct of the call; nothing is answered without the kernel's own steps
+behind it. The knobs build's `SK_RULE_CHECK=1` compares every fired result
+outside attempts with the state's plain unfolding by `defeq` and panics on
+a difference (inside attempts a `false` may only mean "not within the
+budget"); with `SK_RULE_HOT=1` (every candidate derived at its first
+unfolding) the gates (small tests, 256 vectors in all modes, subset
+checks) and Init, Std, con-leche, etale and Mathlib pass that way.
+`SK_RULES=0` turns rules off, `SK_RULE_TRACE=1` prints each rule.
+
+Results against milestone 52 (release, w4, instructions; data in the
+milestone's report): magma-list-deep-n36 23.0 -> 3.0 G (0.93 -> 0.20 GB),
+n21 1.81 -> 0.38 G, magma-list-pair n21 / n7 -3.7% / -6.1%; Arena's 236
+local tests 53.2 -> 30.6 G, verdicts equal; the CFSG walls -4.0% in all
+(AlphaMc_F2/F3 -61% / -72%, McertP_Ly -34%, c6012/6016/6018weq -27..-34%,
+wordElt_toVec -15%, rowOK -15%, m6c -6%; matG_sU +5%, HNGiant +2.6%; the
+sum of their peaks 71.0 -> 60.9 GB); Init -1.0%, Std -0.6%, con-leche
+-2.4%, etale -0.6%, Mathlib -0.1%, peaks equal or lower.
+
 **Names in heavy declarations.** After a declaration has created 1 M values
 or performed 10 K unfoldings, inference and definitional equality are also
 remembered under *names*. A name represents the substituted, unreduced term
