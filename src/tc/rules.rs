@@ -616,7 +616,8 @@ impl Worker {
                 };
                 match small {
                     Some(k) => self.rule_tn(Tn::Nat(k)),
-                    None if (i as usize) < self.env.lits.len() => self.rule_tn(Tn::Lit(i)),
+                    // MAIN's literals and the blocks' (they live with the session)
+                    None if (i as usize) < self.env.lits.len() || i >= BLIT_BASE => self.rule_tn(Tn::Lit(i)),
                     None => return None,
                 }
             }

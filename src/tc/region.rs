@@ -798,7 +798,7 @@ impl Worker {
                 if done {
                     let v = self.val(id);
                     let rc = match v {
-                        Val::Lit(i) if i >= g + r.wm => Rcp::LitAt(id, i),
+                        Val::Lit(i) if i >= g + r.wm && i < BLIT_BASE => Rcp::LitAt(id, i),
                         Val::Neu { head, spine } if spine != EMPTY => Rcp::Neu(id, head, SpineVec::from_slice(self.sp.args(spine))),
                         _ => Rcp::Val(id, v),
                     };

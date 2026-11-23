@@ -845,6 +845,9 @@ pub struct Worker {
     pub blk: Cols,
     pub blk_side: Side,
     pub wlits: Vec<LitVal>,
+    /// milestone 53 (review): the literals of decoded proof blocks, ids from
+    /// BLIT_BASE; they live with `blk` (never cut by a region)
+    pub blits: Vec<LitVal>,
     /// values with their memos (milestone 15: one record per value)
     pub vals: Slab<Rec>,
     /// spines as hash-consed slices (flags: a projection in it, an argument
@@ -1262,6 +1265,7 @@ pub struct Worker {
 struct Stash {
     blk: Cols,
     blk_side: Side,
+    blits: Vec<LitVal>,
     wlits: Vec<LitVal>,
     vals: Slab<Rec>,
     sp: Spines,
@@ -1299,7 +1303,7 @@ struct Stash {
 
 macro_rules! sess_tables {
     ($m:ident) => {
-        $m!(blk, blk_side, wlits, vals, sp, projs, eloc, eslots, ftab, fv_ty, fv_busy, lam_var, var_slots, shash_memo, term_memo, infer_cache, infer_u, unfold_memo, uenv_map, eq_cache, uses0_memo, block_roots, vmap, env_map, proj_map, nat_map, big_map, prop_ind, canon_memo, stab, ctab, wlit_bytes, uenv_next)
+        $m!(blk, blk_side, blits, wlits, vals, sp, projs, eloc, eslots, ftab, fv_ty, fv_busy, lam_var, var_slots, shash_memo, term_memo, infer_cache, infer_u, unfold_memo, uenv_map, eq_cache, uses0_memo, block_roots, vmap, env_map, proj_map, nat_map, big_map, prop_ind, canon_memo, stab, ctab, wlit_bytes, uenv_next)
     };
 }
 
@@ -1328,6 +1332,7 @@ impl Worker {
             blk,
             blk_side: Side::new(),
             wlits: Vec::new(),
+            blits: Vec::new(),
             vals: Slab::new(slab_cap(VALS_CAP)),
             sp: Spines::new(slab_cap(spines::SPINE_WORDS)),
             projs: Vec::new(),
@@ -1565,6 +1570,7 @@ impl Worker {
             + vb(&self.blk_side.lets)
             + vb(&self.blk_side.lvls)
             + vb(&self.wlits)
+            + vb(&self.blits)
             + vb(&self.vals)
             + self.sp.bytes()
             + vb(&self.projs)
@@ -1771,6 +1777,7 @@ impl Worker {
         clear_vec(&mut self.blk_side.lvls);
         self.blk_side.lvls.push(0);
         clear_vec(&mut self.wlits);
+        clear_vec(&mut self.blits);
         self.wlit_bytes = 0;
         clear_slab(&mut self.vals);
         self.sp.clear(keep_bytes());
@@ -1816,6 +1823,7 @@ impl Worker {
                 self.fv_busy.push(true);
                 self.blk.push(SORT, 0, 0, ZERO, 0, 0);
                 self.wlits.push(LitVal::Nat(BigUint::zero()));
+                self.blits.push(LitVal::Nat(BigUint::zero()));
             }
         }
     }
@@ -2423,7 +2431,13 @@ impl Worker {
 
     pub fn lit(&self, i: u32) -> &LitVal {
         let g = self.env.lits.len() as u32;
-        let l = if i < g { &self.env.lits[i as usize] } else { &self.wlits[(i - g) as usize] };
+        let l = if i < g {
+            &self.env.lits[i as usize]
+        } else if i >= BLIT_BASE {
+            &self.blits[(i - BLIT_BASE) as usize]
+        } else {
+            &self.wlits[(i - g) as usize]
+        };
         debug_assert!(!matches!(l, LitVal::Str(s) if s.starts_with('\u{0}')), "literal {i} read after its region was rolled back");
         l
     }
@@ -3164,6 +3178,7 @@ impl Worker {
             }
             self.wlit_bytes += (n.bits() / 8) as usize;
         }
+        debug_assert!(i < BLIT_BASE, "session literals reach the blocks' ids");
         self.wlits.push(LitVal::Nat(n));
         let v = self.intern(Val::Lit(i))?;
         if let Some(k) = small {
@@ -4987,8 +5002,12 @@ impl Worker {
         let b = env.blocks[bi as usize];
         let base = self.m + self.blk.len() as u32;
         let cols_base = self.m;
-        let lit_base = env.lits.len() as u32;
-        let (blk, side, lits) = (&mut self.blk, &mut self.blk_side, &mut self.wlits);
+        // milestone 53 (review): a block's literals go to `blits`, which
+        // lives as long as `blk`; in `wlits` a block decoded inside a region
+        // lost them at its rollback while `blk` and `block_roots` kept the
+        // terms naming them (a later unfolding read a dead or reused slot)
+        let lit_base = BLIT_BASE;
+        let (blk, side, lits) = (&mut self.blk, &mut self.blk_side, &mut self.blits);
         let r: Result<(), susz::read::Stop<()>> = susz::read::decode_block(env.bytes, &env.st, b, |_k, e| {
             // milestone 19: past a dropped push the children's ids are not
             // nodes: stop (the arena-full decline below)
@@ -9141,6 +9160,10 @@ fn dm_bits(k: usize) -> usize {
 /// an entry of a frame the term never reads (not a value id: `intern`
 /// stops below it)
 pub const HOLE: u32 = PROJ_BIT - 1;
+/// Milestone 53 (review): literal ids of decoded proof blocks (`blits`),
+/// past every id of MAIN's and the session's own literals (`wlits`), which
+/// a region's rollback cuts.
+pub const BLIT_BASE: u32 = 0xC000_0000;
 /// `m_step`'s answer for a side that waits (never a value id)
 const MWAIT: u32 = PROJ_BIT - 2;
 /// milestone 27: ticks between two stack measurements (a power of two

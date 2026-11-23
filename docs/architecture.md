@@ -583,6 +583,20 @@ enclosing rollback decides again by its own marks. Outside regions
 nothing is noted. `SK_LOOP_STATES` (knobs): 0 off, 1 memo lookups only,
 2 on.
 
+**Block literals (milestone 53 review).** A theorem's proof block decoded
+on demand inside a region (`decl_value`, an unfolding in whnf) put its
+literals in `wlits`, which a rollback cuts to the region's mark, while
+`blk` and `block_roots` keep the block for the session: a later unfolding
+of the theorem read a dead slot, or a literal made after the cut in the
+same slot. The block's literals now go to `blits`, ids from `BLIT_BASE`
+(0xC000_0000), which live as `blk` does and are never cut.
+`tests/adv/good_m53_block_literal_region` (`tests/adv-base/m53.lean`: an
+`Acc.rec` on a theorem whose proof holds a literal found nowhere in MAIN)
+was declined under the region gate ("literal 9 read after its region was
+rolled back") and is accepted now. No corpus met it: with `SK_REGION_AT=1`
+Init, Std, con-leche, etale and Arena's 236 tests decode no block with a
+literal inside a region.
+
 `SK_REGION_POISON=1` (knobs) marks the dead ids instead of reusing them;
 release-da asserts on every read of a marked value, environment or
 literal, and `=2` also checks after every rollback that no table names a
