@@ -126,6 +126,10 @@ impl Rules {
         self.tn.clear();
         self.tel.clear();
         self.fstates.clear();
+        // a panic inside a derivation leaves these set (after_panic starts
+        // a new session)
+        self.deriving = false;
+        self.nat_unfolded = false;
     }
     pub(super) fn bytes(&self) -> usize {
         self.state.len() * 16 + self.rules.len() * 8 + self.nodes.len() * 12 + self.branches.len() * 20 + self.tn.len() * 24 + self.tel.len() * 4
@@ -334,7 +338,14 @@ impl Worker {
         let t = self.ticks;
         self.rl.work += t.wrapping_sub(self.rl.last_tick) as u64;
         self.rl.last_tick = t;
-        if self.ground_busy || self.rl.spent > self.rl.work / RULE_SHARE + BUDGET as u64 {
+        // past half of where work is handed up from (`deep_at`) a
+        // derivation does not start: it would only end at Stop::Deep
+        let deep = self.deep_at != 0 && {
+            let x = 0u8;
+            let sp = std::hint::black_box(&x) as *const u8 as usize;
+            self.stack_base.saturating_sub(sp) > self.deep_at / 2 || self.wdepth >= self.deep_cur / 2
+        };
+        if deep || self.ground_busy || self.rl.spent > self.rl.work / RULE_SHARE + BUDGET as u64 {
             // not now: counted again from zero
             self.rl.state.insert(key, Hot::Count(0));
             return Ok(Hot::Count(0));
@@ -358,9 +369,12 @@ impl Worker {
         let root = match r {
             Ok(Some(Some(root))) => Some(root),
             Ok(_) => None,
-            Err(Stop::Reject) | Err(Stop::Decline) if !self.arena_full => {
+            Err(Stop::Reject) | Err(Stop::Decline) | Err(Stop::Deep) if !self.arena_full => {
                 // a step that fails on variables: no rule (the call does
-                // the reference's steps and fails there if it must)
+                // the reference's steps and fails there if it must); work
+                // handed up from too deep is not handed past the
+                // derivation either (it would run outside its budget and
+                // RULE_SHARE): no rule
                 self.argstack.truncate(a0);
                 self.vdepth_to(d0);
                 None
@@ -530,16 +544,20 @@ impl Worker {
             if self.ll_get(llr).len() != self.consts[row as usize].lparams.len() {
                 return Ok(None);
             }
+            // every recursor of the chain, not only the innermost: an outer
+            // K-like or structure recursor reduces without its major brought
+            // to a constructor (`Eq.rec … (Bool.rec h₁ h₂ b)`: K never
+            // forces `b`), and a guard on the inner one would force it
+            if k {
+                return Ok(None);
+            }
+            let Some(&ind) = self.env.rec_major.get(&row) else { return Ok(None) };
+            let irow = self.env.known_row(ind);
+            if irow == NONE || !self.visible(irow) || self.structure_like(irow) {
+                return Ok(None);
+            }
             let m = self.whnf(elims[mi])?;
             if let Val::Neu { head: Head::FVar(i), spine: EMPTY } = self.val(m) {
-                if k {
-                    return Ok(None);
-                }
-                let Some(&ind) = self.env.rec_major.get(&row) else { return Ok(None) };
-                let irow = self.env.known_row(ind);
-                if irow == NONE || !self.visible(irow) || self.structure_like(irow) {
-                    return Ok(None);
-                }
                 let s = slots.iter().position(|s| s.fv == i && s.split.is_none());
                 return Ok(s.map(|s| (s, row, llr)));
             }

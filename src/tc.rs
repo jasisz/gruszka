@@ -2135,8 +2135,10 @@ impl Worker {
     /// is nearer, that stop stays, and a `Budget` it raises is not this
     /// attempt's: it goes on up to the attempt it belongs to. Every caller
     /// decides first whether it opens an attempt inside another one (all
-    /// of them today: no, they run unbudgeted under the outer stop or
-    /// skip their shortcut).
+    /// of them but one: no, they run unbudgeted under the outer stop or
+    /// skip their shortcut; milestone 53's derivation, `rule_derive`, is
+    /// opened inside whatever attempt is running, its own budget kept
+    /// when it is the nearer stop).
     fn attempt<T>(&mut self, kind: Att, budget: u32, f: impl FnOnce(&mut Self) -> R<T>) -> R<Option<T>> {
         let t0 = self.ticks;
         let d0 = self.vdepth;

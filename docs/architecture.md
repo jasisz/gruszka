@@ -802,15 +802,18 @@ to `r` with the `ai` put in.
   one of the variables, the variable is split into each constructor
   applied to fresh variables and the same is done again: at most 3 splits
   deep, 8 constructors, 64 forms. K-like recursors and structures are not
-  split on (they reach their rule without bringing the major to a
-  constructor, and a guard would bring it there; Lean's structure eta
-  before the major is reduced, lean4#15351). A derivation runs as an
+  split on, nor is a variable under one (`Eq.rec … (Bool.rec h₁ h₂ b)`:
+  any recursor of the chain that is K-like or a structure's ends the
+  search), since they reach their rule without bringing the major to a
+  constructor and a guard would bring it there (K never forces `b`;
+  Lean's structure eta before the major is reduced, lean4#15351). A derivation runs as an
   attempt of 2^16 ticks; it fails (no rule, `Never`) at that budget, at a
-  reject or decline met on variables, or when it unfolds a Nat operation
-  the kernel computes on literals (with literals the call would be
-  computed, not unfolded). A stop that is not its own (an enclosing
-  attempt's, work handed up, cancellation) goes on up and the count starts
-  again. All derivations of a worker take at most an eighth of its ticks
+  reject or decline met on variables, at work handed up from too deep
+  (`Stop::Deep` is not passed past it: it would run outside the budget),
+  or when it unfolds a Nat operation the kernel computes on literals
+  (with literals the call would be computed, not unfolded). None starts
+  past half of `deep_at`. A stop that is not its own (an enclosing
+  attempt's, cancellation) goes on up and the count starts again. All derivations of a worker take at most an eighth of its ticks
   (`RULE_SHARE`): past that a hot constant waits.
 - *Rules that save* (Pestka's RulesThatSave): a rule is kept only when its
   derivation unfolded more than once per form it met (a definition that is
