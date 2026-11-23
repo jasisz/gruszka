@@ -556,6 +556,33 @@ region is now moved out of its dead slot at the cut (`Rcp::LitAt`). In
 McertP_Ly's register file of 150 000-bit numbers this copying was 57% of
 the time: the slice now checks in 568 s at 4.4 GB (M39: past 900 s).
 
+**Loop states (milestone 52).** A whnf loop passes through states
+(each step's `whnf_core`, before the next unfolding), and all of them
+reduce by head steps to the loop's result. Arena's magma-list-deep-n36
+looks 5184 times into a list literal of 1296 entries, at 1296 different
+indices. Within a session hash-consing shares a repeated walk (the states
+after the index became a literal are the same values), but each lookup's
+walk was a region whose result is one literal: the rollback dropped the
+walk, and the next lookup at that index walked it again (2.24 M steps
+instead of 0.84 M; 57 G, regions off 22 G). Those states are made only of
+older values (the list, its `below` tower, the constants) and small Nat
+literals, so a later lookup makes them again with the same keys. Inside a
+region a loop now notes such states (made in the region, every part older
+than it or a Nat literal of one word: a kept copy of a literal is found
+again by its number); when the loop ends, the ones that save work get the
+result as their whnf memo and are kept by a rollback with it, as closed
+thunks are, within the region's copy budget, first states first. A loop
+that meets a state with a memo stops there. A state saves work when the
+loop reached it at least `GHOST_TICKS` before its end (a rollback's own
+bookkeeping); of those only one per halving of the work left, or one with
+older parts than the last kept: the first state made only of old parts is
+where a repeated lookup comes in, and halving bounds a long loop's copies
+by the logarithm of its length. A result that is a big literal is not
+memoized (CFSG's rowOK loops end in 120100-bit numbers: +0.7 GB). An
+enclosing rollback decides again by its own marks. Outside regions
+nothing is noted. `SK_LOOP_STATES` (knobs): 0 off, 1 memo lookups only,
+2 on.
+
 `SK_REGION_POISON=1` (knobs) marks the dead ids instead of reusing them;
 release-da asserts on every read of a marked value, environment or
 literal, and `=2` also checks after every rollback that no table names a

@@ -86,6 +86,8 @@ pub(super) struct Reg {
     /// past them are this region's (their roots were made in it)
     pm: usize,
     dm: usize,
+    /// milestone 52: length of `wfront` when it opened
+    fm: usize,
     spg: u32,
     ftg: u32,
     prev: u32,
@@ -195,6 +197,7 @@ impl Worker {
             pk: std::mem::take(&mut self.reg_kmax),
             pm: self.pin_ids.len(),
             dm: self.reg_done.len(),
+            fm: self.wfront.len(),
             vm: self.vals.len() as u32,
             em: self.eloc.len() as u32,
             esm: self.eslots.len() as u32,
@@ -268,6 +271,7 @@ impl Worker {
             self.undo.clear();
             self.reg_done.clear();
             self.pin_ids.clear();
+            self.wfront.clear();
         }
     }
     /// Milestone 37: the region `r` with root `v` closed (kept or rolled
@@ -318,6 +322,7 @@ impl Worker {
         clear_table(&mut self.pinned);
         clear_vec(&mut self.reg_done);
         clear_vec(&mut self.pin_ids);
+        clear_vec(&mut self.wfront);
     }
 
     /// Milestone 37: a key of `v` by content: values older than any
@@ -664,6 +669,39 @@ impl Worker {
                 if w >= r.vm && !seen_v.contains(&w) && !self.reach_root(r, w, lim, &mut seen_v, &mut seen_e, &mut out) {
                     continue;
                 }
+                budget = budget.saturating_sub(out.len() - n0);
+                self.reg_pairs.push((d, w));
+            }
+        }
+        // milestone 52: the states of whnf loops made of older parts keep
+        // their memos, the loop's result (`wstates_settle`): a later loop
+        // makes the same state again through hash-consing and stops there.
+        // Lookups into one list literal at the same index from different
+        // places (magma-list-deep-n36: 5184 lookups, 1296 indices) walked
+        // the list again after every rollback: 2.6 times the steps.
+        // Within the region's budget, first states first; past it the
+        // rest go.
+        for i in r.fm..self.wfront.len() {
+            let d = self.wfront[i];
+            if d < r.vm || budget == 0 {
+                continue;
+            }
+            let w = self.memo_at(d).whnf;
+            if w == NONE || w == d || w >= (1 << 28) {
+                continue;
+            }
+            let front = match self.vals[d as usize].v {
+                Val::Neu { head: Head::FVar(i), .. } => i < r.fvm && self.made_of_older(d, r.vm),
+                Val::Neu { .. } => self.made_of_older(d, r.vm),
+                _ => false,
+            };
+            if !front || (self.wlit_bytes > self.reg_lit_keep && self.big_lit(w)) {
+                continue;
+            }
+            let n0 = out.len();
+            if (seen_v.contains(&d) || self.reach_root(r, d, budget, &mut seen_v, &mut seen_e, &mut out))
+                && (w < r.vm || seen_v.contains(&w) || self.reach_root(r, w, budget, &mut seen_v, &mut seen_e, &mut out))
+            {
                 budget = budget.saturating_sub(out.len() - n0);
                 self.reg_pairs.push((d, w));
             }
@@ -1062,6 +1100,7 @@ impl Worker {
             g.pin = r.pin;
             g.pm = r.pm;
             g.dm = r.dm;
+            g.fm = r.fm;
             self.reg_ckpt_new = Some(g);
         }
         self.cgen_bump();
@@ -1209,6 +1248,17 @@ impl Worker {
                 }
             }
             self.pin_ids.truncate(j);
+            // milestone 52: kept loop states live as their copies
+            let mut j = r.fm;
+            for i in r.fm..self.wfront.len() {
+                let x = self.wfront[i];
+                let y = if x >= r.vm { mv.get(&x).copied() } else { Some(x) };
+                if let Some(y) = y {
+                    self.wfront[j] = y;
+                    j += 1;
+                }
+            }
+            self.wfront.truncate(j);
         }
         if ok {
             for (d, w) in std::mem::take(&mut self.reg_pairs) {

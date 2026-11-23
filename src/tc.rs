@@ -1216,6 +1216,17 @@ pub struct Worker {
     /// roots of pinned regions an enclosing rollback must keep, with their
     /// whnf memos
     pin_ids: Vec<V>,
+    /// milestone 52: states of the whnf loops in progress made of older
+    /// parts (each loop's from its call's base up; with the ticks when
+    /// reached and their youngest part), settled when the loop ends
+    /// (`wstates_settle`)
+    wstates: Vec<(V, u32, u32)>,
+    /// milestone 52: loop states of the open regions made of older parts,
+    /// with their whnf memos: a rollback keeps them (`reg_reach`)
+    wfront: Vec<V>,
+    /// milestone 52, SK_LOOP_STATES (knobs): 0 off, 1 memo lookups only,
+    /// 2 on (default)
+    loop_states: u8,
     /// SK_REGION_PIN (knobs): 0 off, 1 on (default)
     reg_pin: bool,
     /// milestone 36: `args_refuted` on (SK_ARGS_REFUTE=0 in knobs: off)
@@ -1468,6 +1479,9 @@ impl Worker {
             ghost_ticks: if KNOBS { std::env::var("SK_GHOST_TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(region::GHOST_TICKS) } else { region::GHOST_TICKS },
             reg_done: Vec::new(),
             pin_ids: Vec::new(),
+            wstates: Vec::new(),
+            wfront: Vec::new(),
+            loop_states: if KNOBS { std::env::var("SK_LOOP_STATES").ok().and_then(|s| s.parse().ok()).unwrap_or(2) } else { 2 },
             reg_pin: REGION_PIN && !(KNOBS && std::env::var("SK_REGION_PIN").is_ok_and(|s| s == "0")),
             reg_logk: if KNOBS { std::env::var("SK_REGION_LOGK").ok().and_then(|s| s.parse().ok()).unwrap_or(REGION_LOGK) } else { REGION_LOGK },
             reg_kmax: 0,
@@ -1826,6 +1840,7 @@ impl Worker {
         self.sess_last = d;
         self.sess_len += 1;
         self.argstack.clear();
+        self.wstates.clear();
         // milestone 38: the hand-up bound starts over with each declaration
         // (and no whnf is running: a panic may have left the count)
         self.deep_cur = self.deep_n;
@@ -5228,19 +5243,26 @@ impl Worker {
         }
         // milestone 36: past `reg_at` values the call is a region
         // (SK_REGION_LATEGATE=1, knobs, gates: every region opens late)
+        let base = self.wstates.len();
         let r = if self.reg_wanted() && !self.reg_lategate {
-            self.whnf_region(v, v)?
+            self.whnf_region(v, v, base)
         } else {
-            match self.whnf_loop(v)? {
-                Ok(r) => r,
+            match self.whnf_loop(v) {
+                Ok(Ok(r)) => {
+                    self.wstates_settle(base, r);
+                    Ok(r)
+                }
                 // milestone 38: the session passed `reg_at` while this
                 // loop ran: the rest of it is a region (a late region)
-                Err(t) => {
+                Ok(Err(t)) => {
                     self.stats.late += 1;
-                    self.whnf_region(v, t)?
+                    self.whnf_region(v, t, base)
                 }
+                Err(e) => Err(e),
             }
         };
+        self.wstates.truncate(base);
+        let r = r?;
         self.memo_w(v).whnf = r;
         // only real steps: a value in normal form found again under another
         // id with the same name must come back as itself, or a caller that
@@ -5252,7 +5274,7 @@ impl Worker {
     /// at `v`'s call, or late: at a step of the loop, which keeps only its
     /// current term from one step to the next, as at a checkpoint).
     #[inline(never)]
-    fn whnf_region(&mut self, v: V, t: V) -> R<V> {
+    fn whnf_region(&mut self, v: V, t: V, base: usize) -> R<V> {
         Ok({
             let mut g = self.reg_open(v);
             // milestone 37: the loop's current term is all it keeps from
@@ -5269,6 +5291,9 @@ impl Worker {
                         Ok(c) => c,
                         Err(cur) => return Ok(Err(cur)),
                     };
+                    if let Some(w) = self.wstate(c) {
+                        return Ok(Ok(w));
+                    }
                     if let Some(n) = self.reduce_nat(c)? {
                         return Ok(Ok(n));
                     }
@@ -5278,10 +5303,15 @@ impl Worker {
                     })
                 })();
                 match step {
-                    Ok(Ok(r)) => break self.reg_close(&g, v, r)?,
+                    Ok(Ok(r)) => {
+                        self.wstates_settle(base, r);
+                        break self.reg_close(&g, v, r)?;
+                    }
                     Ok(Err(u)) => {
                         t = u;
                         if self.reg_ckpt && self.reg_due(&g) {
+                            // the states so far may die at the checkpoint
+                            self.wstates.truncate(base);
                             (t, g) = self.reg_checkpoint(&g, v, t)?;
                         }
                     }
@@ -5303,6 +5333,99 @@ impl Worker {
         })
     }
 
+    /// Milestone 52: a state `c` of a whnf loop (a value whose
+    /// `whnf_core` it is): its whnf when known. Every state a loop passes
+    /// through reduces by head steps to the loop's result, so they all have
+    /// that result as their whnf; a later loop that comes to one of them
+    /// (two lookups into a list at the same index, the same after their
+    /// first steps) has its answer there. Outside regions hash-consing and
+    /// the step memos already share a repeated walk (no lookup there);
+    /// inside one, a state
+    /// that survives the rollback is what matters: one made in the region
+    /// of older parts only, which a later call makes again with the same
+    /// key. Such states are noted for `wstates_settle`.
+    #[inline(always)]
+    fn wstate(&mut self, c: V) -> Option<V> {
+        if self.reg_vm == 0 || self.loop_states == 0 || !matches!(self.val(c), Val::Neu { .. }) {
+            return None;
+        }
+        let m = self.memo_at(c).whnf;
+        if m != NONE {
+            return Some(m);
+        }
+        if c >= self.reg_vm {
+            if let Some(age) = self.youngest_part(c) {
+                if age < self.reg_vm {
+                    self.wstates.push((c, self.ticks, age));
+                }
+            }
+        }
+        None
+    }
+    /// Milestone 52: the loop whose states are noted past `base` ended at
+    /// `r`. A state gets `r` as its whnf memo and goes to `wfront`, so that
+    /// a rollback keeps it with its memo (`reg_reach`), when it saves work:
+    /// reached at least `ghost_ticks` before the loop's end (what a
+    /// rollback's bookkeeping costs), and of those one per halving of the
+    /// work left, or one with older parts than the last kept (the first
+    /// state made only of old parts is where a repeated call comes in). A
+    /// long loop keeps a logarithmic number of states.
+    fn wstates_settle(&mut self, base: usize, r: V) {
+        // a memo keeps its result as long as the state lives: not a big
+        // literal (CFSG's rowOK loops end in 120100-bit numbers; their
+        // states' memos held 0.7 GB more)
+        if self.loop_states < 2 || (matches!(self.val(r), Val::Lit(_)) && !self.is_small_nat(r)) {
+            self.wstates.truncate(base);
+            return;
+        }
+        let (mut last, mut last_age) = (u32::MAX, u32::MAX);
+        for i in base..self.wstates.len() {
+            let (c, t, age) = self.wstates[i];
+            if c == r || self.memo_at(c).whnf != NONE {
+                continue;
+            }
+            let rem = self.ticks.wrapping_sub(t);
+            if rem >= self.ghost_ticks && (rem <= last / 2 || age < last_age) {
+                self.memo_w(c).whnf = r;
+                self.wfront.push(c);
+                (last, last_age) = (rem, age);
+            }
+        }
+        self.wstates.truncate(base);
+    }
+    /// Milestone 52: a neutral value whose head and arguments are all
+    /// older than `vm` (made before the region that opened at `vm`) or Nat
+    /// literals (`youngest_part`).
+    pub(super) fn made_of_older(&self, c: V, vm: u32) -> bool {
+        self.youngest_part(c).is_some_and(|y| y < vm)
+    }
+    /// Milestone 52: the youngest value a neutral value is made of (its
+    /// stuck head, its arguments); 0 for a constant alone, None for any
+    /// other value. A copy kept by a rollback lives as long as its parts.
+    /// A small Nat literal counts as 0: a rollback that keeps the value
+    /// copies it, and every later literal of that number is found as the copy
+    /// (literals are interned by number), so the value is made again with
+    /// the same key (a walk down a list makes the index literals as it goes).
+    fn youngest_part(&self, c: V) -> Option<u32> {
+        let Val::Neu { head, spine } = self.vals[c as usize].v else { return None };
+        let mut y = match head {
+            Head::Stuck(x) => x,
+            _ => 0,
+        };
+        for &a in self.sp.args(spine) {
+            if a & PROJ_BIT == 0 && a > y && !self.is_small_nat(a) {
+                y = a;
+            }
+        }
+        Some(y)
+    }
+    /// A Nat literal of one machine word (a big one kept by a copy would
+    /// hold its bytes: CFSG's rowOK loops over 120100-bit numbers).
+    #[inline(always)]
+    fn is_small_nat(&self, a: V) -> bool {
+        matches!(self.vals[a as usize].v, Val::Lit(i) if matches!(self.lit(i), LitVal::Nat(n) if n.bits() <= 64))
+    }
+
     /// The whnf loop without a region: Ok(result), or Err(current term)
     /// once the session wants regions (milestone 38: a loop that began
     /// before the session passed `reg_at` gave nothing back until it
@@ -5317,6 +5440,9 @@ impl Worker {
                 Ok(c) => c,
                 Err(cur) => break Err(cur),
             };
+            if let Some(w) = self.wstate(c) {
+                break Ok(w);
+            }
             if let Some(n) = self.reduce_nat(c)? {
                 break Ok(n);
             }
