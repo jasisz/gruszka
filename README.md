@@ -14,6 +14,7 @@
   <a href="#what-it-checks">What it checks</a> ·
   <a href="#a-few-things-inside">A few things inside</a> ·
   <a href="#how-fast">How fast</a> ·
+  <a href="#large-developments">Large developments</a> ·
   <a href="docs/architecture.md">Inside the kernel</a>
 </p>
 
@@ -37,6 +38,9 @@ and Susz for food.
 
 It checks **all of mathlib** (702,040 declarations) in under nine seconds on
 eight cores, in under 3 GB. [How fast →](#how-fast)
+It has also checked whole exports of CFSG (39.7 million declarations, in
+3 h 7 min on 32 workers), the Riemann hypothesis claim and FLT.
+[Large developments →](#large-developments)
 
 *Gruszka* is Polish for a pear. Dried pears are a classic *susz*, a pear has
 *pestki* (pips) inside, and pear trees get rust. The Polish phrase *gruszki
@@ -242,6 +246,71 @@ instructions on all twelve cores for mathlib, and 37 s for the FLT export.
 On the [Lean Kernel Arena](https://arena.lean-lang.org)'s x86 runner, with
 the conversion included and four workers, mathlib takes 25.7 s, 2.47 GB
 and 445 G instructions.
+
+## Large developments
+
+Whole exports checked on AWS. Wall time and peak memory
+(maximum resident set size) are from GNU `time -v`; each row is one run
+unless noted.
+
+| Development | Declarations | Machine, workers | Wall | Peak memory | Verdict | Date | Gruszka |
+| :--- | ---: | :--- | ---: | ---: | :--- | :--- | :--- |
+| CFSG (`cfsg-5437cdc`) | 39,656,013 | r7a.8xlarge (32 vCPU), 32 | 3 h 7 min 25 s | 168.7 GiB | accepted | 2026-11-21 | 0.1.2 source without the Nat layer (9eeff7b), PGO |
+| CFSG (`cfsg-5437cdc`) | 39,656,013 | r7a.8xlarge (32 vCPU), 32 | 3 h 11 min 28 s | 183.7 GiB | accepted | 2026-11-21 | 0.1.1, PGO |
+| RH, MIT export (`5ea74b91…`) | 1,468,418 | r7a.16xlarge (64 vCPU), 32 | 2 min 3 s | 27.9 GiB | accepted | 2026-11-21 | 0.1.1, PGO |
+| RH, olean-export 0.7.0 from independently built oleans | 1,468,418 | r7a.16xlarge (64 vCPU), 32 | 3 min 13 s | 26.1 GiB | accepted | 2026-11-22 | 0.1.2, crates.io |
+| FLT (whole environment) | 1,710,994 | c7a.metal-48xl, 16 pinned cores, 16 | 2 min 9 s | 26.4 GiB | accepted | 2026-11-16 | 090b7f9, PGO |
+
+- CFSG: 9eeff7b differs from 0.1.2 only by `src/nat.rs`, the layer
+  through which Nat literals reach the bignum library. In both runs the
+  classification theorem uses the axioms `propext`, `Quot.sound` and
+  `Classical.choice` (`susz axioms`).
+- RH, olean-export: the same Gruszka built with glibc malloc instead of
+  mimalloc (`--no-default-features`) took 3 min 32 s and 25.6 GiB. The
+  export has the same kernel digest (`susz digest --kernel`) as the MIT
+  export. This row is a plain `cargo install`, not a PGO build.
+- FLT: median of three runs, made while other kernels ran on the
+  machine's other cores. Converting the ndjson export with `susz pack` with 16
+  threads took a further 16 s (median of three).
+
+RH, MIT export, Gruszka 0.1.1 (PGO), by number of workers (r7a.16xlarge,
+64 vCPU, up to 64 workers; r7a.48xlarge, 192 vCPU, above; 2026-11-21):
+
+| Workers | 4 | 8 | 16 | 32 | 64 | 96 | 128 | 192 |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Wall | 7:26 | 4:00 | 3:13 | 2:03 | 1:39 | 1:31 | 1:44 | 1:38 |
+| Speed-up over 4 workers | 1.0× | 1.9× | 2.3× | 3.6× | 4.5× | 4.9× | 4.3× | 4.6× |
+| Peak memory (GiB) | 20.2 | 22.6 | 23.4 | 27.9 | 31.0 | 36.5 | 38.7 | 42.7 |
+
+FLT, Gruszka 090b7f9 (PGO), on c7a.metal-48xl with the workers pinned to
+as many cores and the rest of the machine idle; 2026-11-16:
+
+| Workers | 4 | 8 | 16 | 32 | 64 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| Wall | 6:30 | 3:53 | 2:07 | 1:12 | 0:47 |
+| Speed-up over 4 workers | 1.0× | 1.7× | 3.1× | 5.4× | 8.3× |
+| Peak memory (GiB) | 18.7 | 21.1 | 25.2 | 31.5 | 42.6 |
+
+At 96 and more workers this build declined FLT ("the worker's block arena
+is full"); an unreleased build of 2026-11-17 checked it at 96 to 192 workers
+in under a minute.
+
+On a laptop (Apple M2 Pro, 12 cores, 32 GB), Gruszka 0.1.1 without PGO,
+8 workers, 2026-11-23, with other work running on the machine:
+
+| Development | Wall | Peak memory footprint (GiB) | Verdict |
+| :--- | ---: | ---: | :--- |
+| Mathlib | 11.7 s | 2.4 | accepted |
+| FLT (whole environment) | 3:09 | 11.2 | accepted |
+
+macOS reports the peak memory footprint, which counts compressed pages;
+it is not directly comparable with the resident set sizes above.
+
+The AWS builds used `-C target-cpu=native`; PGO means `scripts/build-pgo.sh`
+trained on Init. The CFSG, RH (MIT) and FLT Susz files are in the Hugging
+Face dataset [jasisz/susz](https://huggingface.co/datasets/jasisz/susz)
+under `susz-0.1/`; `gruszka FILE N`, with the row's worker count as N,
+repeats a row.
 
 ## Working on Gruszka
 
