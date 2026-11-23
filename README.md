@@ -249,68 +249,70 @@ and 445 G instructions.
 
 ## Large developments
 
-Whole exports checked on AWS. Wall time and peak memory
-(maximum resident set size) are from GNU `time -v`; each row is one run
-unless noted.
+Whole exports checked on AWS (AMD EPYC 9R14). Wall time and peak memory
+(maximum resident set size) are from GNU `time -v`.
 
-| Development | Declarations | Machine, workers | Wall | Peak memory | Verdict | Date | Gruszka |
-| :--- | ---: | :--- | ---: | ---: | :--- | :--- | :--- |
-| CFSG (`cfsg-5437cdc`) | 39,656,013 | r7a.8xlarge (32 vCPU), 32 | 3 h 7 min 25 s | 168.7 GiB | accepted | 2026-11-21 | 0.1.2 source without the Nat layer (9eeff7b), PGO |
-| CFSG (`cfsg-5437cdc`) | 39,656,013 | r7a.8xlarge (32 vCPU), 32 | 3 h 11 min 28 s | 183.7 GiB | accepted | 2026-11-21 | 0.1.1, PGO |
-| RH, MIT export (`5ea74b91…`) | 1,468,418 | r7a.16xlarge (64 vCPU), 32 | 2 min 3 s | 27.9 GiB | accepted | 2026-11-21 | 0.1.1, PGO |
-| RH, olean-export 0.7.0 from independently built oleans | 1,468,418 | r7a.16xlarge (64 vCPU), 32 | 3 min 13 s | 26.1 GiB | accepted | 2026-11-22 | 0.1.2, crates.io |
-| FLT (whole environment) | 1,710,994 | c7a.metal-48xl, 16 pinned cores, 16 | 2 min 9 s | 26.4 GiB | accepted | 2026-11-16 | 090b7f9, PGO |
+| Development | Declarations | Workers | Wall | Peak memory |
+| :--- | ---: | ---: | ---: | ---: |
+| CFSG | 39,656,013 | 32 | 3 h 7 min | 169 GiB |
+| Riemann hypothesis claim | 1,468,418 | 32 | 2 min 3 s | 28 GiB |
+| FLT | 1,710,994 | 16 | 2 min 9 s | 26 GiB |
 
-- CFSG: 9eeff7b differs from 0.1.2 only by `src/nat.rs`, the layer
-  through which Nat literals reach the bignum library. In both runs the
-  classification theorem uses the axioms `propext`, `Quot.sound` and
-  `Classical.choice` (`susz axioms`).
-- RH, olean-export: the same Gruszka built with glibc malloc instead of
-  mimalloc (`--no-default-features`) took 3 min 32 s and 25.6 GiB. The
-  export has the same kernel digest (`susz digest --kernel`) as the MIT
-  export. This row is a plain `cargo install`, not a PGO build.
-- FLT: median of three runs, made while other kernels ran on the
-  machine's other cores. Converting the ndjson export with `susz pack` with 16
-  threads took a further 16 s (median of three).
+All three are accepted. In more detail:
 
-RH, MIT export, Gruszka 0.1.1 (PGO), by number of workers (r7a.16xlarge,
-64 vCPU, up to 64 workers; r7a.48xlarge, 192 vCPU, above; 2026-11-21):
+- **CFSG** (`cfsg-5437cdc`), r7a.8xlarge (32 vCPU), 2026-11-21: 3:07:25,
+  168.7 GiB, with the 0.1.2 source without `src/nat.rs`, the layer through
+  which Nat literals reach the bignum library (9eeff7b, PGO). Gruszka 0.1.1
+  (PGO) on the same machine: 3:11:28, 183.7 GiB. The classification theorem
+  uses the axioms `propext`, `Quot.sound` and `Classical.choice`
+  (`susz axioms`).
+- **Riemann hypothesis claim**, MIT export (`5ea74b91…`), r7a.16xlarge
+  (64 vCPU), Gruszka 0.1.1 (PGO), 2026-11-21: 2:03, 27.9 GiB. An export
+  made by olean-export 0.7.0 from independently built oleans, with the same
+  kernel digest (`susz digest --kernel`), took 3:13 and 26.1 GiB with
+  Gruszka 0.1.2 from crates.io (no PGO), and 3:32 and 25.6 GiB with the
+  same Gruszka built with glibc malloc instead of mimalloc
+  (`--no-default-features`), 2026-11-22.
+- **FLT**, whole environment, c7a.metal-48xl with 16 pinned cores,
+  Gruszka 090b7f9 (PGO), 2026-11-16: median of three runs made while other
+  kernels ran on the machine's other cores. Converting the ndjson export
+  with `susz pack` on 16 threads took a further 16 s.
 
-| Workers | 4 | 8 | 16 | 32 | 64 | 96 | 128 | 192 |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Wall | 7:26 | 4:00 | 3:13 | 2:03 | 1:39 | 1:31 | 1:44 | 1:38 |
-| Speed-up over 4 workers | 1.0× | 1.9× | 2.3× | 3.6× | 4.5× | 4.9× | 4.3× | 4.6× |
-| Peak memory (GiB) | 20.2 | 22.6 | 23.4 | 27.9 | 31.0 | 36.5 | 38.7 | 42.7 |
+By number of workers (Gruszka 0.1.1 for RH, on r7a.16xlarge up to 64
+workers and r7a.48xlarge above; 090b7f9 for FLT, workers pinned to as many
+cores, the rest of the machine idle):
 
-FLT, Gruszka 090b7f9 (PGO), on c7a.metal-48xl with the workers pinned to
-as many cores and the rest of the machine idle; 2026-11-16:
+| Workers | RH wall | RH speed-up | RH memory | FLT wall | FLT speed-up | FLT memory |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 7:26 | 1.0× | 20 GiB | 6:30 | 1.0× | 19 GiB |
+| 8 | 4:00 | 1.9× | 23 GiB | 3:53 | 1.7× | 21 GiB |
+| 16 | 3:13 | 2.3× | 23 GiB | 2:07 | 3.1× | 25 GiB |
+| 32 | 2:03 | 3.6× | 28 GiB | 1:12 | 5.4× | 32 GiB |
+| 64 | 1:39 | 4.5× | 31 GiB | 0:47 | 8.3× | 43 GiB |
+| 96 | 1:31 | 4.9× | 37 GiB | | | |
+| 128 | 1:44 | 4.3× | 39 GiB | | | |
+| 192 | 1:38 | 4.6× | 43 GiB | | | |
 
-| Workers | 4 | 8 | 16 | 32 | 64 |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| Wall | 6:30 | 3:53 | 2:07 | 1:12 | 0:47 |
-| Speed-up over 4 workers | 1.0× | 1.7× | 3.1× | 5.4× | 8.3× |
-| Peak memory (GiB) | 18.7 | 21.1 | 25.2 | 31.5 | 42.6 |
+At 96 and more workers the FLT build declined ("the worker's block arena
+is full"); an unreleased build of 2026-11-17 checked FLT at 96 to 192
+workers in under a minute.
 
-At 96 and more workers this build declined FLT ("the worker's block arena
-is full"); an unreleased build of 2026-11-17 checked it at 96 to 192 workers
-in under a minute.
+On a laptop (Apple M2 Pro, 32 GB), Gruszka 0.1.1 without PGO, 8 workers,
+with other work running, 2026-11-23:
 
-On a laptop (Apple M2 Pro, 12 cores, 32 GB), Gruszka 0.1.1 without PGO,
-8 workers, 2026-11-23, with other work running on the machine:
-
-| Development | Wall | Peak memory footprint (GiB) | Verdict |
-| :--- | ---: | ---: | :--- |
-| Mathlib | 11.7 s | 2.4 | accepted |
-| FLT (whole environment) | 3:09 | 11.2 | accepted |
+| Development | Wall | Peak memory footprint |
+| :--- | ---: | ---: |
+| Mathlib | 11.7 s | 2.4 GiB |
+| FLT | 3 min 9 s | 11.2 GiB |
 
 macOS reports the peak memory footprint, which counts compressed pages;
 it is not directly comparable with the resident set sizes above.
 
-The AWS builds used `-C target-cpu=native`; PGO means `scripts/build-pgo.sh`
-trained on Init. The CFSG, RH (MIT) and FLT Susz files are in the Hugging
-Face dataset [jasisz/susz](https://huggingface.co/datasets/jasisz/susz)
-under `susz-0.1/`; `gruszka FILE N`, with the row's worker count as N,
-repeats a row.
+The AWS builds used `-C target-cpu=native`; PGO means
+`scripts/build-pgo.sh` trained on Init. The CFSG, RH (MIT) and FLT Susz
+files are in the Hugging Face dataset
+[jasisz/susz](https://huggingface.co/datasets/jasisz/susz) under
+`susz-0.1/`; `gruszka FILE N` with N workers repeats a run.
 
 ## Working on Gruszka
 
