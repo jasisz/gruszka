@@ -4296,6 +4296,54 @@ impl Worker {
         r
     }
 
+    /// Milestone 59: `Nat.land (Nat.shiftRight x k) (2^w - 1)` (op 8) and
+    /// `Nat.mod (Nat.shiftRight x k) 2^w` (op 4), the shift unforced (an
+    /// application of the kernel's shiftRight row), on literals `x`, `k`:
+    /// bits `k .. k + w` of `x` straight from its digits, without `x >>> k`
+    /// (a copy of the whole number). The operands are worked out in the
+    /// plain path's order (the shift's, then the mask's); anything else is
+    /// the plain path's.
+    fn nat_bits_of_shift(&mut self, op: usize, a0: V, b0: V) -> R<Option<V>> {
+        const SHIFT_RIGHT: u8 = 13; // 1 + index of shiftRight in NAT_OPS
+        let p = self.force(a0)?;
+        let Some((row, _, sp)) = self.const_head(p) else { return Ok(None) };
+        if sp == EMPTY || self.env.nat_op[row as usize] != SHIFT_RIGHT {
+            return Ok(None);
+        }
+        let Some(sa) = self.app_args(sp) else { return Ok(None) };
+        if sa.len() != 2 {
+            return Ok(None);
+        }
+        let (s0, s1) = (sa[0], sa[1]);
+        let x = self.whnf(s0)?;
+        if self.nat_ref(x).is_none() {
+            return Ok(None);
+        }
+        let kv = self.whnf(s1)?;
+        let Some(k) = self.nat_ref(kv).and_then(|k| k.to_u64()) else { return Ok(None) };
+        let m = self.whnf(b0)?;
+        let Some(mv) = self.nat_ref(m) else { return Ok(None) };
+        let w = if op == 8 {
+            let w = mv.trailing_ones();
+            if w != mv.bits() {
+                return Ok(None);
+            }
+            w
+        } else {
+            match mv.trailing_zeros() {
+                Some(t) if t + 1 == mv.bits() => t,
+                _ => return Ok(None),
+            }
+        };
+        let r = ground::nat_bits(self.nat_ref(x).unwrap(), k, w);
+        if KNOBS && nat_check() {
+            let xs = self.nat_ref(x).unwrap() >> k as usize;
+            let Ok(ground::NatR::N(e)) = ground::nat_fold(op, &xs, self.nat_ref(m).unwrap()) else { panic!("SK_NAT_CHECK: nat_bits") };
+            assert!(r == e, "SK_NAT_CHECK: nat_bits");
+        }
+        Ok(Some(self.mk_nat(r)?))
+    }
+
     fn reduce_nat(&mut self, v: V) -> R<Option<V>> {
         let Some((row, _, spine)) = self.const_head(v) else { return Ok(None) };
         if spine == EMPTY || self.env.nat_op[row as usize] == 0 {
@@ -4339,6 +4387,12 @@ impl Worker {
         } else {
             false
         };
+        // milestone 59: bits of a shifted literal, from its digits
+        if (op == 4 || op == 8)
+            && let Some(r) = self.nat_bits_of_shift(op, args[0], args[1])?
+        {
+            return Ok(Some(r));
+        }
         #[cfg(feature = "cnt")]
         let c0 = crate::natcnt::counts();
         let a = self.whnf(args[0])?;
@@ -4370,6 +4424,18 @@ impl Worker {
         // two copies of up to tens of KB per operation on CFSG's bit-sliced
         // tables)
         let (Some(x), Some(y)) = (self.nat_ref(a), self.nat_ref(b)) else { return Ok(None) };
+        // milestone 59: an operand that is the result, as it is (a literal:
+        // `Nat.zero` would come back as itself, not as the literal 0)
+        if let Some(i) = ground::nat_ident(op, x, y) {
+            let v = if i == 0 { a } else { b };
+            if matches!(self.val(v), Val::Lit(_)) {
+                if KNOBS && nat_check() {
+                    let Ok(ground::NatR::N(r)) = ground::nat_fold(op, x, y) else { panic!("SK_NAT_CHECK: nat_ident") };
+                    assert!(Some(&r) == self.nat_ref(v), "SK_NAT_CHECK: nat_ident");
+                }
+                return Ok(Some(v));
+            }
+        }
         let r = match ground::nat_fold(op, x, y) {
             Ok(ground::NatR::N(r)) => r,
             Ok(ground::NatR::B(e)) => return self.mk_bool(e),
@@ -9349,6 +9415,36 @@ fn hmix(h: u64, x: u64) -> u64 {
 #[cfg(test)]
 mod nat_tests {
     use super::*;
+    #[test]
+    fn nat_bits_and_ident_match() {
+        let mut seed = 0x0bad_cafe_1234_5678u64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..3000 {
+            let n = (rnd() % 40) as usize;
+            let x = BigUint::new((0..2 * n).map(|_| if rnd() % 3 == 0 { 0 } else { rnd() as u32 }).collect());
+            let k = rnd() % (64 * n as u64 + 70);
+            let w = rnd() % 300;
+            let mask = (BigUint::one() << w as usize) - 1u32;
+            let want = (&x >> k as usize) & &mask;
+            assert_eq!(ground::nat_bits(&x, k, w), want, "bits {k} {w}");
+            let small = [BigUint::zero(), BigUint::one(), BigUint::from(2u32), x.clone(), &x + 1u32];
+            for a in &small {
+                for b in &small {
+                    for op in 0..14 {
+                        if let Some(i) = ground::nat_ident(op, a, b) {
+                            let Ok(ground::NatR::N(r)) = ground::nat_fold(op, a, b) else { panic!("op {op}") };
+                            assert_eq!(&r, if i == 0 { a } else { b }, "op {op} {a} {b}");
+                        }
+                    }
+                }
+            }
+        }
+    }
     #[test]
     fn nat_mul_matches() {
         let mut seed = 0x1234_5678_9abc_def0u64;

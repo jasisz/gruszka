@@ -597,6 +597,59 @@ fn top_app(m: &Gm) -> bool {
     m.el.len() > m.base && matches!(m.el.last(), Some(El::App(_)))
 }
 
+/// Milestone 59: the operand that Nat operation `op` (index into NAT_OPS)
+/// returns as it is on these literals (0: the first, 1: the second), if
+/// one does: `x + 0`, `x * 1`, `x % y` with `x < y`, `x &&& x`, ... (no
+/// copy, no new literal). Lean's refusals stand: `pow` only with a count
+/// that fits 32 bits.
+pub(super) fn nat_ident(op: usize, x: &BigUint, y: &BigUint) -> Option<usize> {
+    let one = |n: &BigUint| n.bits() == 1;
+    match NAT_OPS[op] {
+        "add" | "xor" | "lor" if y.is_zero() => Some(0),
+        "add" | "xor" | "lor" if x.is_zero() => Some(1),
+        // (not `x <<< 0`: Lean's size estimate may refuse it)
+        "sub" | "shiftRight" if y.is_zero() => Some(0),
+        "shiftLeft" | "shiftRight" if x.is_zero() => Some(0),
+        "mul" if one(y) || x.is_zero() => Some(0),
+        "mul" if one(x) || y.is_zero() => Some(1),
+        "div" if one(y) || x.is_zero() => Some(0),
+        "mod" if y.is_zero() || x < y => Some(0),
+        "gcd" if y.is_zero() => Some(0),
+        "gcd" if x.is_zero() => Some(1),
+        "land" if x.is_zero() => Some(0),
+        "land" if y.is_zero() => Some(1),
+        "land" | "lor" | "gcd" if x == y => Some(0),
+        "pow" if one(y) => Some(0),
+        "pow" if (one(x) || x.is_zero()) && !y.is_zero() && y.to_u32().is_some() => Some(0),
+        _ => None,
+    }
+}
+
+/// Milestone 59: bits `k .. k + w` of `x` (`(x >>> k) &&& (2^w - 1)`,
+/// `(x >>> k) % 2^w`) from its digits, without the shifted copy.
+pub(super) fn nat_bits(x: &BigUint, k: u64, w: u64) -> BigUint {
+    let len = x.iter_u64_digits().len() as u64;
+    let start = k / 64;
+    if start >= len || w == 0 {
+        return BigUint::zero();
+    }
+    let sh = (k % 64) as u32;
+    let n = w.div_ceil(64).min(len - start) as usize;
+    let mut it = x.iter_u64_digits().skip(start as usize);
+    let mut cur = it.next().unwrap_or(0);
+    let mut out: smallvec::SmallVec<[u64; 8]> = smallvec::SmallVec::with_capacity(n);
+    for _ in 0..n {
+        let next = it.next().unwrap_or(0);
+        out.push(if sh == 0 { cur } else { (cur >> sh) | (next << (64 - sh)) });
+        cur = next;
+    }
+    if w < 64 * n as u64 {
+        let r = (w % 64) as u32;
+        out[n - 1] &= (1u64 << r) - 1;
+    }
+    BigUint::from_u64_digits(&out)
+}
+
 /// The kernel's Nat operation `op` (index into NAT_OPS) on literals, or
 /// the reason Lean's kernel refuses it (milestone 47, Lean's rule from
 /// v4.34: a count past 32 bits, or a result past `NAT_MAX_BYTES`, is a
@@ -1976,6 +2029,16 @@ impl Worker {
             }
             Fr::NatB { row, llr, op, a, x, y, base } => {
                 m.base = base;
+                // milestone 59: an operand returned as it is
+                if let (Obj::Nat(p), Obj::Nat(q)) = (&*a, &*w)
+                    && let Some(i) = nat_ident(op as usize, p, q)
+                {
+                    if KNOBS && super::nat_check() {
+                        let Ok(NatR::N(r)) = nat_fold(op as usize, p, q) else { panic!("SK_NAT_CHECK: nat_ident") };
+                        assert!(&r == if i == 0 { p } else { q }, "SK_NAT_CHECK: nat_ident");
+                    }
+                    return Ok(Ok(C::Ob(if i == 0 { a } else { w })));
+                }
                 let r = match (&*a, &*w) {
                     (Obj::Nat(p), Obj::Nat(q)) => match nat_fold(op as usize, p, q) {
                         Ok(r) => Some(r),

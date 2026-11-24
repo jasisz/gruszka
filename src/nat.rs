@@ -30,6 +30,12 @@ pub trait NatExt: Sized {
     fn nat_gcd(&self, y: &Self) -> Self;
     /// `self * d` for one 64-bit digit (a copy multiplied in place).
     fn mul_u64(&self, d: u64) -> Self;
+    /// From 64-bit digits, least significant first.
+    fn from_u64_digits(d: &[u64]) -> Self;
+    /// Trailing one bits (0 for 0).
+    fn trailing_ones(&self) -> u64;
+    /// Trailing zero bits (None for 0).
+    fn trailing_zeros(&self) -> Option<u64>;
 }
 
 mod backend {
@@ -87,6 +93,21 @@ mod backend {
         fn mul_u64(&self, d: u64) -> Self {
             self.clone() * d
         }
+        fn from_u64_digits(d: &[u64]) -> Self {
+            match d {
+                [] => ZERO,
+                [x] => BigUint::from(*x),
+                _ => BigUint::new(d.iter().flat_map(|&x| [x as u32, (x >> 32) as u32]).collect()),
+            }
+        }
+        #[inline]
+        fn trailing_ones(&self) -> u64 {
+            BigUint::trailing_ones(self)
+        }
+        #[inline]
+        fn trailing_zeros(&self) -> Option<u64> {
+            BigUint::trailing_zeros(self)
+        }
     }
 }
 
@@ -115,5 +136,10 @@ mod tests {
         assert_eq!(BigUint::from(0u32).nat_pow(0), BigUint::one());
         assert_eq!(&BigUint::from(1u32) << 70usize >> 69usize, BigUint::from(2u32));
         assert_eq!(BigUint::from(5u32) - BigUint::one(), BigUint::from(4u32));
+        assert_eq!(BigUint::from_u64_digits(&[1, 2, 0]), (BigUint::from(2u32) << 64usize) + 1u32);
+        assert!(BigUint::from_u64_digits(&[0, 0]).is_zero());
+        assert_eq!(NatExt::trailing_ones(&BigUint::from(0b0111u32)), 3);
+        assert_eq!(NatExt::trailing_zeros(&BigUint::from(8u32)), Some(3));
+        assert_eq!(NatExt::trailing_zeros(&BigUint::zero()), None);
     }
 }
