@@ -285,8 +285,6 @@ const REGION_AT: usize = 1 << 22;
 const REGION_MIN: usize = 1 << 8;
 const REGION_REACH8: usize = 2;
 const REGION_LIT_KEEP: usize = 512;
-/// MiB of big literals, value records and spine words (milestone 59:
-/// literals alone until then) that open regions as `REGION_AT` values do
 const REGION_LIT_AT: usize = 64;
 /// milestone 37: see `reg_fwd`
 const REGION_FWD: u8 = 1;

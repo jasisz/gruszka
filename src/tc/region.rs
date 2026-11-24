@@ -140,18 +140,10 @@ pub const DEAD_LVL: u32 = 0xDEAD_0001;
 pub const DEAD_RUN: u32 = 0xDEAD_0002;
 
 impl Worker {
-    /// Milestone 59: the bytes a region bounds besides its values' count:
-    /// big literals, value records and spine words. With literals alone, a
-    /// Nat path that stopped copying big numbers (`nat_bits`) let the
-    /// values it kept instead grow the footprint by up to 22% (c0f)
-    #[inline(always)]
-    fn reg_bytes(&self, lits: usize, vals: usize, words: usize) -> usize {
-        lits + vals * std::mem::size_of::<Rec>() + words * 4
-    }
     /// Is a region opened here?
     #[inline(always)]
     pub(super) fn reg_wanted(&self) -> bool {
-        (self.vals.len() >= self.reg_at || self.reg_bytes(self.wlit_bytes, self.vals.len(), self.sp.words()) >= self.reg_lit_at) && !self.scratch
+        (self.vals.len() >= self.reg_at || self.wlit_bytes >= self.reg_lit_at) && !self.scratch
     }
     #[inline(never)]
     pub(super) fn reg_open(&mut self, v: V) -> Reg {
@@ -237,8 +229,7 @@ impl Worker {
     pub(super) fn reg_due(&self, r: &Reg) -> bool {
         let d = self.reg_ckdiv;
         self.vals.len() - r.dvm as usize >= (self.reg_at / d).max(self.reg_min).max(r.lv)
-            || self.reg_bytes(self.wlit_bytes.saturating_sub(r.dlb), self.vals.len() - r.dvm as usize, self.sp.words().saturating_sub(r.spm as usize))
-                >= (self.reg_lit_at / d).max(REGION_MIN_LIT_BYTES)
+            || self.wlit_bytes.saturating_sub(r.dlb) >= (self.reg_lit_at / d).max(REGION_MIN_LIT_BYTES)
     }
     /// Milestone 37: the region of the same whnf call, opened again after a
     /// checkpoint (same root, cost clock and pin).
@@ -1504,5 +1495,4 @@ impl Worker {
         }
     }
 }
-
 
