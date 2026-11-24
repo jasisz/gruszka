@@ -2032,6 +2032,7 @@ impl Worker {
                 // milestone 59: an operand returned as it is
                 if let (Obj::Nat(p), Obj::Nat(q)) = (&*a, &*w)
                     && let Some(i) = nat_ident(op as usize, p, q)
+                    && !(KNOBS && super::knob_off("SK_NAT_IDENT"))
                 {
                     if KNOBS && super::nat_check() {
                         let Ok(NatR::N(r)) = nat_fold(op as usize, p, q) else { panic!("SK_NAT_CHECK: nat_ident") };

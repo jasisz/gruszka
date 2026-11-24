@@ -432,6 +432,13 @@ fn nat_mul(x: &BigUint, y: &BigUint) -> BigUint {
     }
     r
 }
+/// knobs: SK_NAT_BITS=0, SK_NAT_IDENT=0 turn milestone 59's paths off
+pub(crate) fn knob_off(name: &str) -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static I: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let off = || std::env::var(name).is_ok_and(|s| s == "0");
+    if name == "SK_NAT_BITS" { *B.get_or_init(off) } else { *I.get_or_init(off) }
+}
 /// knobs: SK_NAT_CHECK=1 compares each fast Nat path with the plain one
 pub(crate) fn nat_check() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -4389,6 +4396,7 @@ impl Worker {
         };
         // milestone 59: bits of a shifted literal, from its digits
         if (op == 4 || op == 8)
+            && !(KNOBS && knob_off("SK_NAT_BITS"))
             && let Some(r) = self.nat_bits_of_shift(op, args[0], args[1])?
         {
             return Ok(Some(r));
@@ -4426,7 +4434,9 @@ impl Worker {
         let (Some(x), Some(y)) = (self.nat_ref(a), self.nat_ref(b)) else { return Ok(None) };
         // milestone 59: an operand that is the result, as it is (a literal:
         // `Nat.zero` would come back as itself, not as the literal 0)
-        if let Some(i) = ground::nat_ident(op, x, y) {
+        if let Some(i) = ground::nat_ident(op, x, y)
+            && !(KNOBS && knob_off("SK_NAT_IDENT"))
+        {
             let v = if i == 0 { a } else { b };
             if matches!(self.val(v), Val::Lit(_)) {
                 if KNOBS && nat_check() {
