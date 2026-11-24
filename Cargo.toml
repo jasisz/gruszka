@@ -19,6 +19,11 @@ rustc-hash = "2"
 smallvec = { version = "1", features = ["union"] }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 
+# renovation (lean4export 3.2 flags): susz's `renovation` branch, local until
+# a susz release carries kind-7 blocks; a Gruszka release needs that version
+[patch.crates-io]
+susz = { path = "../susz-renov" }
+
 [features]
 default = ["mimalloc"]
 cnt = []

@@ -53,6 +53,16 @@ pub struct Ind {
     /// milestone 24s: canonical names of outParam, semiOutParam, optParam
     /// and autoParam (NONE when absent), for consume_type_annotations
     ann: [u32; 4],
+    /// Renovation: the block's flags once checked (`None` in a 3.1 export).
+    fl: Option<BlockFlags>,
+}
+
+/// What the recursors of a flagged block follow (lean4#16595): large
+/// elimination (else a motive into Prop and no rules) and K.
+#[derive(Clone, Copy)]
+struct BlockFlags {
+    large: bool,
+    k: bool,
 }
 
 /// Milestone 24s: a syntactic closure, compared structurally (binder names
@@ -647,7 +657,11 @@ impl Worker {
             self.find_name(&["optParam"]),
             self.find_name(&["autoParam"]),
         ];
-        let mut ind = Ind { types: vec![], canon: canon.clone(), np, params: vec![], llr, lvls, result: 0, unsafe_, ann };
+        let mut ind = Ind { types: vec![], canon: canon.clone(), np, params: vec![], llr, lvls, result: 0, unsafe_, ann, fl: None };
+        // renovation: the flags of lean4export 3.2, one set per type (a file
+        // has them on every inductive type or on none, env.rs)
+        let tflags: Option<Vec<IndFlags>> = types.iter().map(|&r| self.ind_flags(r)).collect();
+        let impred = tflags.as_ref().map(|f| f[0].is_impredicative);
         let mut param_tys: Vec<V> = Vec::new();
         for (j, &r) in types.iter().enumerate() {
             let ty = env.consts[r as usize].ty;
@@ -701,6 +715,20 @@ impl Worker {
                 ind.result = l;
             } else if !self.lv.equiv(l, ind.result) {
                 return reject("mutually inductive types must live in the same universe");
+            }
+        }
+        // renovation (Lean's check_inductive_types): an impredicative type
+        // lives in Prop for every universe; the types of a block agree on
+        // isImpredicative and on hasLargeElim
+        if let Some(fs) = &tflags {
+            if fs[0].is_impredicative && !self.lv.zeroish(ind.result) {
+                return reject("inductive datatype marked as impredicative must always live in Prop");
+            }
+            if fs.iter().any(|f| f.is_impredicative != fs[0].is_impredicative) {
+                return reject("mutually defined inductive types must all have the same impredicativity tag");
+            }
+            if fs.iter().any(|f| f.has_large_elim != fs[0].has_large_elim) {
+                return reject("mutually defined inductive types must all have the same large elimination tag");
             }
         }
         for (j, &r) in types.iter().enumerate() {
@@ -787,7 +815,14 @@ impl Worker {
                     } else {
                         let s = self.infer(dom, e, ls, !aux)?;
                         let sl = self.sort_of(s, "constructor field")?;
-                        if !(self.lv.geq(ind.result, sl) || self.lv.zeroish(ind.result)) {
+                        // with the flags a field may be bigger only in an
+                        // impredicative type (lean4#16595); without them, in
+                        // every type that lives in Prop
+                        let fits = match impred {
+                            Some(imp) => imp || self.lv.geq(ind.result, sl),
+                            None => self.lv.geq(ind.result, sl) || self.lv.zeroish(ind.result),
+                        };
+                        if !fits {
                             return reject(format!(
                                 "universe level of field {} of {} is too big for the inductive type",
                                 i + 1,
@@ -823,10 +858,88 @@ impl Worker {
                 return reject("isRec / isReflexive do not match the declaration");
             }
         }
+        if let Some(fs) = &tflags {
+            ind.fl = Some(self.check_flags(&ind, fs, is_rec)?);
+        }
 
         // ---- recursors (types and constructors visible)
         self.self_vis = 2;
         self.check_recursors(&ind, types.len(), &param_tys, &recs)
+    }
+
+    /// Renovation (lean4#16595: init_projs_eta, init_K_target,
+    /// check_large_elim): each flag of the enlarged block is allowed, or the
+    /// block is rejected. An auxiliary type of a nested occurrence `J Ds`
+    /// takes isK and hasProjections from J, never hasEta, and the block's
+    /// isImpredicative and hasLargeElim (Lean's elim_nested_inductive).
+    fn check_flags(&mut self, ind: &Ind, fs: &[IndFlags], is_rec: bool) -> R<BlockFlags> {
+        let nreal = fs.len();
+        let nt = ind.types.len();
+        let impred = fs[0].is_impredicative;
+        let large = fs[0].has_large_elim;
+        let mut ks = Vec::with_capacity(nt);
+        let mut eta0 = false;
+        for j in 0..nt {
+            let (k, projs, eta) = if j < nreal {
+                (fs[j].is_k, fs[j].has_projections, fs[j].has_eta)
+            } else {
+                match self.ind_flags(ind.types[j].row) {
+                    Some(f) => (f.is_k, f.has_projections, false),
+                    None => return reject("nested occurrence of an inductive type without the flags of lean4export 3.2"),
+                }
+            };
+            ks.push(k);
+            if !projs {
+                if eta {
+                    return reject("Type cannot have eta with no projections");
+                }
+                continue;
+            }
+            if ind.types[j].ctors.len() != 1 {
+                return reject("Type cannot have projections: it doesn't have exactly one constructor");
+            }
+            if ind.types[j].nidx != 0 {
+                return reject("Types cannot have projections: it has indices");
+            }
+            if impred {
+                return reject("Impredicative types cannot have projections");
+            }
+            if eta && is_rec {
+                return reject("Recursive types cannot be eta-expandable");
+            }
+            if j == 0 {
+                eta0 = eta;
+            }
+        }
+        // K: only the first type of a block of one, in Prop for every
+        // universe, one constructor without fields
+        let k = ks[0];
+        if ks[1..].iter().any(|&x| x) {
+            return reject("Type is incorrectly marked as K-like");
+        }
+        if k {
+            let cs = &ind.types[0].ctors;
+            if nt != 1 || !self.lv.zeroish(ind.result) || cs.len() != 1 {
+                return reject("Type is incorrectly marked as K-like");
+            }
+            if !matches!(self.env.consts[cs[0] as usize].kind, CKind::Ctor { nfields: 0, .. }) {
+                return reject("Type is incorrectly marked as K-like");
+            }
+        }
+        // large elimination: never in Prop, or a single non-impredicative
+        // type without constructors, or with one and eta or K
+        if large {
+            if impred {
+                return reject("Type is incorrectly marked as having large elimination");
+            }
+            if !self.lv.is_not_zero(ind.result) {
+                let nc = ind.types[0].ctors.len();
+                if nt > 1 || !(nc == 0 || (nc == 1 && (eta0 || k))) {
+                    return reject("Type is incorrectly marked as having large elimination");
+                }
+            }
+        }
+        Ok(BlockFlags { large, k })
     }
 
     fn elim_only_at_zero(&mut self, ind: &Ind) -> R<bool> {
@@ -912,11 +1025,17 @@ impl Worker {
         if recs.len() != nt {
             return reject("expected one recursor per inductive type (auxiliary ones included)");
         }
-        let elim_zero = self.elim_only_at_zero(ind)?;
+        let elim_zero = match ind.fl {
+            Some(b) => !b.large,
+            None => self.elim_only_at_zero(ind)?,
+        };
         let all_ctors: Vec<(usize, u32)> =
             (0..nt).flat_map(|j| ind.types[j].ctors.iter().map(move |&c| (j, c)).collect::<Vec<_>>()).collect();
-        let mut k_target = nt == 1 && self.lv.zeroish(ind.result);
-        if k_target {
+        let mut k_target = match ind.fl {
+            Some(b) => b.k,
+            None => nt == 1 && self.lv.zeroish(ind.result),
+        };
+        if k_target && ind.fl.is_none() {
             let cs = &ind.types[0].ctors;
             k_target = cs.len() == 1 && matches!(env.consts[cs[0] as usize].kind, CKind::Ctor { nfields: 0, .. });
         }
@@ -1055,10 +1174,18 @@ impl Worker {
                 return reject("recursor type: result mismatch");
             }
 
-            // ---- the rules, for the constructors of type j
+            // ---- the rules, for the constructors of type j (none for a
+            // flagged block without large elimination; rules that never
+            // fire are held out of the row, env.rs)
+            let rules = env.rec_rules_held.get(&rr).unwrap_or(rules);
             let cs = ind.types[j].ctors.clone();
-            if rules.len() != cs.len() {
-                return reject("recursor: wrong number of rules");
+            let want = if ind.fl.is_some_and(|b| !b.large) { 0 } else { cs.len() };
+            if rules.len() != want {
+                return reject(if want == 0 {
+                    "recursor of a type without large elimination has reduction rules"
+                } else {
+                    "recursor: wrong number of rules"
+                });
             }
             self.self_vis = 3;
             let ctx = RuleCtx { doms: &doms, motives: &motives, minors: &minors, rec_rows: &rec_rows, rec_llr };

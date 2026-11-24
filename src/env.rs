@@ -12,6 +12,7 @@
 use crate::nat::{BigUint, NatExt};
 use rustc_hash::FxHashMap;
 use susz::read::{BlockRef, Component, Decl, Expr, Hints, Level, Ref, State, Visit};
+pub use susz::read::IndFlags;
 
 pub const BVAR: u8 = 0;
 pub const SORT: u8 = 1;
@@ -673,6 +674,10 @@ pub enum CKind {
         is_rec: bool,
         is_reflexive: bool,
         unsafe_: bool,
+        /// The five flags of lean4export 3.2 (lean4#16595), inputs the
+        /// kernel checks and then uses; `None` in a 3.1 export, where the
+        /// kernel works them out as before.
+        flags: Option<IndFlags>,
     },
     Ctor { induct: u32, cidx: u32, nparams: u32, nfields: u32, unsafe_: bool },
     Rec {
@@ -780,6 +785,17 @@ pub struct Env<'f> {
     pub rec_major: FxHashMap<u32, u32>,
     /// Per row: 1 + index into NAT_OPS, 100 Nat.succ, 101 Nat.log2, 0 other.
     pub nat_op: Vec<u8>,
+    /// The file's inductive types carry the flags of lean4export 3.2
+    /// (every one of them: the reader rejects a file mixing flagged and
+    /// unflagged blocks).
+    pub flagged: bool,
+    /// Renovation: rules of recursors that never reduce, held out of their
+    /// row (whose `rules` is then empty) for the recursor check alone. Lean
+    /// (lean4#16595 inductive_reduce_rec) reduces no recursor whose major
+    /// premise's inductive lacks `hasLargeElim`: a type without it has no
+    /// rules, and an auxiliary recursor of a block with large elimination
+    /// nested through such a type has rules that never fire.
+    pub rec_rules_held: FxHashMap<u32, Box<[(u32, u32, u32)]>>,
 }
 
 impl<'f> Env<'f> {
@@ -890,6 +906,7 @@ impl<'a> Visit<'a> for Loader {
                             is_rec: t.is_rec,
                             is_reflexive: t.is_reflexive,
                             unsafe_: t.is_unsafe,
+                            flags: t.flags,
                         },
                     );
                 }
@@ -1274,6 +1291,39 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
             }
         }
     }
+    // renovation: the flags come with every inductive block of a file or
+    // with none. The reader refuses a file mixing the two (susz: FLAGS
+    // present iff every inductive block is kind 7, class flags-section),
+    // and the packer a 3.2 export without them.
+    let mut n_flagged = 0usize;
+    let mut n_plain = 0usize;
+    for c in &ld.consts {
+        if let CKind::Induct { flags, .. } = &c.kind {
+            if flags.is_some() { n_flagged += 1 } else { n_plain += 1 }
+        }
+    }
+    debug_assert!(n_flagged == 0 || n_plain == 0, "susz let a file mix flagged and unflagged inductive blocks");
+    let flagged = n_flagged > 0;
+    let mut rec_rules_held = FxHashMap::default();
+    if flagged {
+        // canonical name of every inductive type to its hasLargeElim
+        let mut large_of: FxHashMap<u32, bool> = FxHashMap::default();
+        for c in ld.consts.iter() {
+            if let CKind::Induct { flags: Some(f), .. } = &c.kind {
+                large_of.insert(st.name_canon[c.name as usize], f.has_large_elim);
+            }
+        }
+        for (i, c) in ld.consts.iter_mut().enumerate() {
+            let CKind::Rec { rules, .. } = &mut c.kind else { continue };
+            if rules.is_empty() {
+                continue;
+            }
+            let large = rec_major.get(&(i as u32)).and_then(|m| large_of.get(m)).copied().unwrap_or(true);
+            if !large {
+                rec_rules_held.insert(i as u32, std::mem::take(rules));
+            }
+        }
+    }
     let mut nat_op = vec![0u8; ld.consts.len()];
     for (i, c) in ld.consts.iter().enumerate() {
         let cn = st.name_canon[c.name as usize];
@@ -1324,5 +1374,7 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
         known,
         row_of_canon,
         rec_major,
+        flagged,
+        rec_rules_held,
     })
 }

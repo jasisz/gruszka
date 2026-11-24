@@ -1,0 +1,14 @@
+{"meta":{"exporter":{"name":"lean4export","version":"3.2.0"},"format":{"version":"3.2.0"},"lean":{"githash":"8f3431ee714a7a96acf091678540b0e42e4e8423","version":"4.38.0, commit 8f3431ee714a7a96acf091678540b0e42e4e8423"}}}
+{"in":1,"str":{"pre":0,"str":"KEmpty"}}
+{"ie":0,"sort":0}
+{"in":2,"str":{"pre":1,"str":"rec"}}
+{"in":3,"str":{"pre":0,"str":"motive"}}
+{"in":4,"str":{"pre":0,"str":"t"}}
+{"const":{"name":1,"us":[]},"ie":1}
+{"forallE":{"binderInfo":"default","body":0,"name":4,"type":1},"ie":2}
+{"bvar":1,"ie":3}
+{"bvar":0,"ie":4}
+{"app":{"arg":4,"fn":3},"ie":5}
+{"forallE":{"binderInfo":"default","body":5,"name":4,"type":1},"ie":6}
+{"forallE":{"binderInfo":"default","body":6,"name":3,"type":2},"ie":7}
+{"inductive":{"ctors":[],"recs":[{"all":[1],"isUnsafe":false,"k":true,"levelParams":[],"name":2,"numIndices":0,"numMinors":0,"numMotives":1,"numParams":0,"rules":[],"type":7}],"types":[{"all":[1],"ctors":[],"hasEta":false,"hasLargeElim":false,"hasProjections":false,"isImpredicative":false,"isK":true,"isRec":false,"isReflexive":false,"isUnsafe":false,"levelParams":[],"name":1,"numIndices":0,"numNested":0,"numParams":0,"type":0}]}}

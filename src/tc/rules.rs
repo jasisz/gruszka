@@ -463,7 +463,9 @@ impl Worker {
         let Some((s, rrow, rllr)) = split else { leaf!() };
         let CKind::Rec { rules, .. } = &self.env.consts[rrow as usize].kind else { leaf!() };
         let rules: SmallVec<[u32; 8]> = rules.iter().map(|r| r.0).collect();
-        if rules.len() > MAX_CTORS {
+        // renovation: a flagged recursor without rules never reduces (no
+        // large elimination, lean4#16595); a split would wait on nothing
+        if rules.len() > MAX_CTORS || (rules.is_empty() && self.env.flagged) {
             leaf!();
         }
         // the constructors' level list: the recursor's, past the motive's
