@@ -265,9 +265,9 @@ Whole exports checked on AWS (AMD EPYC 9R14). Wall time and peak memory
 All three are accepted. In more detail:
 
 - **CFSG** (`cfsg-5437cdc`), r7a.16xlarge (64 vCPU, 493 GB), Gruszka
-  0.2.0 (dfc2b80, PGO), 64 workers: 1:25:28, 275.8 GiB, 319,930 s of CPU
-  time (user + sys, 88.9 h), no swap. All 64 workers were busy until about
-  30 s before the end; the slowest declaration,
+  0.2.0 (dfc2b80, PGO), 64 workers, 2026-11-24: 1:25:28, 275.8 GiB,
+  319,930 s of CPU time (user + sys, 88.9 h), no swap. All 64 workers were
+  busy until about 30 s before the end; the slowest declaration,
   `CertificateChecks.KernelSpor.SuzMcF.bound_of`, took about 943 s.
   Gruszka 0.1.1 (PGO) on r7a.8xlarge (32 vCPU), 32 workers: 3:11:28,
   183.7 GiB, 362,793 s of CPU time. So 0.2.0 used 12% less CPU time and
