@@ -28,6 +28,8 @@ mod env;
 mod induct;
 mod level;
 mod nat;
+#[cfg(feature = "cnt")]
+mod natcnt;
 mod quot;
 mod tc;
 
@@ -610,6 +612,8 @@ fn main() {
                 .stack_size(stack)
                 .spawn_scoped(s, move || {
                     let mut w = Worker::new(env, shared, first_fail, stack_limit);
+                    #[cfg(feature = "cnt")]
+                    natcnt::set_worker(wi);
                     if tc::KNOBS && wi == 0 {
                         w.show_consts();
                     }
@@ -737,6 +741,8 @@ fn main() {
                     // milestone 24: the process exits after the verdict; freeing
                     // a worker's tables here only delayed it
                     w.dump_unfold_hist();
+                    #[cfg(feature = "cnt")]
+                    natcnt::flush();
                     if mem_report {
                         eprintln!("MEM worker {wi}: {} deep_up {} ckpts {} late {}/{}", w.mem_report(), w.stats.deep_up, w.stats.ckpts, w.stats.late, w.stats.late_ld);
                     }
@@ -800,6 +806,8 @@ fn main() {
         eprintln!("PR {:<20} {:>12} {:>7.3} per value (values made {})", "TOTAL probes", tot, tot as f64 / made as f64, made);
         tc::spines::loc::report();
     }
+    #[cfg(feature = "cnt")]
+    natcnt::report();
     let msgs = msgs.into_inner().unwrap();
     for d in 0..nd {
         match status[d].load(Ordering::Relaxed) {

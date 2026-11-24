@@ -606,6 +606,16 @@ pub(super) enum NatR {
     B(bool),
 }
 pub(super) fn nat_fold(op: usize, x: &BigUint, y: &BigUint) -> Result<NatR, &'static str> {
+    #[cfg(feature = "cnt")]
+    if crate::natcnt::on() {
+        return crate::natcnt::fold(op, x, y, || nat_fold0(op, x, y), |r| match r {
+            Ok(NatR::N(n)) => Some(n),
+            _ => None,
+        });
+    }
+    nat_fold0(op, x, y)
+}
+fn nat_fold0(op: usize, x: &BigUint, y: &BigUint) -> Result<NatR, &'static str> {
     Ok(NatR::N(match NAT_OPS[op] {
         "add" => nat_sized(x + y)?,
         "sub" => {

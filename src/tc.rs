@@ -1898,6 +1898,8 @@ impl Worker {
         #[cfg(debug_assertions)]
         self.vstack.clear();
         self.cur_decl = d;
+        #[cfg(feature = "cnt")]
+        crate::natcnt::set_decl_t(d, self.ticks);
         self.self_vis = 0;
         self.safety = 0;
         self.cur_lparams.clear();
@@ -4309,7 +4311,37 @@ impl Worker {
             return Ok(None);
         }
         let Some(op) = k.nat_ops.iter().position(|&x| x == c && x != NONE) else { return Ok(None) };
+        // milestone 59 (cnt): land/mod over an unforced shiftRight
+        #[cfg(feature = "cnt")]
+        let pat = if crate::natcnt::on() && (op == 4 || op == 8) {
+            let p = self.force(args[0])?;
+            self.const_head(p).is_some_and(|(r, _, s)| s != EMPTY && self.env.nat_op[r as usize] == 13)
+        } else {
+            false
+        };
+        #[cfg(feature = "cnt")]
+        let c0 = crate::natcnt::counts();
         let a = self.whnf(args[0])?;
+        #[cfg(feature = "cnt")]
+        if pat {
+            let c1 = crate::natcnt::counts();
+            let b = self.whnf(args[1])?;
+            let ok = match (self.nat_ref(a), self.nat_ref(b)) {
+                (Some(_), Some(m)) => {
+                    let m1 = m + 1u32;
+                    if op == 8 { m1.count_ones() == 1 } else { m.count_ones() == 1 }
+                }
+                _ => false,
+            };
+            crate::natcnt::TL.with(|t| {
+                let mut t = t.borrow_mut();
+                let i = if op == 8 { 0 } else { 2 } + ok as usize;
+                t.pat[i] += 1;
+                if ok {
+                    t.pat_ins += c1.0 - c0.0;
+                }
+            });
+        }
         if self.nat_ref(a).is_none() {
             return Ok(None);
         }
@@ -4323,6 +4355,21 @@ impl Worker {
             Ok(ground::NatR::B(e)) => return self.mk_bool(e),
             Err(why) => return reject(why),
         };
+        #[cfg(feature = "cnt")]
+        if crate::natcnt::on() {
+            let small = r.to_u64().is_some();
+            let nl = self.wlits.len();
+            let a = crate::natcnt::counts();
+            let v = self.mk_nat(r)?;
+            let b = crate::natcnt::counts();
+            let k = (self.wlits.len() != nl) as usize * 2 + (!small) as usize;
+            crate::natcnt::TL.with(|t| {
+                let mut t = t.borrow_mut();
+                t.mk[k] += 1;
+                t.mk_ins += b.0 - a.0;
+            });
+            return Ok(Some(v));
+        }
         Ok(Some(self.mk_nat(r)?))
     }
 
@@ -5294,6 +5341,76 @@ impl Worker {
     }
 
     fn whnf_body(&mut self, v: V) -> R<V> {
+        #[cfg(feature = "cnt")]
+        if crate::natcnt::won() {
+            return self.whnf_body_cnt(v);
+        }
+        self.whnf_body0(v)
+    }
+    /// Milestone 59 (cnt, SK_WCNT=PREFIX): closed whnfs of GHOST_TICKS or
+    /// more, by name, for a memo across declarations (`scripts/m59_whnf.py`)
+    #[cfg(feature = "cnt")]
+    #[inline(never)]
+    fn whnf_body_cnt(&mut self, v: V) -> R<V> {
+        use crate::natcnt::{TL, counts};
+        if self.memo_at(v).whnf != NONE {
+            return self.whnf_body0(v);
+        }
+        let seq0 = TL.with(|t| {
+            let mut t = t.borrow_mut();
+            t.wseq += 1;
+            t.wseq
+        });
+        // the cost of a name, sampled: 1 in 64 misses of a closed value
+        if seq0 % 64 == 0 && !self.has_fvar(v) {
+            let i0 = std::time::Instant::now();
+            let c0 = counts();
+            let n = self.name_v(v);
+            let c1 = counts();
+            let ns = i0.elapsed().as_nanos() as u64;
+            let nodes = (1u64 << 16) - self.nm.fuel as u64;
+            let cl = n.map_or(2, |n| self.nm.closed(n) as u8);
+            TL.with(|t| t.borrow_mut().name_samples.push((ns, c1.0 - c0.0, nodes, cl)));
+        }
+        let t0 = self.ticks;
+        let i0 = std::time::Instant::now();
+        let r = self.whnf_body0(v);
+        let dt = self.ticks.wrapping_sub(t0);
+        if let Ok(rv) = r
+            && dt >= region::GHOST_TICKS
+            && !self.has_fvar(v)
+        {
+            let ns = i0.elapsed().as_nanos();
+            let seq1 = TL.with(|t| t.borrow().wseq);
+            let d = self.cur_decl;
+            let line = match self.name_v(v) {
+                Some(n) if self.nm.closed(n) => {
+                    let (shape, bytes) = match self.val(rv) {
+                        Val::Lit(i) => match self.lit(i) {
+                            LitVal::Nat(x) => match x.to_u64() {
+                                Some(_) => ("nat", 0),
+                                None => ("bignat", x.bits() / 8),
+                            },
+                            LitVal::Str(x) => ("str", x.len() as u64),
+                        },
+                        Val::Neu { head: Head::Const(..), spine } => (if spine == EMPTY { "const" } else { "capp" }, 0),
+                        Val::Neu { head: Head::FVar(_), .. } => ("fvar", 0),
+                        Val::Neu { head: Head::Stuck(_), .. } => ("stuck", 0),
+                        Val::Sort(_) => ("sort", 0),
+                        Val::Clo { .. } => ("lam", 0),
+                        Val::CloI { .. } => ("cloi", 0),
+                        Val::Thunk { .. } => ("thunk", 0),
+                    };
+                    let rcl = self.name_v(rv).is_some_and(|m| self.nm.closed(m));
+                    format!("W\t{d}\t{}\t{n}\t{dt}\t{ns}\t{seq0}\t{seq1}\t{shape}\t{}\t{bytes}", self.nm.pflushes, rcl as u8)
+                }
+                _ => format!("X\t{d}\t\t\t{dt}\t{ns}\t{seq0}\t{seq1}"),
+            };
+            TL.with(|t| t.borrow_mut().wev.push(line));
+        }
+        r
+    }
+    fn whnf_body0(&mut self, v: V) -> R<V> {
         let m = self.memo_at(v).whnf;
         if m != NONE {
             return Ok(m);
