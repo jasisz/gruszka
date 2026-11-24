@@ -362,8 +362,9 @@ the kernel's Nat operations at 20% of run349, ~50% of run124 and ~90%
 of LyOm. The product is now the library's (`x * y`): M37's own loop for
 a short factor collected both factors' digits and built its result
 through bytes, and on run124 a one-digit factor times a number of over
-a thousand digits was 39% of the run (run349 -3.8%, LyOm -2%, c0f
--0.7%; peaks equal). A scalar product on a copy (`clone() * d`) was
+a thousand digits was 39% of the run (w4: run124 -38.8%, 19063 ->
+11666 G, cycles -29%, peak 7.78 -> 8.36 GB; run349 -3.8%, LyOm -2%,
+c0f -0.7%, peaks equal). A scalar product on a copy (`clone() * d`) was
 tried first: its carry digit doubled the copy's buffer (run349 peak
 +5%). `SK_NAT_CHECK=1` (knobs) compares it with M37's loop.
 
