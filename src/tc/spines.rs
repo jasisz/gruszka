@@ -24,7 +24,10 @@ pub struct Spines {
     /// per spine: a header (length | flags) followed by its elims
     d: crate::env::Slab<u32>,
     /// neutral values by head and elims; open addressing with linear
-    /// probing: (hash tag, value id)
+    /// probing: (hash tag, value id). Milestone 56: the tag is the hash's
+    /// high word, whose top `bits` bits are the entry's home slot (`home`),
+    /// so growing, rebuilding and deleting move entries without reading
+    /// their values and spines.
     tab: Vec<(u32, u32)>,
     n: usize,
     bits: u32,
@@ -45,6 +48,13 @@ fn head_words(h: Head) -> (u32, u32, u32) {
         Head::Const(r, l) => (5, r, l),
         Head::Stuck(x) => (6, x, 0),
     }
+}
+
+/// The tag kept in an entry for hash `h` (milestone 56: its high word; the
+/// home slot `h >> (64 - bits)` is the tag's top `bits` bits).
+#[inline(always)]
+fn tag_of(h: u64) -> u32 {
+    (h >> 32) as u32
 }
 
 /// Where a missing neutral goes in the table (see `Spines::find`).
@@ -145,14 +155,34 @@ impl Spines {
         self.tab = vec![FREE; len];
         self.bits = len.trailing_zeros();
         let mask = len - 1;
-        for &(_, v) in old.iter().filter(|e| e.1 != EMPTY) {
-            let Val::Neu { head, spine } = vals[v as usize].v else { unreachable!() };
-            let h = self.hash(head, spine, &[]);
-            let mut j = (h >> (64 - self.bits)) as usize;
+        // milestone 56: by the tags alone (a rehash read each entry's value
+        // and spine: two cache misses per entry, 10-12% of the samples on
+        // ch294002m0, sch0_4 and kE4Parse)
+        for &(t, v) in old.iter().filter(|e| e.1 != EMPTY) {
+            self.debug_home(vals, t, v);
+            let mut j = self.home(t);
             while self.tab[j].1 != EMPTY {
                 j = (j + 1) & mask;
             }
-            self.tab[j] = (h as u32, v);
+            self.tab[j] = (t, v);
+        }
+    }
+
+    /// Milestone 56: the home slot of an entry with tag `t`: the hash's top
+    /// `bits` bits, as `find` computes it (`bits` <= 32: one slot per two
+    /// value ids at most, and value ids are below 2^32).
+    #[inline(always)]
+    fn home(&self, t: u32) -> usize {
+        debug_assert!(self.bits >= 1 && self.bits <= 32);
+        (t >> (32 - self.bits)) as usize
+    }
+    /// Debug builds: entry `(t, v)` carries `v`'s hash.
+    #[inline(always)]
+    fn debug_home(&self, _vals: &[super::Rec], _t: u32, _v: V) {
+        #[cfg(debug_assertions)]
+        {
+            let Val::Neu { head, spine } = _vals[_v as usize].v else { unreachable!() };
+            assert_eq!(_t, tag_of(self.hash(head, spine, &[])), "spine table: the tag of value {_v}");
         }
     }
 
@@ -166,7 +196,7 @@ impl Spines {
         let bl = self.len(base);
         let n = bl + extra.len();
         let h = self.hash(head, base, extra);
-        let tag = h as u32;
+        let tag = tag_of(h);
         let mask = self.tab.len() - 1;
         let mut j = (h >> (64 - self.bits)) as usize;
         loop {
@@ -287,8 +317,8 @@ impl Spines {
                 self.tab[i] = FREE;
                 return;
             }
-            let Val::Neu { head: hx, spine: sx } = vals[x as usize].v else { unreachable!() };
-            let home = (self.hash(hx, sx, &[]) >> (64 - self.bits)) as usize;
+            self.debug_home(vals, t, x);
+            let home = self.home(t);
             // x may move to i unless its home lies cyclically in (i, k]
             if (k.wrapping_sub(home) & mask) >= (k.wrapping_sub(i) & mask) {
                 self.tab[i] = (t, x);
@@ -305,14 +335,13 @@ impl Spines {
         self.bits = len.trailing_zeros();
         self.n = 0;
         let mask = len - 1;
-        for &(_, v) in old.iter().filter(|e| e.1 != EMPTY && e.1 < vm) {
-            let Val::Neu { head, spine } = vals[v as usize].v else { unreachable!() };
-            let h = self.hash(head, spine, &[]);
-            let mut j = (h >> (64 - self.bits)) as usize;
+        for &(t, v) in old.iter().filter(|e| e.1 != EMPTY && e.1 < vm) {
+            self.debug_home(vals, t, v);
+            let mut j = self.home(t);
             while self.tab[j].1 != EMPTY {
                 j = (j + 1) & mask;
             }
-            self.tab[j] = (h as u32, v);
+            self.tab[j] = (t, v);
             self.n += 1;
         }
     }

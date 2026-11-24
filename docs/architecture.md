@@ -112,6 +112,34 @@ same definition produce equal but separate graphs, and comparing them can
 take as long as running the definition. In Init, that was the difference
 between seconds and divergence.
 
+**Spine table (milestone 56).** Neutral values are hash-consed in one
+open-addressing table per worker, an entry `(tag, value id)`. Its tag is
+the hash's high word, whose top bits are the entry's home slot, so a
+growth, a rebuild below a region's mark and a deletion move entries by
+their tags alone. Before, each moved entry was rehashed from its value
+and spine (two cache misses an entry; a growing table rehashes about as
+many entries as it holds): with the table split out of line, the growth
+inside `find` was 10-12% of the samples on ch294002m0, sch0_4 and
+kE4Parse. On the five run349 certificates (w1, release, medians of three
+alternating rounds, shared machine): kE4Parse -19% cycles, sch0_4 -12.5%,
+ch294002m0 -2.5%, cover4 and tuple_ok flat, all five -3.8% cycles at
+-0.1% instructions, memory unchanged; corpora, CFSG walls and Arena
+verdicts unchanged, instructions within +-0.5%.
+
+Measured and left out: (1) a hash kept per spine, so a spine of n+1
+elims hashes from the one of n (the state of a left fold over the
+elims, mixed with head and length last, two words before each header).
+Spines are short: 81-99% of probes start from an empty base, an average
+base under one word (kE4Parse 0.8), a base of 16 words or more 28 times,
+so nothing is saved; it costs +1-5% memory and +0.5% instructions, and
+the "hash" share of the profile was the stall of the first read of the
+arguments. (2) a direct-mapped buffer of recently found values (4096
+entries, checked like a table hit) in front of the probe: it caught
+40-92% of the hits, yet saved nothing, because the slots it skips were
+just read and are in cache anyway. What is left of the probe (15-23% of
+the samples) is its first touch of a random slot in a table of 16-64 MB:
+for new values (35-70% of the probes) there is nothing to find nearer.
+
 ## Sessions
 
 A worker keeps its arena, and every table keyed by arena ids, from one
