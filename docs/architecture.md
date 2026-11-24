@@ -925,6 +925,21 @@ stand for the same term, so a type or equality established for one also
 holds for the other. This is Pestka's identity "value = substituted term",
 paid for only where it saves work.
 
+Tried and dropped (milestone 59): a memo of closed whnfs *across*
+declarations, keyed by name, for whnfs of `GHOST_TICKS` or more, hits
+counted only from earlier declarations (counters under `cnt`,
+`SK_WCNT`, `scripts/m59_whnf.py`). One worker: run349 hit 23 K times
+and would save 21% of its ticks (282 s; median hit 1.7 ms), LyOm 351
+times (15.2 s); but naming every closed miss costs more (run349 ~3100 s,
+LyOm ~15 s, sampled at 1.5 us a name), and the results are mostly big
+Nat literals: 22 GB (run349) and 6.7 GB (LyOm) to keep. With 32 workers
+(the real spill) LyOm and c0f hit 0 times: a heavy declaration's repeats
+are its own, under the per-declaration memos. Nat operations measured in the same
+build: repeated (op, a, b) pairs within a declaration are 4.7% of
+run124 and 27% of LyOm, big x big products (both >= 17 limbs) 3.7% of
+run124 and 84% of LyOm, below the bounds set for an operation memo
+(5% / 30%) and a faster product (10% of run124): not done.
+
 **Declarations.** The checker handles axioms, definitions, theorems (which
 require a Prop type), opaques, the quotient package (with each type compared
 structurally with the one Lean builds after Eq's shape is checked), and
