@@ -215,6 +215,8 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "susz"
 version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be95a9cd0f7c06a696a42b20cf95a92d7801f8a5a09220fc92ca971b6019442b"
 dependencies = [
  "dashu-int",
  "memmap2",

@@ -19,11 +19,6 @@ rustc-hash = "2"
 smallvec = { version = "1", features = ["union"] }
 mimalloc = { version = "0.1.52", default-features = false, optional = true }
 
-# susz 0.4.0 (lean4export 3.2 flags, kind-7 blocks) from its local tree until
-# 0.4.0 is on crates.io; then this patch goes
-[patch.crates-io]
-susz = { path = "../susz-renov" }
-
 [features]
 default = ["mimalloc"]
 cnt = []
