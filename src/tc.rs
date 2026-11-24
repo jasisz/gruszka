@@ -4869,9 +4869,26 @@ impl Worker {
             _ => None,
         }
     }
-    /// One constructor, no indices, not recursive.
+    /// The flags of inductive `row` (lean4export 3.2), `None` without them.
+    pub fn ind_flags(&self, row: u32) -> Option<IndFlags> {
+        match &self.consts[row as usize].kind {
+            CKind::Induct { flags, .. } => *flags,
+            _ => None,
+        }
+    }
+    /// Structure eta applies to inductive `row`: one constructor, no
+    /// indices, not recursive (a 3.1 export); with the flags of 3.2, its
+    /// `hasEta` (Lean's has_eta, lean4#16595), which the block's check
+    /// allows only on such a type (the shape is asked here too, so a flag
+    /// not checked yet never reaches a type without one constructor).
     pub fn structure_like(&self, row: u32) -> bool {
-        matches!(self.ind_info(row), Some((_, 0, ctors, false)) if ctors.len() == 1)
+        match &self.consts[row as usize].kind {
+            CKind::Induct { nindices: 0, ctors, is_rec, flags, .. } if ctors.len() == 1 => match flags {
+                Some(f) => f.has_eta,
+                None => !*is_rec,
+            },
+            _ => false,
+        }
     }
 
     fn to_ctor_when_k(&mut self, rec_row: u32, major: V) -> R<V> {
@@ -6268,6 +6285,14 @@ impl Worker {
         if ctors.len() != 1 {
             return reject("projection of a type that is not structure-like");
         }
+        // renovation: with the flags, a projection needs `hasProjections`
+        // (Lean's infer_proj, lean4#16595); a type with them is never
+        // impredicative, so every field of an instance in Prop is a proof
+        // and the checks for proofs below are dropped as Lean drops them
+        let flags = self.ind_flags(irow);
+        if flags.is_some_and(|f| !f.has_projections) {
+            return reject("projection of a type without projections (hasProjections)");
+        }
         let c0 = ctors[0];
         let Some(args) = self.app_args(ispine) else { return reject("projection: bad structure type") };
         if args.len() != np as usize + ni as usize {
@@ -6293,7 +6318,7 @@ impl Worker {
         // A structure whose inductive lives in Prop (at generic parameters) is
         // a proposition even when this instance only shows it through a
         // chain of equalities that are not transitive (proof irrelevance).
-        let is_prop = self.is_prop_type(st)? || self.ind_in_prop(irow)?;
+        let is_prop = flags.is_none() && (self.is_prop_type(st)? || self.ind_in_prop(irow)?);
         for i in 0..idx {
             let w = self.whnf(r)?;
             if !self.is_pi_val(w) {
