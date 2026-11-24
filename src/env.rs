@@ -672,7 +672,9 @@ pub enum CKind {
         ctors: Box<[u32]>,
         nnested: u32,
         is_rec: bool,
-        is_reflexive: bool,
+        /// `None` when the export does not carry it (Lean since lean4#16595,
+        /// Susz kind 8): the kernel computes it and has nothing to compare.
+        is_reflexive: Option<bool>,
         unsafe_: bool,
         /// The five flags of lean4export 3.2 (lean4#16595), inputs the
         /// kernel checks and then uses; `None` in a 3.1 export, where the

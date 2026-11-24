@@ -2,8 +2,8 @@
 //! parameters and universes of the types, nested occurrences eliminated
 //! into auxiliary types, constructor types (parameters, universe of each
 //! field, strict positivity, return type), then the computed facts (isRec,
-//! isReflexive, numNested, K, large elimination) against what the file
-//! says, and the recursors: each recursor type and each rule is compared
+//! isReflexive when the file carries it, numNested, K, large elimination)
+//! against what the file says, and the recursors: each recursor type and each rule is compared
 //! with the one Lean would generate.
 //!
 //! Nothing in the declaration record is trusted. The recursor type in the
@@ -854,7 +854,7 @@ impl Worker {
         }
         for &r in &types {
             let CKind::Induct { is_rec: ir, is_reflexive: rf, .. } = env.consts[r as usize].kind else { unreachable!() };
-            if ir != is_rec || rf != is_reflexive {
+            if ir != is_rec || rf.is_some_and(|rf| rf != is_reflexive) {
                 return reject("isRec / isReflexive do not match the declaration");
             }
         }

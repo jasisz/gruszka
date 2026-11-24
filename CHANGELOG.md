@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+Reads susz 0.5.0 files whose inductive blocks do not carry `isReflexive`
+(Susz kind 8, the NOREFL section): Lean since the kernel renovation
+(lean4#16595) no longer has the field, so its exports leave it out.
+Gruszka computes isReflexive as before and compares it with the file only
+where the file gives it.
+
 ## 0.2.0
 
 Checks all of CFSG (`cfsg-5437cdc.susz`, 39,656,013 declarations) on
