@@ -603,24 +603,39 @@ fn top_app(m: &Gm) -> bool {
 /// copy, no new literal). Lean's refusals stand: `pow` only with a count
 /// that fits 32 bits.
 pub(super) fn nat_ident(op: usize, x: &BigUint, y: &BigUint) -> Option<usize> {
+    // by index into NAT_OPS (a match on the names compared strings on
+    // every operation: c0f +2%)
+    const ADD: usize = 0;
+    const SUB: usize = 1;
+    const MUL: usize = 2;
+    const DIV: usize = 3;
+    const MOD: usize = 4;
+    const GCD: usize = 5;
+    const LAND: usize = 8;
+    const LOR: usize = 9;
+    const XOR: usize = 10;
+    const SHL: usize = 11;
+    const SHR: usize = 12;
+    const POW: usize = 13;
+    debug_assert!(NAT_OPS[LAND] == "land" && NAT_OPS[SHR] == "shiftRight" && NAT_OPS[POW] == "pow");
     let one = |n: &BigUint| n.bits() == 1;
-    match NAT_OPS[op] {
-        "add" | "xor" | "lor" if y.is_zero() => Some(0),
-        "add" | "xor" | "lor" if x.is_zero() => Some(1),
+    match op {
+        ADD | XOR | LOR if y.is_zero() => Some(0),
+        ADD | XOR | LOR if x.is_zero() => Some(1),
         // (not `x <<< 0`: Lean's size estimate may refuse it)
-        "sub" | "shiftRight" if y.is_zero() => Some(0),
-        "shiftLeft" | "shiftRight" if x.is_zero() => Some(0),
-        "mul" if one(y) || x.is_zero() => Some(0),
-        "mul" if one(x) || y.is_zero() => Some(1),
-        "div" if one(y) || x.is_zero() => Some(0),
-        "mod" if y.is_zero() || x < y => Some(0),
-        "gcd" if y.is_zero() => Some(0),
-        "gcd" if x.is_zero() => Some(1),
-        "land" if x.is_zero() => Some(0),
-        "land" if y.is_zero() => Some(1),
-        "land" | "lor" | "gcd" if x == y => Some(0),
-        "pow" if one(y) => Some(0),
-        "pow" if (one(x) || x.is_zero()) && !y.is_zero() && y.to_u32().is_some() => Some(0),
+        SUB | SHR if y.is_zero() => Some(0),
+        SHL | SHR if x.is_zero() => Some(0),
+        MUL if one(y) || x.is_zero() => Some(0),
+        MUL if one(x) || y.is_zero() => Some(1),
+        DIV if one(y) || x.is_zero() => Some(0),
+        MOD if y.is_zero() || x < y => Some(0),
+        GCD if y.is_zero() => Some(0),
+        GCD if x.is_zero() => Some(1),
+        LAND if x.is_zero() => Some(0),
+        LAND if y.is_zero() => Some(1),
+        LAND | LOR | GCD if x == y => Some(0),
+        POW if one(y) => Some(0),
+        POW if (one(x) || x.is_zero()) && !y.is_zero() && y.to_u32().is_some() => Some(0),
         _ => None,
     }
 }
@@ -2030,9 +2045,10 @@ impl Worker {
             Fr::NatB { row, llr, op, a, x, y, base } => {
                 m.base = base;
                 // milestone 59: an operand returned as it is
-                if let (Obj::Nat(p), Obj::Nat(q)) = (&*a, &*w)
+                if KNOBS
+                    && super::nat_ident_on()
+                    && let (Obj::Nat(p), Obj::Nat(q)) = (&*a, &*w)
                     && let Some(i) = nat_ident(op as usize, p, q)
-                    && !(KNOBS && super::knob_off("SK_NAT_IDENT"))
                 {
                     if KNOBS && super::nat_check() {
                         let Ok(NatR::N(r)) = nat_fold(op as usize, p, q) else { panic!("SK_NAT_CHECK: nat_ident") };

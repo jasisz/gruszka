@@ -334,7 +334,8 @@ than they gave back:
   the session is that value (a hash of its length and a few digits,
   confirmed by comparing contents): shared thunks and memos, one copy.
   Nat operations read their operands in place instead of cloning them,
-  and a long-by-short product skips zero digits.
+  and a long-by-short product skipped zero digits (until milestone 59:
+  the library's product, below).
 
 The constants (data/m37/sweep.txt: knobs build, w1, the CFSG slices p6,
 hD, m6c, rowOK49, gf3, probe300, c0f and lyLet; instructions and peak):
@@ -354,6 +355,39 @@ hD, m6c, rowOK49, gf3, probe300, c0f and lyLet; instructions and peak):
   instead of deletion: hD past 300 s.
 
 Results: data/m37/README.txt.
+
+**Nat operations (milestone 59).** Counters (`cnt`, `SK_NATCNT=1`: per
+operation and operand size, repeats, results equal to an operand) put
+the kernel's Nat operations at 20% of run349, ~50% of run124 and ~90%
+of LyOm. The product is now the library's (`x * y`): M37's own loop for
+a short factor collected both factors' digits and built its result
+through bytes, and on run124 a one-digit factor times a number of over
+a thousand digits was 39% of the run (run349 -3.8%, LyOm -2%, c0f
+-0.7%; peaks equal). A scalar product on a copy (`clone() * d`) was
+tried first: its carry digit doubled the copy's buffer (run349 peak
++5%). `SK_NAT_CHECK=1` (knobs) compares it with M37's loop.
+
+Measured and kept off (knobs, both checked by `SK_NAT_CHECK=1`):
+
+- `SK_NAT_IDENT=1`: an operation whose result is an operand returns
+  that operand's value (`x + 0`, `x * 1`, `x % y` with `x < y`, ...; not
+  `x <<< 0`, which Lean's size estimate may refuse), in the ground
+  machine too. The checks cost more than the copies saved: run349
+  +0.8%, c0f +1.3% against the product alone.
+- `SK_NAT_BITS=1`: `Nat.land (x >>> k) (2^w - 1)` and `Nat.mod (x >>> k)
+  2^w` on an unforced shift, as bits `k .. k + w` of `x` read from its
+  digits, without the shifted copy. c0f -31% instructions and run349
+  -12.5%, but the copies it saved were what opened regions (64 MiB of
+  big literals): the values kept instead raised peaks 10-22%. Counting
+  value records and spine words in that bound brought the peaks back
+  (c0f 147 MB, run349 -19%) at a third of run349's gain, and without
+  the fusion it cost run349 +9.6%. On LyOm the fusion lost: its loops
+  take the bits of `x >>> k` and then shift `x` by `k` for the next
+  step (398 K of 511 K fusions), and the full copy came later in a
+  region that dropped and redid it (tw_checks 37.7 -> 65.6 G). A session
+  that sees a fused shift made in full to a big literal falls back to
+  the plain path; that fixes one worker (LyOm w1 -3.7%, peak +2.4%) but
+  not four (+1.2%, peak +11%).
 
 **Loops that give back (milestone 38).** CFSG's Fi24P7.MS.a0 multiplies
 42 bit-sliced 781x781 matrices over GF(3) (609961-bit numbers) and held

@@ -432,10 +432,12 @@ fn nat_mul(x: &BigUint, y: &BigUint) -> BigUint {
     }
     r
 }
-/// knobs: SK_NAT_IDENT=0 turns milestone 59's identities off
-pub(crate) fn knob_off(name: &str) -> bool {
+/// knobs: SK_NAT_IDENT=1 turns `ground::nat_ident` on (off by default:
+/// its checks cost more than the copies they save, run349 +0.8%, c0f
+/// +1.3%; see docs/architecture.md, milestone 59)
+pub(crate) fn nat_ident_on() -> bool {
     static I: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *I.get_or_init(|| std::env::var(name).is_ok_and(|s| s == "0"))
+    *I.get_or_init(|| std::env::var("SK_NAT_IDENT").is_ok_and(|s| s == "1"))
 }
 /// knobs: SK_NAT_BITS=1 turns `nat_bits_of_shift` on (off by default:
 /// LyOm at 4 workers, instructions +1.2% and peak +11% even with the
@@ -4466,7 +4468,8 @@ impl Worker {
         // milestone 59: a fused shift made in full after all, to a big
         // literal (the copy fusion was there to avoid): the session takes
         // the plain path from now on
-        if op == 12
+        if KNOBS
+            && op == 12
             && !self.fused.is_empty()
             && self.fused.contains(&v)
             && let (Some(x), Some(k)) = (self.nat_ref(a), self.nat_ref(b))
@@ -4478,8 +4481,9 @@ impl Worker {
         let (Some(x), Some(y)) = (self.nat_ref(a), self.nat_ref(b)) else { return Ok(None) };
         // milestone 59: an operand that is the result, as it is (a literal:
         // `Nat.zero` would come back as itself, not as the literal 0)
-        if let Some(i) = ground::nat_ident(op, x, y)
-            && !(KNOBS && knob_off("SK_NAT_IDENT"))
+        if KNOBS
+            && nat_ident_on()
+            && let Some(i) = ground::nat_ident(op, x, y)
         {
             let v = if i == 0 { a } else { b };
             if matches!(self.val(v), Val::Lit(_)) {
