@@ -8,7 +8,11 @@ pub const FREE: (u32, u32) = (0, u32::MAX);
 
 #[derive(Default)]
 pub struct FrameTab {
-    /// open addressing with linear probing: (hash tag, environment id)
+    /// open addressing with linear probing: (hash tag, environment id).
+    /// Milestone 58: the tag is the hash's high word and an entry's home
+    /// slot is the tag's top bits (`home`), so growing, rebuilding and
+    /// deleting move entries by their tags, without reading their frames
+    /// (a rehash read `eloc` and `eslots`: two cache misses per entry).
     tab: Vec<(u32, u32)>,
     n: usize,
     /// milestone 36: growths of `tab` (see `Spines::grows`)
@@ -29,7 +33,26 @@ pub fn fhash(c: &[u32]) -> u64 {
     fmix(h, c.len() as u32)
 }
 
+/// The tag kept in an entry for hash `h` (milestone 58: its high word).
+#[inline(always)]
+fn tag_of(h: u64) -> u32 {
+    (h >> 32) as u32
+}
+
 impl FrameTab {
+    /// Milestone 58: the home slot of tag `t` in a table of `len` slots (a
+    /// power of two, at most 2^32): the tag's top bits.
+    #[inline(always)]
+    fn home(t: u32, len: usize) -> usize {
+        debug_assert!(len.is_power_of_two() && len >= 2 && len <= 1 << 32);
+        ((t as u64) << 32 >> (64 - len.trailing_zeros())) as usize
+    }
+    /// Debug builds: entry `(t, x)` carries `x`'s hash.
+    #[inline(always)]
+    fn debug_tag(_t: u32, _x: u32, _hash_of: &impl Fn(u32) -> u64) {
+        #[cfg(debug_assertions)]
+        assert_eq!(_t, tag_of(_hash_of(_x)), "frame table: the tag of frame {_x}");
+    }
     pub fn bytes(&self) -> usize {
         self.n * 16
     }
@@ -57,8 +80,8 @@ impl FrameTab {
             return Err(usize::MAX);
         }
         let mask = self.tab.len() - 1;
-        let tag = (h >> 32) as u32;
-        let mut i = (h as usize) & mask;
+        let tag = tag_of(h);
+        let mut i = Self::home(tag, self.tab.len());
         loop {
             let (t, e) = self.tab[i];
             if e == u32::MAX {
@@ -72,24 +95,25 @@ impl FrameTab {
     }
 
     /// Records frame `e` (hash `h`) at `slot` from `find`; grows the table
-    /// first when it is half full (`hash_of` rehashes old entries). The
-    /// slot taken, None after a growth (milestone 36 logs it).
+    /// first when it is half full (old entries move by their tags; `hash_of`
+    /// checks them in debug builds). The slot taken, None after a growth
+    /// (milestone 36 logs it).
     pub fn insert(&mut self, h: u64, slot: usize, e: u32, hash_of: impl Fn(u32) -> u64) -> Option<usize> {
         if slot == usize::MAX || (self.n + 1) * 2 > self.tab.len() {
             self.grows = self.grows.wrapping_add(1);
             let len = (self.tab.len() * 2).max(1 << 10);
             let old = std::mem::replace(&mut self.tab, vec![FREE; len]);
             self.n = 0;
-            for (_, x) in old {
+            for (t, x) in old {
                 if x != u32::MAX {
-                    let hx = hash_of(x);
-                    self.place(hx, x);
+                    Self::debug_tag(t, x, &hash_of);
+                    self.place(t, x);
                 }
             }
-            self.place(h, e);
+            self.place(tag_of(h), e);
             return None;
         }
-        self.tab[slot] = ((h >> 32) as u32, e);
+        self.tab[slot] = (tag_of(h), e);
         self.n += 1;
         Some(slot)
     }
@@ -112,7 +136,7 @@ impl FrameTab {
             return;
         }
         let mask = self.tab.len() - 1;
-        let mut i = (h as usize) & mask;
+        let mut i = Self::home(tag_of(h), self.tab.len());
         loop {
             let x = self.tab[i].1;
             if x == u32::MAX {
@@ -133,7 +157,8 @@ impl FrameTab {
                 self.tab[i] = FREE;
                 return;
             }
-            let home = (hash_of(x) as usize) & mask;
+            Self::debug_tag(t, x, &hash_of);
+            let home = Self::home(t, self.tab.len());
             if (k.wrapping_sub(home) & mask) >= (k.wrapping_sub(i) & mask) {
                 self.tab[i] = (t, x);
                 i = k;
@@ -145,20 +170,22 @@ impl FrameTab {
         let old = std::mem::take(&mut self.tab);
         self.tab = vec![FREE; old.len().max(1 << 10)];
         self.n = 0;
-        for (_, x) in old {
+        for (t, x) in old {
             if x != u32::MAX && x < em {
-                self.place(hash_of(x), x);
+                Self::debug_tag(t, x, &hash_of);
+                self.place(t, x);
             }
         }
     }
 
-    fn place(&mut self, h: u64, e: u32) {
+    /// Milestone 58: by tag `t` (its home slot is the tag's top bits).
+    fn place(&mut self, t: u32, e: u32) {
         let mask = self.tab.len() - 1;
-        let mut i = (h as usize) & mask;
+        let mut i = Self::home(t, self.tab.len());
         while self.tab[i].1 != u32::MAX {
             i = (i + 1) & mask;
         }
-        self.tab[i] = ((h >> 32) as u32, e);
+        self.tab[i] = (t, e);
         self.n += 1;
     }
 }
