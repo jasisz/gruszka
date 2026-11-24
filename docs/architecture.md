@@ -1088,8 +1088,9 @@ the triple (J, levels, Ds), its constructors are J's at those parameters,
 and every later check runs on the enlarged group in the restored form used
 by the file. Constructor checks then cover the parameters, the universe of
 every field, strict positivity and the return type. The resulting facts are
-compared with the record's: isRec, isReflexive, numNested, the K flag, large
-elimination and the recursor's universe parameters. Finally, the type of
+compared with the record's: isRec, isReflexive (when the file carries it: a
+Susz kind-8 block, from a Lean after lean4#16595, does not), numNested, the
+K flag, large elimination and the recursor's universe parameters. Finally, the type of
 each recursor (`I.rec`, and `I.rec_k` for the auxiliary types) is walked as a
 value against the expected telescope (parameters, motives, minor premises
 with fields and induction hypotheses, indices, major premise, result) and
