@@ -762,8 +762,8 @@ pub struct Env<'f> {
     /// Per row: 1 + index into NAT_OPS, 100 Nat.succ, 101 Nat.log2, 0 other.
     pub nat_op: Vec<u8>,
     /// The file's inductive types carry the flags of lean4export 3.2
-    /// (every one of them: a file mixing flagged and unflagged blocks is
-    /// rejected at load).
+    /// (every one of them: the reader rejects a file mixing flagged and
+    /// unflagged blocks).
     pub flagged: bool,
     /// Renovation: rules of recursors that never reduce, held out of their
     /// row (whose `rules` is then empty) for the recursor check alone. Lean
@@ -1268,8 +1268,9 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
         }
     }
     // renovation: the flags come with every inductive block of a file or
-    // with none (a 3.2 export without them is refused by the converter; a
-    // file mixing the two has no meaning for either rule set)
+    // with none. The reader refuses a file mixing the two (susz: FLAGS
+    // present iff every inductive block is kind 7, class flags-section),
+    // and the packer a 3.2 export without them.
     let mut n_flagged = 0usize;
     let mut n_plain = 0usize;
     for c in &ld.consts {
@@ -1277,9 +1278,7 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
             if flags.is_some() { n_flagged += 1 } else { n_plain += 1 }
         }
     }
-    if n_flagged > 0 && n_plain > 0 {
-        return Err(LoadError::Reject("inductive types with and without the flags of lean4export 3.2 in one file".into()));
-    }
+    debug_assert!(n_flagged == 0 || n_plain == 0, "susz let a file mix flagged and unflagged inductive blocks");
     let flagged = n_flagged > 0;
     let mut rec_rules_held = FxHashMap::default();
     if flagged {
