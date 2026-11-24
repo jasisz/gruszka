@@ -418,15 +418,15 @@ fn nat_sized(n: BigUint) -> Result<BigUint, &'static str> {
         Ok(n)
     }
 }
-/// Milestone 59: `x * y`; a factor of one 64-bit digit by the library's
-/// scalar product (a copy of the other factor multiplied in place). M37's
-/// own loop for a short factor of a long, mostly zero number (kept below
-/// as `nat_mul_m37` for SK_NAT_CHECK) collected both factors' digits and
-/// went through bytes to build its result.
+/// Milestone 59: `x * y`, the library's product (a short factor is its
+/// long multiplication, one pass per digit, into a result of the right
+/// size). M37's own loop for a short factor of a long, mostly zero number
+/// (kept below as `nat_mul_m37` for SK_NAT_CHECK) collected both factors'
+/// digits and went through bytes to build its result. The scalar product
+/// on a copy (`clone() * d`) was tried: its carry digit grew the copy's
+/// buffer to twice its size (run349 footprint +5%).
 fn nat_mul(x: &BigUint, y: &BigUint) -> BigUint {
-    let (l, s) = if x.bits() >= y.bits() { (x, y) } else { (y, x) };
-    let mut sd = s.iter_u64_digits();
-    let r = if sd.len() == 1 { l.mul_u64(sd.next().unwrap()) } else { x * y };
+    let r = x * y;
     if KNOBS && nat_check() {
         assert!(r == nat_mul_m37(x, y), "SK_NAT_CHECK: nat_mul");
     }

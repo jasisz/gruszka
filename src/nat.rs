@@ -28,8 +28,6 @@ pub trait NatExt: Sized {
     fn new(d: Vec<u32>) -> Self;
     fn nat_pow(&self, k: u32) -> Self;
     fn nat_gcd(&self, y: &Self) -> Self;
-    /// `self * d` for one 64-bit digit (a copy multiplied in place).
-    fn mul_u64(&self, d: u64) -> Self;
     /// From 64-bit digits, least significant first.
     fn from_u64_digits(d: &[u64]) -> Self;
     /// Trailing one bits (0 for 0).
@@ -88,10 +86,6 @@ mod backend {
         #[inline]
         fn nat_gcd(&self, y: &Self) -> Self {
             num_integer::Integer::gcd(self, y)
-        }
-        #[inline]
-        fn mul_u64(&self, d: u64) -> Self {
-            self.clone() * d
         }
         fn from_u64_digits(d: &[u64]) -> Self {
             match d {
