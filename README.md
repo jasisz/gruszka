@@ -39,7 +39,7 @@ and Susz for food.
 It checks **all of mathlib** (702,040 declarations) in under nine seconds on
 eight cores, in under 3 GB. [How fast →](#how-fast)
 It has also checked whole exports of CFSG (39.7 million declarations, in
-3 h 7 min on 32 workers), the Riemann hypothesis claim and FLT.
+1 h 25 min on 64 workers), the Riemann hypothesis claim and FLT.
 [Large developments →](#large-developments)
 
 *Gruszka* is Polish for a pear. Dried pears are a classic *susz*, a pear has
@@ -165,6 +165,10 @@ Gruszka implements Lean's type theory, including:
 - Mutual and nested inductive types, with recursors built by Gruszka and
   compared with the export.
 - Quotients, proof irrelevance, and the Nat and String literal extensions.
+- The inductive flags of lean4export 3.2 (lean4#16595: impredicative, K,
+  projections, eta, large elimination), checked by Lean's new rules and
+  then used. An export without them is checked by the old rules; a file
+  mixing the two is rejected.
 
 The last output line and the exit code give the result:
 
@@ -254,18 +258,25 @@ Whole exports checked on AWS (AMD EPYC 9R14). Wall time and peak memory
 
 | Development | Declarations | Workers | Wall | Peak memory |
 | :--- | ---: | ---: | ---: | ---: |
-| CFSG | 39,656,013 | 32 | 3 h 7 min | 169 GiB |
+| CFSG | 39,656,013 | 64 | 1 h 25 min | 276 GiB |
 | Riemann hypothesis claim | 1,468,418 | 32 | 2 min 3 s | 28 GiB |
 | FLT | 1,710,994 | 16 | 2 min 9 s | 26 GiB |
 
 All three are accepted. In more detail:
 
-- **CFSG** (`cfsg-5437cdc`), r7a.8xlarge (32 vCPU), 2026-11-21: 3:07:25,
-  168.7 GiB, with the 0.1.2 source without `src/nat.rs`, the layer through
-  which Nat literals reach the bignum library (9eeff7b, PGO). Gruszka 0.1.1
-  (PGO) on the same machine: 3:11:28, 183.7 GiB. The classification theorem
-  uses the axioms `propext`, `Quot.sound` and `Classical.choice`
-  (`susz axioms`).
+- **CFSG** (`cfsg-5437cdc`), r7a.16xlarge (64 vCPU, 493 GB), Gruszka
+  0.2.0 (dfc2b80, PGO), 64 workers: 1:25:28, 275.8 GiB, 319,930 s of CPU
+  time (user + sys, 88.9 h), no swap. All 64 workers were busy until about
+  30 s before the end; the slowest declaration,
+  `CertificateChecks.KernelSpor.SuzMcF.bound_of`, took about 943 s.
+  Gruszka 0.1.1 (PGO) on r7a.8xlarge (32 vCPU), 32 workers: 3:11:28,
+  183.7 GiB, 362,793 s of CPU time. So 0.2.0 used 12% less CPU time and
+  was 2.24× faster on twice the workers, but its peak memory was 50%
+  higher: each worker keeps its own arenas. The 0.1.2 source without
+  `src/nat.rs` (9eeff7b, PGO) took 3:07:25 and 168.7 GiB on r7a.8xlarge,
+  2026-11-21. The classification theorem uses the axioms `propext`,
+  `Quot.sound` and `Classical.choice` (`susz axioms`); `sorryAx` is not
+  used.
 - **Riemann hypothesis claim**, MIT export (`5ea74b91…`), r7a.16xlarge
   (64 vCPU), Gruszka 0.1.1 (PGO), 2026-11-21: 2:03, 27.9 GiB. An export
   made by olean-export 0.7.0 from independently built oleans, with the same
