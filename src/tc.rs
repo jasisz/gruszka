@@ -418,10 +418,30 @@ fn nat_sized(n: BigUint) -> Result<BigUint, &'static str> {
         Ok(n)
     }
 }
-/// Milestone 37: `x * y` skipping the zero 64-bit digits of the shorter
+/// Milestone 59: `x * y`; a factor of one 64-bit digit by the library's
+/// scalar product (a copy of the other factor multiplied in place). M37's
+/// own loop for a short factor of a long, mostly zero number (kept below
+/// as `nat_mul_m37` for SK_NAT_CHECK) collected both factors' digits and
+/// went through bytes to build its result.
+fn nat_mul(x: &BigUint, y: &BigUint) -> BigUint {
+    let (l, s) = if x.bits() >= y.bits() { (x, y) } else { (y, x) };
+    let mut sd = s.iter_u64_digits();
+    let r = if sd.len() == 1 { l.mul_u64(sd.next().unwrap()) } else { x * y };
+    if KNOBS && nat_check() {
+        assert!(r == nat_mul_m37(x, y), "SK_NAT_CHECK: nat_mul");
+    }
+    r
+}
+/// knobs: SK_NAT_CHECK=1 compares each fast Nat path with the plain one
+pub(crate) fn nat_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SK_NAT_CHECK").is_some())
+}
+/// Milestone 37 (SK_NAT_CHECK's reference since 59): `x * y` skipping the
+/// zero 64-bit digits of the shorter
 /// operand (CFSG's bit-sliced tables multiply a long, mostly zero number
 /// by a short one); num-bigint's product otherwise.
-fn nat_mul(x: &BigUint, y: &BigUint) -> BigUint {
+fn nat_mul_m37(x: &BigUint, y: &BigUint) -> BigUint {
     let (l, s) = if x.bits() >= y.bits() { (x, y) } else { (y, x) };
     let sd: Vec<u64> = s.iter_u64_digits().collect();
     // only worth it for a short factor of a long one
@@ -9347,6 +9367,7 @@ mod nat_tests {
             let (x, y) = (BigUint::new(a), BigUint::new(b));
             assert_eq!(nat_mul(&x, &y), &x * &y);
             assert_eq!(nat_mul(&y, &x), &x * &y);
+            assert_eq!(nat_mul_m37(&x, &y), &x * &y);
         }
     }
 }
