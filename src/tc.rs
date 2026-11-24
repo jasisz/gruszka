@@ -434,12 +434,17 @@ fn nat_mul(x: &BigUint, y: &BigUint) -> BigUint {
     }
     r
 }
-/// knobs: SK_NAT_BITS=0, SK_NAT_IDENT=0 turn milestone 59's paths off
+/// knobs: SK_NAT_IDENT=0 turns milestone 59's identities off
 pub(crate) fn knob_off(name: &str) -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static I: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let off = || std::env::var(name).is_ok_and(|s| s == "0");
-    if name == "SK_NAT_BITS" { *B.get_or_init(off) } else { *I.get_or_init(off) }
+    *I.get_or_init(|| std::env::var(name).is_ok_and(|s| s == "0"))
+}
+/// knobs: SK_NAT_BITS=1 turns `nat_bits_of_shift` on (off by default:
+/// LyOm at 4 workers, instructions +1.2% and peak +11% even with the
+/// session's fallback; see docs/architecture.md, milestone 59)
+pub(crate) fn nat_bits_on() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var("SK_NAT_BITS").is_ok_and(|s| s == "1"))
 }
 /// knobs: SK_NAT_CHECK=1 compares each fast Nat path with the plain one
 pub(crate) fn nat_check() -> bool {
@@ -964,6 +969,13 @@ pub struct Worker {
     prop_ind: CMap<u32, bool, 27>,
     // context
     pub cur_decl: u32,
+    /// milestone 59: the shifts whose bits were taken without them
+    /// (`nat_bits_of_shift`), and whether one of them was then shifted in
+    /// full to a big literal anyway (a loop's next state: LyOm's tw_checks
+    /// made the copy later, in a region that dropped and redid it): the
+    /// session takes the plain path from then on
+    fused: FxHashSet<V>,
+    fuse_off: bool,
     pub self_vis: u8,
     pub safety: u8,
     /// `stats.known_miss` when the declaration began
@@ -1406,6 +1418,8 @@ impl Worker {
             ll_term_map: Default::default(),
             prop_ind: Default::default(),
             cur_decl: 0,
+            fused: Default::default(),
+            fuse_off: false,
             self_vis: 0,
             safety: 0,
             known_miss0: 0,
@@ -1626,6 +1640,7 @@ impl Worker {
             + mb(&self.big_map)
             + mb(&self.prop_ind)
             + mb(&self.canon_memo)
+            + sb(&self.fused)
     }
 
 
@@ -1860,6 +1875,8 @@ impl Worker {
     /// Ends the session: every table keyed by arena ids is emptied.
     fn new_session(&mut self, d: u32) {
         self.gm = None;
+        self.fused = FxHashSet::default();
+        self.fuse_off = false;
         // milestone 53: rules name level ids, block terms and the session's
         // projections
         self.rl.clear();
@@ -4314,6 +4331,9 @@ impl Worker {
     /// the plain path's.
     fn nat_bits_of_shift(&mut self, op: usize, a0: V, b0: V) -> R<Option<V>> {
         const SHIFT_RIGHT: u8 = 13; // 1 + index of shiftRight in NAT_OPS
+        if self.fuse_off {
+            return Ok(None);
+        }
         let p = self.force(a0)?;
         let Some((row, _, sp)) = self.const_head(p) else { return Ok(None) };
         if sp == EMPTY || self.env.nat_op[row as usize] != SHIFT_RIGHT {
@@ -4345,6 +4365,17 @@ impl Worker {
             }
         };
         let r = ground::nat_bits(self.nat_ref(x).unwrap(), k, w);
+        self.fused.insert(p);
+        #[cfg(feature = "cnt")]
+        if crate::natcnt::on() {
+            let memo = self.memo_at(p).whnf != NONE;
+            crate::natcnt::TL.with(|t| {
+                let mut t = t.borrow_mut();
+                t.fz[0] += 1;
+                t.fz[1] += memo as u64;
+                t.fused.insert(p);
+            });
+        }
         if KNOBS && nat_check() {
             let xs = self.nat_ref(x).unwrap() >> k as usize;
             let Ok(ground::NatR::N(e)) = ground::nat_fold(op, &xs, self.nat_ref(m).unwrap()) else { panic!("SK_NAT_CHECK: nat_bits") };
@@ -4398,7 +4429,8 @@ impl Worker {
         };
         // milestone 59: bits of a shifted literal, from its digits
         if (op == 4 || op == 8)
-            && !(KNOBS && knob_off("SK_NAT_BITS"))
+            && KNOBS
+            && nat_bits_on()
             && let Some(r) = self.nat_bits_of_shift(op, args[0], args[1])?
         {
             return Ok(Some(r));
@@ -4433,6 +4465,18 @@ impl Worker {
         // milestone 37: the operands are read in place (they were cloned:
         // two copies of up to tens of KB per operation on CFSG's bit-sliced
         // tables)
+        // milestone 59: a fused shift made in full after all, to a big
+        // literal (the copy fusion was there to avoid): the session takes
+        // the plain path from now on
+        if op == 12
+            && !self.fused.is_empty()
+            && self.fused.contains(&v)
+            && let (Some(x), Some(k)) = (self.nat_ref(a), self.nat_ref(b))
+            && k.to_u64().is_some_and(|k| x.bits().saturating_sub(k) > 64)
+        {
+            self.fuse_off = true;
+            self.fused = FxHashSet::default();
+        }
         let (Some(x), Some(y)) = (self.nat_ref(a), self.nat_ref(b)) else { return Ok(None) };
         // milestone 59: an operand that is the result, as it is (a literal:
         // `Nat.zero` would come back as itself, not as the literal 0)
@@ -4447,6 +4491,19 @@ impl Worker {
                 }
                 return Ok(Some(v));
             }
+        }
+        #[cfg(feature = "cnt")]
+        if crate::natcnt::on() && op == 12 {
+            let bytes = x.bits() / 8;
+            crate::natcnt::TL.with(|t| {
+                let mut t = t.borrow_mut();
+                t.fz[2] += 1;
+                t.fz[3] += bytes;
+                if t.fused.contains(&v) {
+                    t.fz[4] += 1;
+                    t.fz[5] += bytes;
+                }
+            });
         }
         let r = match ground::nat_fold(op, x, y) {
             Ok(ground::NatR::N(r)) => r,

@@ -94,6 +94,10 @@ pub struct T {
     pub pat: [u64; 4],
     /// instructions of the shiftRight operand's whnf where ok
     pub pat_ins: u64,
+    /// fusions, of them with the shift's whnf already known; shifts made
+    /// (count, operand bytes), of them of a value fused before
+    pub fz: [u64; 6],
+    pub fused: std::collections::HashSet<u32>,
 }
 impl Default for T {
     fn default() -> Self {
@@ -120,6 +124,8 @@ impl Default for T {
             last_ticks: 0,
             pat: [0; 4],
             pat_ins: 0,
+            fz: [0; 6],
+            fused: Default::default(),
         }
     }
 }
@@ -204,6 +210,7 @@ pub struct Agg {
     mk_ins: u64,
     pat: [u64; 4],
     pat_ins: u64,
+    fz: [u64; 6],
 }
 pub static ALL: Mutex<Option<Agg>> = Mutex::new(None);
 
@@ -213,7 +220,7 @@ pub fn flush() {
     TL.with(|t| {
         let t = t.borrow();
         let mut g = ALL.lock().unwrap();
-        let a = g.get_or_insert_with(|| Agg { cells: vec![Cell::default(); NOPS * NB * NB], mk: [0; 4], mk_ins: 0, pat: [0; 4], pat_ins: 0 });
+        let a = g.get_or_insert_with(|| Agg { cells: vec![Cell::default(); NOPS * NB * NB], mk: [0; 4], mk_ins: 0, pat: [0; 4], pat_ins: 0, fz: [0; 6] });
         for (x, y) in a.cells.iter_mut().zip(&t.cells) {
             x.add(y);
         }
@@ -225,6 +232,9 @@ pub fn flush() {
             a.pat[k] += t.pat[k];
         }
         a.pat_ins += t.pat_ins;
+        for k in 0..6 {
+            a.fz[k] += t.fz[k];
+        }
         if won() {
             let p = std::env::var("SK_WCNT").unwrap();
             let mut f = std::io::BufWriter::new(std::fs::File::create(format!("{p}.w{}.tsv", t.wi)).unwrap());
@@ -244,6 +254,7 @@ pub fn report() {
     let Some(a) = g.as_ref() else { return };
     eprintln!("NATCNT mk_nat after reduce_nat: small hit {} big hit {} small new {} big new {} ins {}", a.mk[0], a.mk[1], a.mk[2], a.mk[3], a.mk_ins);
     eprintln!("NATCNT land/shiftRight {} (mask {}) mod/shiftRight {} (2^w {}) shift whnf ins {}", a.pat[0] + a.pat[1], a.pat[1], a.pat[2] + a.pat[3], a.pat[3], a.pat_ins);
+    eprintln!("NATCNT fused {} (shift known {}) shifts made {} ({} operand bytes), of fused values {} ({} bytes)", a.fz[0], a.fz[1], a.fz[2], a.fz[3], a.fz[4], a.fz[5]);
     eprintln!("NATCNT op\ta\tb\tn\tins\tcyc\trep_n\trep_ins\txrep_n\txrep_ins\tsame_n\tsame_ins");
     for op in 0..NOPS {
         for ba in 0..NB {
