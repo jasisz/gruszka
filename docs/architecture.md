@@ -815,6 +815,48 @@ is refused, only delayed, so lazy delta's answers stay the reference's.
   doubling at every level multiplied (interp_wV, a recursion 4000
   comparisons deep, past 300 s), and with no race inside rounds R lost
   the nested shortcuts that end lyLet (past 8 GB).
+- *A step is not a unit (milestone 61).* M's step on a side is an
+  unfolding and the cheap `whnf_core` after it, and that `whnf_core`
+  brings a recursor's major premise to whnf, as Lean's does: one step can
+  be a whole computation. Five CFSG walls of Gruszka 0.2.0 at 64 workers
+  (SuzMcF.bound_of 943 s, Cov.H.covHA_sound 179 s,
+  Batch27000.tits_star_check_0 85 s, Batch27580.piv_eq 82 s,
+  Batch7050.cnt_ok 68.5 s; Pestka 0.0-0.1 s) were one pair shape, met
+  under a `∀` from a `List.all`/`decide` lemma:
+  `Bool.and (P (g x)) (Q (g x)) =?= Function.comp f g x` (`f = fun a =>
+  Bool.and (P a) (Q a)`), with `x` a free variable. `Bool.and` is the
+  higher definition, so R unfolds it, and its match brings `P (g x)` to
+  whnf: `starOK`/`commA`/`classOK` run their `Nat.all` loops over 1755 or
+  1782 points on a term stuck on `x`. M took its steps in turn, but the
+  left side's first step never ended within a round, so the right side,
+  whose one step (`Function.comp`, then beta) meets the left side's head
+  `Bool.and` with equal arguments, was never taken: every round of M
+  was spent inside that first step (`SK_RACE_TRACE`: 12 rounds up to
+  8 M ticks, M never wins). Now each side's step runs as an attempt
+  (`Att::MStep`) under that side's allowance, starting at M's meeting
+  allowance and doubled each time it runs out; the side whose step ran
+  out yields its turn and the other side steps (dovetailing). A side's
+  steps cost at most twice what they cost alone, and a step that meets
+  in a few ticks is no longer behind one that computes. Soundness: the
+  steps and meetings are M's as before; an abandoned step only delays
+  that side, and an attempt's stop keeps nothing undecided as a fact
+  (the round's own region rolls back as before). The five slices (cut at
+  the root, `--only`, one worker, M2, release build) went from 30-95 s
+  (bound_of past 240 s) to 0.6 s each. Against 0.2.0 at w4 (plain
+  release, interleaved, medians): Init 22.97 -> 22.93 G, Std 38.23 ->
+  38.25 G, Mathlib 422.33 -> 422.30 G (footprint 2087 -> 2091 MiB), c0f
+  179.92 -> 179.97 G, LyOm 369.3 -> 371.2 G (w4 spread), run349 3583.3 ->
+  3583.0 G, run124 11554 -> 11542 G, peaks within 2%; gates (small tests
+  in three modes, 350 vectors plain and poisoned, `--only`, poisoned
+  corpora, parity both orders): no wrong verdict.
+  Two walls of the same run have other causes and stay open:
+  u52ne_f_normK (52 s; locally 24 s, Pestka 0.8 s) is R's own work
+  (K and M off: 23 s), the probe of `Subgroup.comap e K' =?= K'` under
+  `x0 ∈ comap e K' =?= σ x0 σ⁻¹ ∈ K'`, which whnfs `u52neσ 4` and its
+  `decide` over 462 points; e6SimpleCheck_eq_true (196 s; locally 73 s,
+  Pestka 4.5 s) is regions: with regions off (`SK_REGION_AT=0`) it takes
+  8 s at 3.4 GB instead of 0.86 GB, the rolled-back work being asked for
+  again.
 
 Vectors (`tests/adv-base/m41.lean`, Lean 4.35 + olean-export):
 good/bad_m41_natwait_sum (`[w, 1].sum = w + (1 + 0)` and `+ (2 + 0)`),

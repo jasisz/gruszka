@@ -849,9 +849,11 @@ pub(crate) enum Att {
     Args,
     /// milestone 53: a derivation of a definition's rule
     Derive,
+    /// milestone 61: one step of a side in M, under that side's allowance
+    MStep,
 }
-pub const ATT_KINDS: usize = 10;
-pub const ATT_NAMES: [&str; ATT_KINDS] = ["r0", "r", "k", "m", "kpair", "meet", "n", "refute", "args", "derive"];
+pub const ATT_KINDS: usize = 11;
+pub const ATT_NAMES: [&str; ATT_KINDS] = ["r0", "r", "k", "m", "kpair", "meet", "n", "refute", "args", "derive", "mstep"];
 
 pub struct Worker {
     pub env: &'static Env<'static>,
@@ -8227,6 +8229,7 @@ impl Worker {
         let mut recent: [smallvec::SmallVec<[V; RECENT]>; 2] = Default::default();
         let mut side = 0;
         let mut waits = [false; 2];
+        let mut step_allow = [*allow; 2];
         loop {
             self.tick()?;
             let o = side ^ 1;
@@ -8234,7 +8237,26 @@ impl Worker {
                 side = o;
                 continue;
             }
-            let Some(w) = self.m_step(cur[side])? else { return Ok(false) };
+            // milestone 61: a step is an unfolding and the cheap whnf_core
+            // after it, whose recursors bring their majors to whnf: one
+            // step can be a whole computation (CFSG's tits_star_check_0:
+            // `Bool.and (starOK ..) .. =?= Function.comp f g x`, where
+            // unfolding `Bool.and` runs `starOK` over 1755 points while
+            // one step of the other side meets it). Each side's step runs
+            // under that side's allowance, doubled each time it runs out,
+            // and the other side steps meanwhile (dovetailing): a side's
+            // steps cost at most twice what they would alone, and a cheap
+            // meeting is never behind an expensive step.
+            let c = cur[side];
+            let w = match self.attempt(Att::MStep, step_allow[side], |s| s.m_step(c))? {
+                Some(w) => w,
+                None => {
+                    step_allow[side] = step_allow[side].saturating_mul(2);
+                    side = o;
+                    continue;
+                }
+            };
+            let Some(w) = w else { return Ok(false) };
             if w == MWAIT {
                 waits[side] = true;
                 if waits[o] {
