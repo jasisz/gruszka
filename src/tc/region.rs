@@ -140,8 +140,6 @@ pub const DEAD_LVL: u32 = 0xDEAD_0001;
 pub const DEAD_RUN: u32 = 0xDEAD_0002;
 
 impl Worker {
-    /// Is a region opened here?
-    #[inline(always)]
     /// Milestone 59: the bytes a region bounds besides its values' count:
     /// big literals, value records and spine words. With literals alone, a
     /// Nat path that stopped copying big numbers (`nat_bits`) let the
@@ -150,6 +148,8 @@ impl Worker {
     fn reg_bytes(&self, lits: usize, vals: usize, words: usize) -> usize {
         lits + vals * std::mem::size_of::<Rec>() + words * 4
     }
+    /// Is a region opened here?
+    #[inline(always)]
     pub(super) fn reg_wanted(&self) -> bool {
         (self.vals.len() >= self.reg_at || self.reg_bytes(self.wlit_bytes, self.vals.len(), self.sp.words()) >= self.reg_lit_at) && !self.scratch
     }
