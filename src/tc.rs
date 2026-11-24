@@ -31,7 +31,7 @@ mod ground;
 mod names;
 mod region;
 mod rules;
-mod spines;
+pub(crate) mod spines;
 use region::Undo;
 use spines::Spines;
 

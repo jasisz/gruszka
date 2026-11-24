@@ -798,6 +798,7 @@ fn main() {
             }
         }
         eprintln!("PR {:<20} {:>12} {:>7.3} per value (values made {})", "TOTAL probes", tot, tot as f64 / made as f64, made);
+        tc::spines::loc::report();
     }
     let msgs = msgs.into_inner().unwrap();
     for d in 0..nd {

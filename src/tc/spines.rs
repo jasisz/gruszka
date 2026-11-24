@@ -204,6 +204,8 @@ impl Spines {
             // SAFETY: j is masked by tab.len() - 1 (a power of two)
             let (t, v) = unsafe { *self.tab.get_unchecked(j) };
             if v == EMPTY {
+                #[cfg(feature = "cnt")]
+                loc::record(vals.len(), head, self.args(base), extra, false);
                 return Err(Slot(j, tag));
             }
             if t == tag {
@@ -231,6 +233,8 @@ impl Spines {
                             }
                         }
                         if same {
+                            #[cfg(feature = "cnt")]
+                            loc::record(vals.len(), head, self.args(base), extra, true);
                             return Ok(v);
                         }
                     }
@@ -344,5 +348,88 @@ impl Spines {
             self.tab[j] = (t, v);
             self.n += 1;
         }
+    }
+}
+
+/// Milestone 58 (feature `cnt`): the census for a neutral table local to
+/// the children. For each `Spines::find`: the distance `vals.len() - c`
+/// from the youngest child value `c` (the arguments and a stuck head; a
+/// projection is no value) to the value about to be made, as a log2
+/// histogram, hits and new neutrals apart; and a simulation of buckets
+/// `wtab[c >> k]` of `cap` entries (k = 3, 4: windows of 8 and 16 ids;
+/// cap = 8, 16), filled by the new neutrals whose youngest child lies in
+/// the last 2^15 values: how many find their bucket full. Buckets count
+/// adds only (a region's rollback does not empty them: an upper bound on
+/// the overflow); a new session (fewer values) empties them.
+#[cfg(feature = "cnt")]
+pub mod loc {
+    use super::{Head, PROJ_BIT};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub const WIN: usize = 1 << 15;
+    pub const CFG: [(u32, u32); 4] = [(3, 8), (3, 16), (4, 8), (4, 16)];
+    /// [hit, new][log2 bucket: 0 for d = 1, ..., 33]
+    pub static HIST: [[AtomicU64; 34]; 2] = [const { [const { AtomicU64::new(0) }; 34] }; 2];
+    /// [hit, new]: no child value
+    pub static NOCHILD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    /// [hit, new]: the youngest child within the last `WIN` values
+    pub static INWIN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    /// per `CFG`: new neutrals in the window whose bucket was full
+    pub static OVER: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+    thread_local! {
+        static SIM: std::cell::RefCell<(usize, Vec<rustc_hash::FxHashMap<u32, u32>>)> =
+            std::cell::RefCell::new((0, vec![Default::default(); 4]));
+    }
+    #[inline(never)]
+    pub fn record(nv: usize, head: Head, base: &[u32], extra: &[u32], hit: bool) {
+        let mut c: Option<u32> = match head {
+            Head::Stuck(x) => Some(x),
+            _ => None,
+        };
+        for &e in base.iter().chain(extra) {
+            if e & PROJ_BIT == 0 {
+                c = Some(c.map_or(e, |m| m.max(e)));
+            }
+        }
+        let h = !hit as usize;
+        let Some(c) = c else {
+            NOCHILD[h].fetch_add(1, Relaxed);
+            return;
+        };
+        let d = nv.saturating_sub(c as usize).max(1);
+        HIST[h][(usize::BITS - 1 - d.leading_zeros()) as usize].fetch_add(1, Relaxed);
+        if d > WIN {
+            return;
+        }
+        INWIN[h].fetch_add(1, Relaxed);
+        SIM.with(|s| {
+            let mut s = s.borrow_mut();
+            if nv < s.0 {
+                for m in s.1.iter_mut() {
+                    m.clear();
+                }
+            }
+            s.0 = nv;
+            if hit {
+                return;
+            }
+            for (i, &(k, cap)) in CFG.iter().enumerate() {
+                let n = s.1[i].entry(c >> k).or_insert(0);
+                if *n >= cap {
+                    OVER[i].fetch_add(1, Relaxed);
+                } else {
+                    *n += 1;
+                }
+            }
+        });
+    }
+    /// The census as `LOC` lines on stderr.
+    pub fn report() {
+        for (h, name) in ["hit", "new"].iter().enumerate() {
+            let tot: u64 = HIST[h].iter().map(|x| x.load(Relaxed)).sum::<u64>() + NOCHILD[h].load(Relaxed);
+            let line: Vec<String> = HIST[h].iter().enumerate().filter(|(_, x)| x.load(Relaxed) > 0).map(|(i, x)| format!("2^{i}:{}", x.load(Relaxed))).collect();
+            eprintln!("LOC {name} total {tot} nochild {} inwin {} hist {}", NOCHILD[h].load(Relaxed), INWIN[h].load(Relaxed), line.join(" "));
+        }
+        let o: Vec<String> = CFG.iter().enumerate().map(|(i, &(k, cap))| format!("w{}c{}:{}", 1u32 << k, cap, OVER[i].load(Relaxed))).collect();
+        eprintln!("LOC over {}", o.join(" "));
     }
 }
