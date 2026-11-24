@@ -72,6 +72,8 @@ pub struct Names {
     /// literals that are not small Nats, by content
     plits_n: FxHashMap<BigUint, u32>,
     plits_s: FxHashMap<Box<str>, u32>,
+    #[cfg(feature = "cnt")]
+    plits_h: FxHashMap<u64, u32>,
     pub phits: u64,
     pub pstored: u64,
     pub pflushes: u64,
@@ -136,6 +138,10 @@ impl Names {
         self.peq_heads = FxHashSet::default();
         self.plits_n = FxHashMap::default();
         self.plits_s = FxHashMap::default();
+        #[cfg(feature = "cnt")]
+        {
+            self.plits_h = FxHashMap::default();
+        }
         self.pflushes += 1;
     }
     /// Does the name mean the same term in every declaration (no free
@@ -268,6 +274,16 @@ impl Worker {
             LitVal::Nat(n) => match n.to_u64() {
                 Some(k) => self.nm_node(T_NAT, k as u32, (k >> 32) as u32),
                 None => {
+                    // milestone 59 (cnt, SK_WCNT): by a 64-bit hash of the
+                    // content, not a copy (the counters name millions of
+                    // results; an analysis build only)
+                    #[cfg(feature = "cnt")]
+                    if crate::natcnt::won() {
+                        let h = crate::natcnt::chash(n);
+                        let c = (1 << 30) + self.nm.plits_h.len();
+                        let id = *self.nm.plits_h.entry(h).or_insert(c as u32);
+                        return self.nm_node(T_LIT, id, 0);
+                    }
                     // by content: a literal index means something else in
                     // another declaration's block
                     let n = n.clone();

@@ -148,7 +148,7 @@ pub fn set_worker(wi: usize) {
     TL.with(|t| t.borrow_mut().wi = wi);
 }
 
-fn chash(n: &BigUint) -> u64 {
+pub fn chash(n: &BigUint) -> u64 {
     let mut h = rustc_hash::FxHasher::default();
     for d in n.iter_u64_digits() {
         d.hash(&mut h);
