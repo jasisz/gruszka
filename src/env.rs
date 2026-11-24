@@ -115,7 +115,29 @@ mod vm {
     pub const MAP_NORESERVE: i32 = 0x4000;
     pub fn reserve(bytes: usize) -> *mut u8 {
         let p = unsafe { mmap(std::ptr::null_mut(), bytes, PROT_RW, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0) };
-        if p as isize == -1 { std::ptr::null_mut() } else { p }
+        if p as isize == -1 {
+            return std::ptr::null_mut();
+        }
+        huge(p, bytes);
+        p
+    }
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+    /// Milestone 58 (Linux): the reserved ranges (term columns, slabs, big
+    /// tables) ask for transparent huge pages. Their reads hop across
+    /// gigabytes, so 4 KiB pages missed the TLB on most hops: on AWS x86
+    /// kE4Parse's page walks went from 9.9M to 0.21M, cycles -4...-36% on
+    /// the five run349 certificates at RSS +0...7%. Advice only: a refusal
+    /// (THP off, `never`) changes nothing. Elsewhere: no-op.
+    #[inline]
+    fn huge(_p: *mut u8, _bytes: usize) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            const MADV_HUGEPAGE: i32 = 14;
+            madvise(_p, _bytes, MADV_HUGEPAGE);
+        }
     }
     /// Gives the pages of [p, p + bytes) back (fresh zero pages on next use).
     pub fn release(p: *mut u8, bytes: usize) {
@@ -124,6 +146,8 @@ mod vm {
         }
         let r = unsafe { mmap(p, bytes, PROT_RW, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_FIXED, -1, 0) };
         assert!(r == p, "could not release arena pages");
+        // the fresh mapping lost the advice of `reserve`
+        huge(p, bytes);
     }
 }
 
