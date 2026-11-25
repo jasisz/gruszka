@@ -7664,6 +7664,9 @@ impl Worker {
         if self.try_eta_struct(a2, b2)? || self.try_eta_struct(b2, a2)? {
             return Ok(true);
         }
+        if self.try_eta_ctor(a2, b2)? || self.try_eta_ctor(b2, a2)? {
+            return Ok(true);
+        }
         if let Some(r) = self.string_expansion(a2, b2)? {
             return Ok(r);
         }
@@ -9307,6 +9310,71 @@ impl Worker {
         Ok(true)
     }
 
+    /// Function eta for a partially applied constructor of a structure
+    /// (`b`, lean4#15373), or a recursor of a structure or with rule K that
+    /// misses only its major premise (lean4#15374): `mk ps fs` missing fields
+    /// is `fun x => mk ps fs x`, so it is compared with `a` (not a lambda:
+    /// `try_eta` took those) by applying both to a new variable of the
+    /// domain. Then structure eta (or K) can see the full application.
+    fn try_eta_ctor(&mut self, a: V, b: V) -> R<bool> {
+        if self.is_lam_val(a) {
+            return Ok(false);
+        }
+        let Some((crow, _, spine)) = self.const_head(b) else { return Ok(false) };
+        let Some(args) = self.app_args(spine) else { return Ok(false) };
+        match self.consts[crow as usize].kind {
+            CKind::Ctor { induct, nparams, nfields, .. } => {
+                if args.len() >= nparams as usize + nfields as usize {
+                    return Ok(false);
+                }
+                let irow = self.row_of(induct);
+                if irow == NONE || !self.structure_like(irow) {
+                    return Ok(false);
+                }
+            }
+            // a recursor missing only its major premise (lean4#15374), of a
+            // structure (structure eta then reduces it on the variable) or
+            // with rule K
+            CKind::Rec { nparams, nindices, nmotives, nminors, k, .. } => {
+                if args.len() != (nparams + nmotives + nminors + nindices) as usize {
+                    return Ok(false);
+                }
+                if !k {
+                    let Some(&ind) = self.env.rec_major.get(&crow) else { return Ok(false) };
+                    let irow = self.env.known_row(ind);
+                    if irow == NONE || !self.visible(irow) || !self.structure_like(irow) {
+                        return Ok(false);
+                    }
+                }
+            }
+            _ => return Ok(false),
+        }
+        let tb = self.infer_val(b)?;
+        let tb = self.whnf(tb)?;
+        if !self.is_pi_val(tb) {
+            return Ok(false);
+        }
+        let ta = self.infer_val(a)?;
+        let ta = self.whnf(ta)?;
+        if !self.is_pi_val(ta) {
+            return Ok(false);
+        }
+        let da = self.bind_dom(ta)?;
+        let db = self.bind_dom(tb)?;
+        if !self.defeq(da, db)? {
+            return Ok(false);
+        }
+        let d0 = self.vdepth;
+        let x = self.open_var(db)?;
+        let r = (|| {
+            let ax = self.apply(a, x)?;
+            let bx = self.apply(b, x)?;
+            self.defeq(ax, bx)
+        })();
+        self.close_var(x, d0);
+        r
+    }
+
     fn string_expansion(&mut self, a: V, b: V) -> R<Option<bool>> {
         for (x, y) in [(a, b), (b, a)] {
             if let Val::Lit(i) = self.val(x) {
@@ -9330,6 +9398,14 @@ impl Worker {
         }
         let ta = self.infer_val(a)?;
         let ta = self.whnf(ta)?;
+        if self.is_pi_val(ta) {
+            // functions into a unit-like type (lean4#15372)
+            if !self.unit_like_type(ta, 0)? {
+                return Ok(false);
+            }
+            let tb = self.infer_val(b)?;
+            return self.defeq(ta, tb);
+        }
         let Some((irow, _, _)) = self.const_head(ta) else { return Ok(false) };
         if !self.structure_like(irow) {
             return Ok(false);
@@ -9340,11 +9416,71 @@ impl Worker {
             return Ok(false);
         }
         let CKind::Ctor { nfields, .. } = self.consts[crow as usize].kind else { return Ok(false) };
-        if nfields != 0 {
+        if nfields != 0 && !self.unit_like_type(ta, 0)? {
             return Ok(false);
         }
         let tb = self.infer_val(b)?;
         self.defeq(ta, tb)
+    }
+
+    /// A unit-like type (lean4#15372): a structure with eta whose fields
+    /// are all proofs or of unit-like types, or a function type into a
+    /// unit-like type. Any two of its elements are definitionally equal.
+    /// Nested at most 16 deep (no, past that).
+    fn unit_like_type(&mut self, t: V, depth: u32) -> R<bool> {
+        if depth > 16 {
+            return Ok(false);
+        }
+        let t = self.whnf(t)?;
+        if self.is_pi_val(t) {
+            let d = self.bind_dom(t)?;
+            let d0 = self.vdepth;
+            let x = self.open_var(d)?;
+            let r = (|| {
+                let body = self.bind_body(t, x)?;
+                self.unit_like_type(body, depth + 1)
+            })();
+            self.close_var(x, d0);
+            return r;
+        }
+        let Some((irow, tllr, tspine)) = self.const_head(t) else { return Ok(false) };
+        if !self.structure_like(irow) {
+            return Ok(false);
+        }
+        let (np, _, ctors, _) = self.ind_info(irow).unwrap();
+        let crow = self.row_of(ctors[0]);
+        if crow == NONE || !self.visible(crow) {
+            return Ok(false);
+        }
+        let Some(targs) = self.app_args(tspine) else { return Ok(false) };
+        if targs.len() != np as usize {
+            return Ok(false);
+        }
+        let c = self.mk_const(crow, tllr)?;
+        let c = self.mk_app(c, targs)?;
+        let ct = self.infer_val(c)?;
+        self.fields_unit_like(ct, depth)
+    }
+
+    /// The fields of the telescope `ct` (a constructor applied to its
+    /// parameters) are all proofs or of unit-like types.
+    fn fields_unit_like(&mut self, ct: V, depth: u32) -> R<bool> {
+        let ct = self.whnf(ct)?;
+        if !self.is_pi_val(ct) {
+            return Ok(true);
+        }
+        let d = self.bind_dom(ct)?;
+        if !self.is_prop_type(d)? && !self.unit_like_type(d, depth + 1)? {
+            return Ok(false);
+        }
+        let d0 = self.vdepth;
+        let x = self.open_var(d)?;
+        let r = (|| {
+            let rest = self.bind_body(ct, x)?;
+            self.fields_unit_like(rest, depth)
+        })();
+        self.close_var(x, d0);
+        r
     }
 
     // -----------------------------------------------------------------------

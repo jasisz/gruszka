@@ -720,8 +720,15 @@ values:
 - projections of the same field: first the structures by lazy delta, then
   their fields (Lean's lazy_delta_proj_reduction); congruence of other
   neutral terms; then full projection reduction and a retry, lambda eta,
-  structure eta, string literal expansion (whnf'd, as Pestka does), and
-  unit-like types.
+  structure eta, eta for partial applications (a constructor of a
+  structure missing fields, lean4#15373, or a recursor of a structure or
+  with rule K missing only its major premise, lean4#15374: both sides are
+  applied to a new variable of the domain), string literal expansion
+  (whnf'd, as Pestka does), and unit-like types. A type is unit-like
+  (lean4#15372) when it is a structure with eta whose fields are all proofs
+  or of unit-like types (checked on the constructor's telescope at the
+  type's parameters), or a function type into a unit-like type; at most 16
+  levels deep.
 
 **Complete level comparison (the kernel renovation).** Levels are equal
 (or `≥`) when they are for every assignment of the parameters. Lean's
