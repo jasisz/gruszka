@@ -727,17 +727,28 @@ values:
   (whnf'd, as Pestka does), and unit-like types. A type is unit-like
   (lean4#15372) when it is a structure with eta whose fields are all proofs
   or of unit-like types (checked on the constructor's telescope at the
-  type's parameters), or a function type into a unit-like type; at most 16
-  levels deep.
+  type's parameters), or a function type into a unit-like type. The test
+  terminates by the definition (a structure with eta is not recursive, and
+  each step goes into a field's type or a codomain); every step ticks, and
+  types met twice in one test are looked up in a memo.
 
 **Complete level comparison (the kernel renovation).** Levels are equal
 (or `≥`) when they are for every assignment of the parameters. Lean's
 normal forms decide this once no `imax` is left, and a normal form no
 longer keeps an `imax` that became a `max` (`imax u 1` and `max u 1` have
 one form). Only when the normal forms differ and an `imax` is left does
-`Levels::geq_cases` split on a parameter of an `imax`'s right side: `p = 0`
-and `p = p' + 1`, each of which removes the `imax`es that p decides, at
-most 8 parameters deep (past that, no). Equality is both inequalities.
+`Levels::geq_cases` split on a parameter p that decides whether an
+`imax`'s right side is zero (dec(p) = {p}, dec(succ _) = {}, dec(max c d)
+= dec(c) ∪ dec(d), or {} when a side is never zero, dec(imax c d) =
+dec(d)): `p = 0` and `p = p' + 1`. Either way p decides nothing afterwards
+(it is gone, or only under `succ`), so each split removes a deciding
+parameter, and with none left every `imax` is gone and `is_geq` is
+complete. Results are memoized per pair of normal forms in the worker's
+level interner. Each step ticks (`Worker::lv_cases`), so a hostile file
+with many deciding parameters ends in the tick's stop (a decline or a
+cancellation), never in a "no". Equality is both inequalities. Shortcuts
+whose "no" only means "not shown" (`same_val`, `same_term`) keep Lean's
+normal forms alone.
 
 **Conversion order, milestone 41.** CFSG's three walls (totalC, inv_get,
 invol_eq) were not computations the proofs need but the reference

@@ -18,19 +18,21 @@ pub struct Levels<'e> {
     loc: Vec<(u8, u32, u32)>,
     lmap: FxHashMap<(u8, u32, u32), u32>,
     norm_memo: FxHashMap<u32, u32>,
+    /// `geq_cases` results, per pair of normal forms
+    cases_memo: FxHashMap<(u32, u32), bool>,
 }
 
 impl<'e> Levels<'e> {
     pub fn new(g: &'e [(u8, u32, u32)], gmap: &'e FxHashMap<(u8, u32, u32), u32>) -> Levels<'e> {
-        Levels { g, gmap, loc: Vec::new(), lmap: FxHashMap::default(), norm_memo: FxHashMap::default() }
+        Levels { g, gmap, loc: Vec::new(), lmap: FxHashMap::default(), norm_memo: FxHashMap::default(), cases_memo: FxHashMap::default() }
     }
     /// Milestone 37: bytes held (room included)
     pub fn held_bytes(&self) -> usize {
-        self.loc.capacity() * 12 + self.lmap.capacity() * 17 + self.norm_memo.capacity() * 9
+        self.loc.capacity() * 12 + self.lmap.capacity() * 17 + self.norm_memo.capacity() * 9 + self.cases_memo.capacity() * 9
     }
     /// Worker-made levels and memo entries.
     pub fn len(&self) -> usize {
-        self.loc.len() + self.norm_memo.len()
+        self.loc.len() + self.norm_memo.len() + self.cases_memo.len()
     }
     #[inline(always)]
     pub fn get(&self, l: u32) -> (u8, u32, u32) {
@@ -267,39 +269,42 @@ impl<'e> Levels<'e> {
         }
     }
 
-    /// Equal for every assignment of the parameters (complete level
-    /// comparison of the kernel renovation): normal forms first, and when
-    /// they differ and an `imax` is left, both inequalities by cases.
-    pub fn equiv(&mut self, a: u32, b: u32) -> bool {
+    /// Equal by Lean's normal forms. `Some(false)` only when no `imax` is
+    /// left in them, where the normal forms decide; `None` when an `imax`
+    /// is left (complete comparison: `geq_cases` both ways).
+    pub fn equiv3(&mut self, a: u32, b: u32) -> Option<bool> {
         if a == b {
-            return true;
+            return Some(true);
         }
         let na = self.normalize(a);
         let nb = self.normalize(b);
         if na == nb {
-            return true;
+            return Some(true);
         }
         if !self.has_imax(na) && !self.has_imax(nb) {
-            return false;
+            return Some(false);
         }
-        let mut split = Vec::new();
-        self.geq_cases(na, nb, &mut split) && self.geq_cases(nb, na, &mut split)
+        None
     }
 
-    /// `a >= b` for every assignment of the parameters. Lean's `is_geq`
-    /// decides it when no `imax` is left in the normal forms (only `max`,
-    /// `succ`, parameters and constants); otherwise it is tried by cases.
-    pub fn geq(&mut self, a: u32, b: u32) -> bool {
+    /// Lean's `is_def_eq` on levels (normal forms only): the cheap,
+    /// incomplete test for shortcuts whose "no" only means "not shown".
+    pub fn equiv_fast(&mut self, a: u32, b: u32) -> bool {
+        self.equiv3(a, b) == Some(true)
+    }
+
+    /// `a >= b` by Lean's `is_geq`, which decides it when no `imax` is left
+    /// in the normal forms; `None` otherwise (then `geq_cases`).
+    pub fn geq3(&mut self, a: u32, b: u32) -> Option<bool> {
         let a = self.normalize(a);
         let b = self.normalize(b);
         if self.geq_core(a, b) {
-            return true;
+            return Some(true);
         }
         if !self.has_imax(a) && !self.has_imax(b) {
-            return false;
+            return Some(false);
         }
-        let mut split = Vec::new();
-        self.geq_cases(a, b, &mut split)
+        None
     }
 
     fn geq_fast(&mut self, a: u32, b: u32) -> bool {
@@ -318,62 +323,91 @@ impl<'e> Levels<'e> {
         }
     }
 
-    /// A parameter, not yet split on, of the right side of some `imax` in `l`.
-    fn imax_split_param(&self, l: u32, split: &[u32]) -> Option<u32> {
+    /// A parameter that decides whether `l` is zero: dec(p) = {p},
+    /// dec(succ _) = {}, dec(max c d) = dec(c) ∪ dec(d) (or {} when a side is
+    /// never zero), dec(imax c d) = dec(d). The first one found.
+    fn deciding(&self, l: u32) -> Option<u32> {
         let (k, a, b) = self.get(l);
         match k {
-            K_SUCC => self.imax_split_param(a, split),
-            K_MAX => self.imax_split_param(a, split).or_else(|| self.imax_split_param(b, split)),
-            K_IMAX => {
-                let mut found = None;
-                self.params_in(b, &mut |p| {
-                    if split.contains(&p) {
-                        true
-                    } else {
-                        found = Some(p);
-                        false
-                    }
-                });
-                found.or_else(|| self.imax_split_param(a, split)).or_else(|| self.imax_split_param(b, split))
+            K_PARAM => Some(a),
+            K_MAX => {
+                if self.is_not_zero(a) || self.is_not_zero(b) {
+                    None
+                } else {
+                    self.deciding(a).or_else(|| self.deciding(b))
+                }
             }
+            K_IMAX => self.deciding(b),
             _ => None,
         }
     }
 
-    /// `a >= b` by cases on the parameters that decide an `imax`: `p = 0`,
-    /// and `p = p' + 1` (the same name standing for p'), where every `imax`
-    /// whose right side p decides becomes a `max` or `0`. Once no parameter
-    /// is left to split on, every `imax` is gone, and `geq_core` is complete.
-    /// At most `MAX_SPLITS` parameters deep; past that the answer is no (a
-    /// good file may then be rejected, never a bad one accepted).
-    fn geq_cases(&mut self, a: u32, b: u32, split: &mut Vec<u32>) -> bool {
-        const MAX_SPLITS: usize = 8;
+    /// A parameter deciding the right side of some `imax` in `l`.
+    fn split_param(&self, l: u32) -> Option<u32> {
+        let (k, a, b) = self.get(l);
+        match k {
+            K_SUCC => self.split_param(a),
+            K_MAX => self.split_param(a).or_else(|| self.split_param(b)),
+            K_IMAX => self.deciding(b).or_else(|| self.split_param(a)).or_else(|| self.split_param(b)),
+            _ => None,
+        }
+    }
+
+    /// `a >= b` for every assignment of the parameters, by cases on a
+    /// parameter p that decides an `imax`: `p = 0`, and `p = p' + 1` (the
+    /// same name standing for p'). Either way p no longer decides anything
+    /// (it is gone, or only under `succ`), so each step removes one deciding
+    /// parameter, and once none is left every `imax` is gone and `geq_core`
+    /// is complete. `tick` is called at every step; when it says stop, the
+    /// answer is `None` (the caller declines), never a "no". Results are
+    /// memoized per pair of normal forms.
+    pub fn geq_cases(&mut self, a: u32, b: u32, tick: &mut dyn FnMut() -> bool) -> Option<bool> {
+        if !tick() {
+            return None;
+        }
         let a = self.normalize(a);
         let b = self.normalize(b);
-        if self.geq_core(a, b) {
-            return true;
+        if let Some(&r) = self.cases_memo.get(&(a, b)) {
+            return Some(r);
         }
-        let Some(p) = self.imax_split_param(a, split).or_else(|| self.imax_split_param(b, split)) else {
-            return false;
-        };
-        if split.len() >= MAX_SPLITS {
-            return false;
-        }
-        let pl = self.param(p);
-        let succ_p = self.succ(pl);
-        split.push(p);
-        let mut ok = true;
-        for to in [ZERO, succ_p] {
-            let f = |n: u32| if n == p { Some(to) } else { None };
-            let a2 = self.subst(a, &f, &mut FxHashMap::default());
-            let b2 = self.subst(b, &f, &mut FxHashMap::default());
-            if !self.geq_cases(a2, b2, split) {
-                ok = false;
-                break;
+        let r = if self.geq_core(a, b) {
+            true
+        } else if let Some(p) = self.split_param(a).or_else(|| self.split_param(b)) {
+            let pl = self.param(p);
+            let succ_p = self.succ(pl);
+            let mut ok = true;
+            for to in [ZERO, succ_p] {
+                let f = |n: u32| if n == p { Some(to) } else { None };
+                let a2 = self.subst(a, &f, &mut FxHashMap::default());
+                let b2 = self.subst(b, &f, &mut FxHashMap::default());
+                if !self.geq_cases(a2, b2, tick)? {
+                    ok = false;
+                    break;
+                }
             }
+            ok
+        } else {
+            false
+        };
+        self.cases_memo.insert((a, b), r);
+        Some(r)
+    }
+
+    /// Moves the worker-made levels and memos out (into the returned
+    /// interner), leaving an empty one on the same global table, so that a
+    /// caller can tick while `geq_cases` runs; `attach` puts them back.
+    pub fn detach(&mut self) -> Levels<'e> {
+        Levels {
+            g: self.g,
+            gmap: self.gmap,
+            loc: std::mem::take(&mut self.loc),
+            lmap: std::mem::take(&mut self.lmap),
+            norm_memo: std::mem::take(&mut self.norm_memo),
+            cases_memo: std::mem::take(&mut self.cases_memo),
         }
-        split.pop();
-        ok
+    }
+    pub fn attach(&mut self, other: Levels<'e>) {
+        *self = other;
     }
 
     fn geq_core(&mut self, l1: u32, l2: u32) -> bool {
@@ -482,6 +516,20 @@ impl<'e> Levels<'e> {
 mod tests {
     use super::*;
 
+    /// Complete comparison, never stopped.
+    fn geq(lv: &mut Levels, a: u32, b: u32) -> bool {
+        match lv.geq3(a, b) {
+            Some(r) => r,
+            None => lv.geq_cases(a, b, &mut || true).unwrap(),
+        }
+    }
+    fn equiv(lv: &mut Levels, a: u32, b: u32) -> bool {
+        match lv.equiv3(a, b) {
+            Some(r) => r,
+            None => geq(lv, a, b) && geq(lv, b, a),
+        }
+    }
+
     /// Milestone 29: `geq` against Lean's is_geq_core (offsets compare when
     /// the bases are equal or the right side's base is zero).
     #[test]
@@ -519,7 +567,7 @@ mod tests {
             (v1, iuv1, false),
         ];
         for (a, b, want) in cases {
-            assert_eq!(lv.geq(a, b), want, "geq({a}, {b})");
+            assert_eq!(geq(&mut lv, a, b), want, "geq({a}, {b})");
         }
     }
 
@@ -559,9 +607,9 @@ mod tests {
             (im(&mut lv, u, ivw), im(&mut lv, muv, w)),
         ];
         for (a, b) in good {
-            assert!(lv.equiv(a, b), "equiv({a}, {b})");
+            assert!(equiv(&mut lv, a, b), "equiv({a}, {b})");
         }
-        assert!(lv.geq(muv, iuv), "imax u v <= max u v");
+        assert!(geq(&mut lv, muv, iuv), "imax u v <= max u v");
         let bad = [
             (iuv, muv),
             (iuv, ivu),
@@ -570,8 +618,57 @@ mod tests {
             (iuv, v),
         ];
         for (a, b) in bad {
-            assert!(!lv.equiv(a, b), "not equiv({a}, {b})");
+            assert!(!equiv(&mut lv, a, b), "not equiv({a}, {b})");
         }
-        assert!(!lv.geq(iuv, u), "u <= imax u v is false");
+        assert!(!geq(&mut lv, iuv, u), "u <= imax u v is false");
+    }
+
+    /// Nine and more deciding parameters: no cap on the splits; a tick
+    /// that says stop ends the comparison with no answer, never a "no".
+    #[test]
+    fn equiv_many_deciding_params() {
+        let g = vec![(K_ZERO, 0, 0)];
+        let gmap: FxHashMap<(u8, u32, u32), u32> = [((K_ZERO, 0, 0), 0)].into_iter().collect();
+        let mut lv = Levels::new(&g, &gmap);
+        let u = lv.param(100);
+        let ps: Vec<u32> = (1..=10).map(|i| lv.param(i)).collect();
+        // imax u (max p1 .. p10) = max (imax u p1) .. (imax u p10)
+        let mut m = ps[0];
+        for &p in &ps[1..] {
+            m = lv.mk(K_MAX, m, p);
+        }
+        let left = lv.mk(K_IMAX, u, m);
+        let mut right = lv.mk(K_IMAX, u, ps[0]);
+        for &p in &ps[1..] {
+            let ip = lv.mk(K_IMAX, u, p);
+            right = lv.mk(K_MAX, right, ip);
+        }
+        assert!(equiv(&mut lv, left, right), "imax distributes over a max of ten");
+        // imax u (max p1 .. p10) = max u p1 .. p10 is false (all p = 0, u = 1)
+        let wrong = lv.mk(K_MAX, u, m);
+        assert!(!equiv(&mut lv, left, wrong), "imax is not max");
+        // nested: imax p1 (imax p2 (.. (imax p9 p10))) <= max p1 .. p10, and not >=
+        let mut nest = ps[9];
+        for &p in ps[..9].iter().rev() {
+            nest = lv.mk(K_IMAX, p, nest);
+        }
+        assert!(geq(&mut lv, m, nest), "nested imax under the max");
+        assert!(!geq(&mut lv, nest, m), "max not under the nested imax");
+        // a stop is no answer
+        let mut lv2 = Levels::new(&g, &gmap);
+        let u = lv2.param(100);
+        let ps: Vec<u32> = (1..=10).map(|i| lv2.param(i)).collect();
+        let mut m = ps[0];
+        for &p in &ps[1..] {
+            m = lv2.mk(K_MAX, m, p);
+        }
+        let left = lv2.mk(K_IMAX, u, m);
+        let mut right = lv2.mk(K_IMAX, u, ps[0]);
+        for &p in &ps[1..] {
+            let ip = lv2.mk(K_IMAX, u, p);
+            right = lv2.mk(K_MAX, right, ip);
+        }
+        let mut n = 0;
+        assert_eq!(lv2.geq_cases(left, right, &mut || { n += 1; n < 3 }), None);
     }
 }

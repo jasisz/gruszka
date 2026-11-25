@@ -713,7 +713,7 @@ impl Worker {
             let l = self.sort_of(w, "inductive type result")?;
             if j == 0 {
                 ind.result = l;
-            } else if !self.lv.equiv(l, ind.result) {
+            } else if !self.lv_equiv(l, ind.result)? {
                 return reject("mutually inductive types must live in the same universe");
             }
         }
@@ -776,7 +776,7 @@ impl Worker {
                 v = self.bind_body(w, x)?;
             }
             let l = self.sort_of(v, "nested type result")?;
-            if !self.lv.equiv(l, ind.result) {
+            if !self.lv_equiv(l, ind.result)? {
                 return reject("nested occurrence: the nested type must live in the block's universe");
             }
         }
@@ -819,8 +819,8 @@ impl Worker {
                         // impredicative type (lean4#16595); without them, in
                         // every type that lives in Prop
                         let fits = match impred {
-                            Some(imp) => imp || self.lv.geq(ind.result, sl),
-                            None => self.lv.geq(ind.result, sl) || self.lv.zeroish(ind.result),
+                            Some(imp) => imp || self.lv_geq(ind.result, sl)?,
+                            None => self.lv_geq(ind.result, sl)? || self.lv.zeroish(ind.result),
                         };
                         if !fits {
                             return reject(format!(

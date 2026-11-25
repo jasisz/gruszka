@@ -7235,7 +7235,7 @@ impl Worker {
             (Val::Neu { head: ha, spine: sa }, Val::Neu { head: hb, spine: sb }) => {
                 let heads = match (ha, hb) {
                     (Head::Stuck(x), Head::Stuck(y)) => self.same_val(x, y, fuel),
-                    (Head::Const(r1, l1), Head::Const(r2, l2)) => r1 == r2 && self.levels_equiv(l1, l2),
+                    (Head::Const(r1, l1), Head::Const(r2, l2)) => r1 == r2 && self.levels_equiv_fast(l1, l2),
                     _ => ha == hb,
                 };
                 if !heads {
@@ -7316,7 +7316,7 @@ impl Worker {
             Val::Clo { term, env, ls: l } => self.same_term(term, env, l, t, e, ls, 0, fuel),
             Val::Sort(l) => k == SORT && {
                 let y = self.lsub(self.tp(t), ls);
-                l == y || self.lv.equiv(l, y)
+                l == y || self.lv.equiv_fast(l, y)
             },
             Val::Lit(i) => (k == NAT || k == STR) && self.lit(i) == self.lit(self.tp(t)),
             _ => false,
@@ -7355,7 +7355,7 @@ impl Worker {
             return false;
         }
         let l2 = self.const_ll(f, ls);
-        if !self.levels_equiv(l, l2) {
+        if !self.levels_equiv_fast(l, l2) {
             return false;
         }
         // spine from last to first, args collected last first
@@ -7497,14 +7497,14 @@ impl Worker {
             }
             SORT => {
                 let (x, y) = (self.lsub(na.p, la), self.lsub(nb.p, lb));
-                x == y || self.lv.equiv(x, y)
+                x == y || self.lv.equiv_fast(x, y)
             }
             CONST => {
                 if self.env.canon(na.a) != self.env.canon(nb.a) {
                     return false;
                 }
                 let (x, y) = (self.const_ll(ta, la), self.const_ll(tb, lb));
-                self.levels_equiv(x, y)
+                self.levels_equiv_fast(x, y)
             }
             APP => {
                 self.same_term(na.a, ea, la, nb.a, eb, lb, depth, fuel)
@@ -7537,7 +7537,7 @@ impl Worker {
         }
         match (self.val(a), self.val(b)) {
             (Val::Sort(x), Val::Sort(y)) => {
-                let r = self.lv.equiv(x, y);
+                let r = self.lv_equiv(x, y)?;
                 Ok(Some(r))
             }
             (Val::Lit(x), Val::Lit(y)) => Ok(Some(x == y || self.lit(x) == self.lit(y))),
@@ -8219,7 +8219,7 @@ impl Worker {
     fn race_k(&mut self, a: V, b: V, budget: u32) -> R<bool> {
         let (ra, la, sa) = self.const_head(a).unwrap();
         let (_, lb, sb) = self.const_head(b).unwrap();
-        if !self.levels_equiv(la, lb) {
+        if !self.levels_equiv(la, lb)? {
             return Ok(false);
         }
         let n = self.sp.len(sa);
@@ -8291,7 +8291,7 @@ impl Worker {
             return Ok(Some(false));
         }
         let ly = self.const_head(y).unwrap().1;
-        match self.attempt(Att::Meet, *allow, |s| Ok(s.levels_equiv(lw, ly) && s.spines_defeq_skip(sw, sy, rw, lw, true)?))? {
+        match self.attempt(Att::Meet, *allow, |s| Ok(s.levels_equiv(lw, ly)? && s.spines_defeq_skip(sw, sy, rw, lw, true)?))? {
             Some(true) => Ok(Some(true)),
             Some(false) => {
                 self.put_args_no(w, y);
@@ -8402,7 +8402,7 @@ impl Worker {
                     continue;
                 }
                 if sw == EMPTY {
-                    if self.levels_equiv(lw, ly) {
+                    if self.levels_equiv(lw, ly)? {
                         return Ok(true);
                     }
                     continue;
@@ -8410,7 +8410,7 @@ impl Worker {
                 if self.args_no(w, y) {
                     continue;
                 }
-                match self.attempt(Att::Meet, *allow, |s| Ok(s.levels_equiv(lw, ly) && s.spines_defeq_skip(sw, sy, rw, lw, true)?))? {
+                match self.attempt(Att::Meet, *allow, |s| Ok(s.levels_equiv(lw, ly)? && s.spines_defeq_skip(sw, sy, rw, lw, true)?))? {
                     Some(true) => return Ok(true),
                     Some(false) => self.put_args_no(w, y),
                     None => *allow = allow.saturating_mul(2),
@@ -8618,7 +8618,7 @@ impl Worker {
                             let tk0 = self.ticks;
                             if dstack_on() { dstack_push(b'A', NONE, NONE, self.ticks); }
                             let run = |s: &mut Self| -> R<bool> {
-                                Ok(if !s.levels_equiv(la, lb) || s.args_refuted(sa, sb, ra, la)? {
+                                Ok(if !s.levels_equiv(la, lb)? || s.args_refuted(sa, sb, ra, la)? {
                                     false
                                 } else {
                                     s.spines_defeq_skip(sa, sb, ra, la, true)?
@@ -8661,7 +8661,7 @@ impl Worker {
                         let (_, la, sa) = self.const_head(a).unwrap();
                         let (_, lb, sb) = self.const_head(b).unwrap();
                         if sa != EMPTY && sb != EMPTY && !self.args_no(a, b) && !(self.attempting() && self.att_kind == Att::RaceR) && self.probe_worth(sa, sb, ra) {
-                            if self.levels_equiv(la, lb) && self.probe_args(sa, sb, ra, la)? {
+                            if self.levels_equiv(la, lb)? && self.probe_args(sa, sb, ra, la)? {
                                 return Ok(DStep::Equal);
                             }
                             self.put_args_no(a, b);
@@ -9176,13 +9176,69 @@ impl Worker {
         }
     }
 
-    fn levels_equiv(&mut self, la: u32, lb: u32) -> bool {
+    /// Level lists equal for every assignment (complete; may tick).
+    pub fn levels_equiv(&mut self, la: u32, lb: u32) -> R<bool> {
+        if la == lb {
+            return Ok(true);
+        }
+        let xa = self.ll_get(la).to_vec();
+        let xb = self.ll_get(lb).to_vec();
+        if xa.len() != xb.len() {
+            return Ok(false);
+        }
+        for (&x, &y) in xa.iter().zip(xb.iter()) {
+            if !self.lv_equiv(x, y)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Level lists equal by normal forms only: for shortcuts whose "no"
+    /// only means "not shown".
+    fn levels_equiv_fast(&mut self, la: u32, lb: u32) -> bool {
         if la == lb {
             return true;
         }
         let xa = self.ll_get(la).to_vec();
         let xb = self.ll_get(lb).to_vec();
-        xa.len() == xb.len() && xa.iter().zip(xb.iter()).all(|(&x, &y)| self.lv.equiv(x, y))
+        xa.len() == xb.len() && xa.iter().zip(xb.iter()).all(|(&x, &y)| self.lv.equiv_fast(x, y))
+    }
+
+    /// Levels equal for every assignment of the parameters (complete level
+    /// comparison of the renovation): normal forms first, then by cases.
+    pub fn lv_equiv(&mut self, a: u32, b: u32) -> R<bool> {
+        match self.lv.equiv3(a, b) {
+            Some(r) => Ok(r),
+            None => Ok(self.lv_cases(a, b)? && self.lv_cases(b, a)?),
+        }
+    }
+
+    /// `a >= b` for every assignment of the parameters.
+    pub fn lv_geq(&mut self, a: u32, b: u32) -> R<bool> {
+        match self.lv.geq3(a, b) {
+            Some(r) => Ok(r),
+            None => self.lv_cases(a, b),
+        }
+    }
+
+    /// `Levels::geq_cases`, ticking at every step: a comparison too costly
+    /// ends in the tick's stop (decline, cancellation), never in a "no".
+    fn lv_cases(&mut self, a: u32, b: u32) -> R<bool> {
+        let mut lv = self.lv.detach();
+        let mut stop = None;
+        let r = lv.geq_cases(a, b, &mut || match self.tick() {
+            Ok(()) => true,
+            Err(e) => {
+                stop = Some(e);
+                false
+            }
+        });
+        self.lv.attach(lv);
+        match r {
+            Some(r) => Ok(r),
+            None => Err(stop.expect("geq_cases stops only on a tick's stop")),
+        }
     }
 
     fn spines_defeq(&mut self, sa: u32, sb: u32) -> R<bool> {
@@ -9231,7 +9287,7 @@ impl Worker {
         let heads = match (ha, hb) {
             (Head::FVar(x), Head::FVar(y)) => x == y,
             (Head::Const(r1, l1), Head::Const(r2, l2)) => {
-                if r1 == r2 && self.levels_equiv(l1, l2) {
+                if r1 == r2 && self.levels_equiv(l1, l2)? {
                     if dstack_on() { dstack_push(b'C', NONE, NONE, self.ticks); }
                     let r = self.spines_defeq_skip(sa, sb, r1, l1, false);
                     if dstack_on() { dstack_pop(); }
@@ -9312,7 +9368,7 @@ impl Worker {
 
     /// Function eta for a partially applied constructor of a structure
     /// (`b`, lean4#15373), or a recursor of a structure or with rule K that
-    /// misses only its major premise (lean4#15374): `mk ps fs` missing fields
+    /// misses its major premise (lean4#15374): `mk ps fs` missing fields
     /// is `fun x => mk ps fs x`, so it is compared with `a` (not a lambda:
     /// `try_eta` took those) by applying both to a new variable of the
     /// domain. Then structure eta (or K) can see the full application.
@@ -9332,11 +9388,13 @@ impl Worker {
                     return Ok(false);
                 }
             }
-            // a recursor missing only its major premise (lean4#15374), of a
+            // a recursor missing its major premise (lean4#15374), of a
             // structure (structure eta then reduces it on the variable) or
             // with rule K
             CKind::Rec { nparams, nindices, nmotives, nminors, k, .. } => {
-                if args.len() != (nparams + nmotives + nminors + nindices) as usize {
+                // as lean4#15374: any application that stops at or before
+                // the major premise (`args.size() <= major_idx`)
+                if args.len() > (nparams + nmotives + nminors + nindices) as usize {
                     return Ok(false);
                 }
                 if !k {
@@ -9400,7 +9458,7 @@ impl Worker {
         let ta = self.whnf(ta)?;
         if self.is_pi_val(ta) {
             // functions into a unit-like type (lean4#15372)
-            if !self.unit_like_type(ta, 0)? {
+            if !self.unit_like_type(ta, &mut FxHashMap::default())? {
                 return Ok(false);
             }
             let tb = self.infer_val(b)?;
@@ -9416,7 +9474,7 @@ impl Worker {
             return Ok(false);
         }
         let CKind::Ctor { nfields, .. } = self.consts[crow as usize].kind else { return Ok(false) };
-        if nfields != 0 && !self.unit_like_type(ta, 0)? {
+        if nfields != 0 && !self.unit_like_type(ta, &mut FxHashMap::default())? {
             return Ok(false);
         }
         let tb = self.infer_val(b)?;
@@ -9426,11 +9484,22 @@ impl Worker {
     /// A unit-like type (lean4#15372): a structure with eta whose fields
     /// are all proofs or of unit-like types, or a function type into a
     /// unit-like type. Any two of its elements are definitionally equal.
-    /// Nested at most 16 deep (no, past that).
-    fn unit_like_type(&mut self, t: V, depth: u32) -> R<bool> {
-        if depth > 16 {
-            return Ok(false);
+    /// It terminates by the definition: a structure with eta is not
+    /// recursive, and each call goes into a field's type or a codomain.
+    /// Each call ticks, so one too deep or too costly ends in the tick's
+    /// stop (decline), never in a "no"; `memo` (one per comparison) keeps
+    /// types met twice from being walked twice.
+    fn unit_like_type(&mut self, t: V, memo: &mut FxHashMap<V, bool>) -> R<bool> {
+        self.tick()?;
+        if let Some(&r) = memo.get(&t) {
+            return Ok(r);
         }
+        let r = self.unit_like_type_walk(t, memo)?;
+        memo.insert(t, r);
+        Ok(r)
+    }
+
+    fn unit_like_type_walk(&mut self, t: V, memo: &mut FxHashMap<V, bool>) -> R<bool> {
         let t = self.whnf(t)?;
         if self.is_pi_val(t) {
             let d = self.bind_dom(t)?;
@@ -9438,7 +9507,7 @@ impl Worker {
             let x = self.open_var(d)?;
             let r = (|| {
                 let body = self.bind_body(t, x)?;
-                self.unit_like_type(body, depth + 1)
+                self.unit_like_type(body, memo)
             })();
             self.close_var(x, d0);
             return r;
@@ -9459,25 +9528,26 @@ impl Worker {
         let c = self.mk_const(crow, tllr)?;
         let c = self.mk_app(c, targs)?;
         let ct = self.infer_val(c)?;
-        self.fields_unit_like(ct, depth)
+        self.fields_unit_like(ct, memo)
     }
 
     /// The fields of the telescope `ct` (a constructor applied to its
     /// parameters) are all proofs or of unit-like types.
-    fn fields_unit_like(&mut self, ct: V, depth: u32) -> R<bool> {
+    fn fields_unit_like(&mut self, ct: V, memo: &mut FxHashMap<V, bool>) -> R<bool> {
+        self.tick()?;
         let ct = self.whnf(ct)?;
         if !self.is_pi_val(ct) {
             return Ok(true);
         }
         let d = self.bind_dom(ct)?;
-        if !self.is_prop_type(d)? && !self.unit_like_type(d, depth + 1)? {
+        if !self.is_prop_type(d)? && !self.unit_like_type(d, memo)? {
             return Ok(false);
         }
         let d0 = self.vdepth;
         let x = self.open_var(d)?;
         let r = (|| {
             let rest = self.bind_body(ct, x)?;
-            self.fields_unit_like(rest, depth)
+            self.fields_unit_like(rest, memo)
         })();
         self.close_var(x, d0);
         r

@@ -1118,7 +1118,7 @@ impl Worker {
                     Obj::Con { row: r1, llr: l1, args: a1, ctor: c1, .. },
                     Obj::Con { row: r2, llr: l2, args: a2, ctor: c2, .. },
                 ) => {
-                    if c1 == c2 && a1.len() == a2.len() && self.canon_of_row(*r1) == self.canon_of_row(*r2) && self.levels_equiv(*l1, *l2) {
+                    if c1 == c2 && a1.len() == a2.len() && self.canon_of_row(*r1) == self.canon_of_row(*r2) && self.levels_equiv(*l1, *l2)? {
                         let skip = self.prop_positions(*r1, *l1)?;
                         for i in 0..a1.len() {
                             if i < 64 && skip & (1u64 << i) != 0 {
