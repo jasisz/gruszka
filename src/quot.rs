@@ -19,6 +19,9 @@ enum P {
 enum Lp {
     Zero,
     Param(usize),
+    /// `max 1 u` for parameter i, as `mkLevelMax 1 u` writes it: Quot's
+    /// sort since lean4#15023.
+    Max1(usize),
 }
 
 fn app(f: P, a: P) -> P {
@@ -59,6 +62,12 @@ impl Worker {
         match lp {
             Lp::Zero => Some(ZERO),
             Lp::Param(i) => params.get(i).map(|&n| self.lv.param(n)),
+            Lp::Max1(i) => {
+                let u = self.lp_level(Lp::Param(i), params)?;
+                let one = self.lv.succ(ZERO);
+                // built without simplification, as the export writes it
+                Some(self.lv.mk(crate::level::K_MAX, one, u))
+            }
         }
     }
 
@@ -175,7 +184,14 @@ impl Worker {
         if params.len() != nparams {
             return reject("quotient declaration with the wrong number of universe parameters");
         }
-        if !self.matches(c.ty, &ty, &params) {
+        // lean4#15023 declares `Quot.{u} {α : Sort u} (r : α → α → Prop) :
+        // Sort (max 1 u)`, so that a quotient of a proposition is a type; Lean
+        // before it, `… : Sort u`. Either is a consistent package: everything
+        // else takes Quot's sort from its declared type, and the other three
+        // types do not mention the sort.
+        let renovated = kind == 0
+            && self.matches(c.ty, &pi(P::Sort(Lp::Param(0)), pi(rel(0), P::Sort(Lp::Max1(0)))), &params);
+        if !renovated && !self.matches(c.ty, &ty, &params) {
             return reject("quotient declaration with an unexpected type");
         }
         Ok(())

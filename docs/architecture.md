@@ -1107,7 +1107,11 @@ uses a fully applied rule.
 `Quot.ind` are reserved for the package. A constant with one of those names
 that is not the corresponding quotient record causes the file to be
 rejected, and each record's type is compared with the one Lean builds after
-Eq's shape has been checked. The whole file, including the prelude, is
+Eq's shape has been checked. `Quot` itself may be in `Sort u` (Lean before
+lean4#15023) or in `Sort (max 1 u)` (after it, so that a quotient of a
+proposition is a type); the rest of the kernel takes its sort from the
+declared type, so proof irrelevance applies to `Quot r` exactly when that
+type says it is a proposition. The whole file, including the prelude, is
 treated as hostile.
 
 ## Checking part of a file
