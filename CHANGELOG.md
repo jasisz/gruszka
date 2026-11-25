@@ -1,12 +1,35 @@
 # Changelog
 
-## Unreleased
+## 0.2.2
 
-Reads susz 0.5.0 files whose inductive blocks do not carry `isReflexive`
-(Susz kind 8, the NOREFL section): Lean since the kernel renovation
-(lean4#16595) no longer has the field, so its exports leave it out.
-Gruszka computes isReflexive as before and compares it with the file only
-where the file gives it.
+Passes lean-kernel-arena-beta: all 213 good and 137 bad tests, exported by
+Lean `pr-release-16595-55bd690` (the kernel renovation, lean4#16595), Init
+and Std included. 0.2.1 could not read most of them: their inductive types
+no longer carry `isReflexive`, and susz 0.4.0 refused to pack them. The
+renovation tests that are ahead of that toolchain pass too. On Init and
+mathlib at 4 workers, instructions are within 0.4% of 0.2.1 and peak
+memory within 1%.
+
+Changes:
+
+- Reads susz 0.5.0 files whose inductive blocks do not carry `isReflexive`
+  (Susz kind 8, the NOREFL section). Gruszka computes isReflexive as before
+  and compares it with the file only where the file gives it.
+- `Quot` may be declared in `Sort (max 1 u)` (lean4#15023), so that a
+  quotient of a proposition is a type, as well as in `Sort u` as before.
+  Proof irrelevance follows the declared type.
+- Complete level comparison: levels are equal (or `≥`) when they are for
+  every assignment of the parameters. When Lean's normal forms differ and
+  an `imax` is left, the parameters that decide it are split on (`p = 0`
+  and `p = p' + 1`), at most 8 deep. A normal form no longer keeps an
+  `imax` that became a `max`.
+- Eta for partial applications: a constructor of a structure missing
+  fields (lean4#15373), and a recursor of a structure or with rule K
+  missing only its major premise (lean4#15374), are compared by applying
+  both sides to a new variable.
+- Unit-like types (lean4#15372): a structure with eta whose fields are all
+  proofs or of unit-like types, or a function type into one. Any two of its
+  elements are definitionally equal.
 
 ## 0.2.1
 
