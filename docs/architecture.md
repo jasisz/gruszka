@@ -883,14 +883,36 @@ is refused, only delayed, so lazy delta's answers stay the reference's.
   `J` projections), with the values' ids, and `SK_REDO_TRACE` prints the
   roots of redone regions.
   e6SimpleCheck_eq_true (196 s; locally 69-73 s at 0.86 GB, Pestka 4.5 s)
-  stays open: it is regions redoing rolled-back work (317 M ticks against
-  37 M with regions off, which takes 8 s at 3.4 GB; 512 K rollbacks made
-  283 M values). The redone pieces are matrix entries of lazy lists
-  (`HAdd .. (HMul (Array.getD (List.toArray (mmulL ..)) i) ..)`), each
-  first redone once (12.9 K first redos against 1.7 K second, so they are
-  pinned only at the second), and much of the work is below `GHOST_TICKS`
-  per piece and never seen as redone. Opening regions later does not fit
-  in twice the memory (2^23 values: 53 s, 1.6 GB; 2^24: 8.7 s, 2.6 GB).
+  is regions redoing rolled-back work: milestone 63 below.
+- *Redone regions, closed for now (milestone 63).* e6SimpleCheck_eq_true
+  takes 317 M ticks with regions against 37 M without (8 s at 3.4 GB).
+  The arena sits at the threshold (4.2-4.5 M values), rollbacks are small
+  (~550 values each, 4.7% of the copy budget used), and what is done again
+  is whole tests (`BEq (foldl ..) % p`, `matVecA6`), not only matrix
+  entries. Probes (knobs, w1, M2): `SK_PIN_FIRST=1` with `SK_GHOST_TICKS`
+  16 / 64: 26 / 30 s, 1.19 / 1.16 GB; `SK_REGION_MIN=4096`: 62 s;
+  `SK_REGION_FRONT=1` / `=2`: 13.2 / 12.7 s, 1.23 / 1.03 GB; the ground
+  machine from 2^22 values (`SK_GROUND_AT`, with or without the gate mode):
+  past 150 s. A counter (knobs `SK_REDO_CLASS=1`: every closed region's
+  root dropped by a rollback is keyed at any cost; a region opened later is
+  classed by its root's key: fresh, dropped at `GHOST_TICKS` or more, or
+  dropped cheaper; the outermost classed region's ticks are summed; per
+  shape, roots dropped and returned, ticks and values made): at 185 M
+  ticks, 16.8 M regions were 4.5 M fresh, 0.22 M redone costly and 12.0 M
+  redone cheap, and the redone ones held 49.7 M + 32.3 M ticks, about half
+  of the ~163 M excess by then (the rest: rollback bookkeeping and work
+  under fresh keys). Below the 80% set beforehand, so keeping a root with
+  its result by a learnt return rate per shape (rule 1) has no ceiling here.
+  `FRONT=2` (values made of older parts keep their whnf memos, a memo that
+  does not fit dropped; `reach_root` lets a one-object root through at a
+  spent budget, so past the quarter every one-object pair is still kept)
+  passes w07 but doubles MatCert_J4Fix (w4: 4.73 -> 9.74 T instructions,
+  6.7 -> 4.5 GB); stopping at the spent budget (`=3`) or keeping only pairs
+  already copied (`=4`) costs MatCert +4% and leaves w07 at 28 s. Ground
+  from fewer values loses on w07 itself. All three rules die at the
+  thresholds set beforehand (w07 <= 16 s and 1.7 GB, MatCert and the
+  pinning slices within 1%); the counters and `SK_REGION_FRONT=3/4` stay in
+  the knobs build, release unchanged.
 
 Vectors (`tests/adv-base/m41.lean`, Lean 4.35 + olean-export):
 good/bad_m41_natwait_sum (`[w, 1].sum = w + (1 + 0)` and `+ (2 + 0)`),

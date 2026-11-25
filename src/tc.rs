@@ -1281,6 +1281,18 @@ pub struct Worker {
     /// closed regions (root, cost in ticks) whose roots may die in an
     /// enclosing rollback (then their keys go to `ghost`)
     reg_done: Vec<(V, u32)>,
+    /// milestone 63, knobs SK_REDO_CLASS=1: every closed region's root (any
+    /// cost) dropped by a rollback, by key with its cost; region ticks by
+    /// class of root (fresh, dropped before at >= ghost_ticks, dropped
+    /// before cheaper); per shape: dropped, returned, ticks dropped, made
+    pub(crate) rc_on: bool,
+    pub(crate) rc_all: Vec<(V, u32, u32)>,
+    pub(crate) rc_ghost: FxHashMap<u64, u32>,
+    pub(crate) rc_in: bool,
+    pub(crate) rc_ckpt: bool,
+    pub(crate) rc_sum: [u64; 3],
+    pub(crate) rc_cnt: [u64; 3],
+    pub(crate) rc_shape: FxHashMap<u64, [u64; 4]>,
     /// roots of pinned regions an enclosing rollback must keep, with their
     /// whnf memos
     pin_ids: Vec<V>,
@@ -1562,6 +1574,14 @@ impl Worker {
             key_fuel: if KNOBS { std::env::var("SK_KEY_FUEL").ok().and_then(|s| s.parse().ok()).unwrap_or(region::KEY_FUEL) } else { region::KEY_FUEL },
             ghost_ticks: if KNOBS { std::env::var("SK_GHOST_TICKS").ok().and_then(|s| s.parse().ok()).unwrap_or(region::GHOST_TICKS) } else { region::GHOST_TICKS },
             reg_done: Vec::new(),
+            rc_on: KNOBS && std::env::var_os("SK_REDO_CLASS").is_some(),
+            rc_all: Vec::new(),
+            rc_ghost: FxHashMap::default(),
+            rc_in: false,
+            rc_ckpt: false,
+            rc_sum: [0; 3],
+            rc_cnt: [0; 3],
+            rc_shape: FxHashMap::default(),
             pin_ids: Vec::new(),
             wstates: Vec::new(),
             wfront: Vec::new(),

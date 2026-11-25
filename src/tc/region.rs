@@ -100,6 +100,11 @@ pub(super) struct Reg {
     dvm: u32,
     dlb: usize,
     lv: usize,
+    /// milestone 63 (SK_REDO_CLASS): length of `rc_all` at the opening, the
+    /// root's class, and whether it is the outermost classed region
+    ram: usize,
+    cls: u8,
+    top: bool,
 }
 
 /// A value of the region its result reaches, with the ids it held.
@@ -190,6 +195,24 @@ impl Worker {
         }
         let mut r = self.reg_open_marks();
         r.pin = pin;
+        if self.rc_on {
+            let mut fuel = self.key_fuel;
+            let k = self.mkey(v, &mut fuel);
+            let sk = self.shape_key(v);
+            r.cls = match self.rc_ghost.get(&k) {
+                Some(&c) if c >= self.ghost_ticks => 1,
+                Some(_) => 2,
+                None => 0,
+            };
+            self.rc_cnt[r.cls as usize] += 1;
+            if r.cls != 0 {
+                self.rc_shape.entry(sk).or_insert([0; 4])[1] += 1;
+                if !self.rc_in {
+                    r.top = true;
+                    self.rc_in = true;
+                }
+            }
+        }
         r
     }
     pub(super) fn reg_open_marks(&mut self) -> Reg {
@@ -215,9 +238,20 @@ impl Worker {
             dvm: self.vals.len() as u32,
             dlb: self.wlit_bytes,
             lv: 0,
+            ram: self.rc_all.len(),
+            cls: 0,
+            top: false,
         };
         self.reg_vm = r.vm;
         self.stats.reg[0] += 1;
+        if self.rc_on && (self.stats.reg[0] & (self.stats.reg[0] - 1)) == 0 {
+            let mut v: Vec<_> = self.rc_shape.iter().map(|(&k, &x)| (k, x)).collect();
+            v.sort_by_key(|e| std::cmp::Reverse(e.1[2]));
+            eprintln!("RC ticks {} regions {} cls {:?} sum {:?} ghost {} shapes {}", self.ticks, self.stats.reg[0], self.rc_cnt, self.rc_sum, self.rc_ghost.len(), v.len());
+            for (k, x) in v.iter().take(8) {
+                eprintln!("RCS {k:x} dropped {} returned {} ticks {} made {}", x[0], x[1], x[2], x[3]);
+            }
+        }
         if KNOBS && (self.stats.reg[0] & (self.stats.reg[0] - 1)) == 0 && std::env::var("SK_REGION_REPORT").is_ok() {
             eprintln!("REG ticks {} {}", self.ticks, self.table_report());
         }
@@ -242,7 +276,9 @@ impl Worker {
         self.stats.ckpts += 1;
         self.reg_ckpt_req = self.reg_ckpt_same;
         self.reg_ckpt_new = None;
+        self.rc_ckpt = true;
         let t = self.reg_close(g, v, t);
+        self.rc_ckpt = false;
         self.reg_ckpt_req = false;
         let t = t?;
         let g2 = match self.reg_ckpt_new.take() {
@@ -260,10 +296,21 @@ impl Worker {
         let mut r = self.reg_open_marks();
         r.t0 = old.t0;
         r.pin = old.pin;
+        r.cls = old.cls;
+        r.top = old.top;
+        if r.top {
+            self.rc_in = true;
+        }
         r
     }
     /// The region ends without a rollback (an error, or nothing to gain).
     pub(super) fn reg_keep(&mut self, r: &Reg) {
+        if self.rc_on && r.top {
+            self.rc_in = false;
+            if !self.rc_ckpt {
+                self.rc_sum[r.cls as usize] += self.ticks.wrapping_sub(r.t0) as u64;
+            }
+        }
         self.reg_vm = r.prev;
         // what the enclosing region learns: the largest region inside it
         // that stays after an attempt (or below one that did)
@@ -272,6 +319,7 @@ impl Worker {
             // no region is open: nothing can be rolled back any more
             self.undo.clear();
             self.reg_done.clear();
+            self.rc_all.clear();
             self.pin_ids.clear();
             self.wfront.clear();
         }
@@ -280,6 +328,10 @@ impl Worker {
     /// back): remembered as costly work an enclosing rollback may drop, or
     /// as pinned work it must keep.
     fn reg_note(&mut self, r: &Reg, v: V) {
+        if self.rc_on && r.prev != 0 && !r.pin && v >= r.prev {
+            let made = (self.vals.len() as u32).saturating_sub(r.vm);
+            self.rc_all.push((v, self.ticks.wrapping_sub(r.t0), made));
+        }
         if !self.reg_pin || r.prev == 0 {
             return;
         }
@@ -617,8 +669,14 @@ impl Worker {
             // made the BFS thunk (older parts) and returned a Bool, so the
             // BFS was done again for every element.
             for d in r.vm..self.vals.len() as u32 {
+                if self.reg_front == 3 && budget == 0 {
+                    break;
+                }
                 let w = self.memo_at(d).whnf;
                 if w == NONE || w == d || w >= (1 << 28) {
+                    continue;
+                }
+                if self.reg_front == 4 && budget == 0 && !(seen_v.contains(&d) && (w < r.vm || seen_v.contains(&w))) {
                     continue;
                 }
                 // read directly: dead markers of inner rollbacks (SK_REGION_POISON)
@@ -707,6 +765,24 @@ impl Worker {
                 budget = budget.saturating_sub(out.len() - n0);
                 self.reg_pairs.push((d, w));
             }
+        }
+        if self.rc_on {
+            for i in r.ram..self.rc_all.len() {
+                let (x, cost, made) = self.rc_all[i];
+                if x < r.vm || seen_v.contains(&x) {
+                    continue;
+                }
+                let mut fuel = self.key_fuel;
+                let k = self.mkey(x, &mut fuel);
+                let e = self.rc_ghost.entry(k).or_insert(0);
+                *e = (*e).max(cost);
+                let sk = self.shape_key(x);
+                let st = self.rc_shape.entry(sk).or_insert([0; 4]);
+                st[0] += 1;
+                st[2] += cost as u64;
+                st[3] += made as u64;
+            }
+            self.rc_all.truncate(r.ram);
         }
         // milestone 37: costly closed regions whose roots die here: their
         // keys go to the ghost table (a region opened later on a value of
