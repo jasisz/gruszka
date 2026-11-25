@@ -723,6 +723,15 @@ values:
   structure eta, string literal expansion (whnf'd, as Pestka does), and
   unit-like types.
 
+**Complete level comparison (the kernel renovation).** Levels are equal
+(or `≥`) when they are for every assignment of the parameters. Lean's
+normal forms decide this once no `imax` is left, and a normal form no
+longer keeps an `imax` that became a `max` (`imax u 1` and `max u 1` have
+one form). Only when the normal forms differ and an `imax` is left does
+`Levels::geq_cases` split on a parameter of an `imax`'s right side: `p = 0`
+and `p = p' + 1`, each of which removes the `imax`es that p decides, at
+most 8 parameters deep (past that, no). Equality is both inequalities.
+
 **Conversion order, milestone 41.** CFSG's three walls (totalC, inv_get,
 invol_eq) were not computations the proofs need but the reference
 kernel's order of steps: each `rfl` holds after a few unfoldings of one

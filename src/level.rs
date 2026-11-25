@@ -204,7 +204,10 @@ impl<'e> Levels<'e> {
                 let l1 = self.normalize(a);
                 let l2 = self.normalize(b);
                 let im = self.imax(l1, l2);
-                self.succ_n(im, k)
+                // an imax that became a max (its right side is not zero) is
+                // normalized as one: `imax u 1` and `max u 1` have one form
+                let im = self.succ_n(im, k);
+                if self.kind(self.to_offset(im).0) == K_MAX { self.normalize(im) } else { im }
             }
             _ => {
                 // K_MAX
@@ -264,14 +267,113 @@ impl<'e> Levels<'e> {
         }
     }
 
+    /// Equal for every assignment of the parameters (complete level
+    /// comparison of the kernel renovation): normal forms first, and when
+    /// they differ and an `imax` is left, both inequalities by cases.
     pub fn equiv(&mut self, a: u32, b: u32) -> bool {
-        a == b || self.normalize(a) == self.normalize(b)
+        if a == b {
+            return true;
+        }
+        let na = self.normalize(a);
+        let nb = self.normalize(b);
+        if na == nb {
+            return true;
+        }
+        if !self.has_imax(na) && !self.has_imax(nb) {
+            return false;
+        }
+        let mut split = Vec::new();
+        self.geq_cases(na, nb, &mut split) && self.geq_cases(nb, na, &mut split)
     }
 
+    /// `a >= b` for every assignment of the parameters. Lean's `is_geq`
+    /// decides it when no `imax` is left in the normal forms (only `max`,
+    /// `succ`, parameters and constants); otherwise it is tried by cases.
     pub fn geq(&mut self, a: u32, b: u32) -> bool {
         let a = self.normalize(a);
         let b = self.normalize(b);
+        if self.geq_core(a, b) {
+            return true;
+        }
+        if !self.has_imax(a) && !self.has_imax(b) {
+            return false;
+        }
+        let mut split = Vec::new();
+        self.geq_cases(a, b, &mut split)
+    }
+
+    fn geq_fast(&mut self, a: u32, b: u32) -> bool {
+        let a = self.normalize(a);
+        let b = self.normalize(b);
         self.geq_core(a, b)
+    }
+
+    fn has_imax(&self, l: u32) -> bool {
+        let (k, a, b) = self.get(l);
+        match k {
+            K_IMAX => true,
+            K_SUCC => self.has_imax(a),
+            K_MAX => self.has_imax(a) || self.has_imax(b),
+            _ => false,
+        }
+    }
+
+    /// A parameter, not yet split on, of the right side of some `imax` in `l`.
+    fn imax_split_param(&self, l: u32, split: &[u32]) -> Option<u32> {
+        let (k, a, b) = self.get(l);
+        match k {
+            K_SUCC => self.imax_split_param(a, split),
+            K_MAX => self.imax_split_param(a, split).or_else(|| self.imax_split_param(b, split)),
+            K_IMAX => {
+                let mut found = None;
+                self.params_in(b, &mut |p| {
+                    if split.contains(&p) {
+                        true
+                    } else {
+                        found = Some(p);
+                        false
+                    }
+                });
+                found.or_else(|| self.imax_split_param(a, split)).or_else(|| self.imax_split_param(b, split))
+            }
+            _ => None,
+        }
+    }
+
+    /// `a >= b` by cases on the parameters that decide an `imax`: `p = 0`,
+    /// and `p = p' + 1` (the same name standing for p'), where every `imax`
+    /// whose right side p decides becomes a `max` or `0`. Once no parameter
+    /// is left to split on, every `imax` is gone, and `geq_core` is complete.
+    /// At most `MAX_SPLITS` parameters deep; past that the answer is no (a
+    /// good file may then be rejected, never a bad one accepted).
+    fn geq_cases(&mut self, a: u32, b: u32, split: &mut Vec<u32>) -> bool {
+        const MAX_SPLITS: usize = 8;
+        let a = self.normalize(a);
+        let b = self.normalize(b);
+        if self.geq_core(a, b) {
+            return true;
+        }
+        let Some(p) = self.imax_split_param(a, split).or_else(|| self.imax_split_param(b, split)) else {
+            return false;
+        };
+        if split.len() >= MAX_SPLITS {
+            return false;
+        }
+        let pl = self.param(p);
+        let succ_p = self.succ(pl);
+        split.push(p);
+        let mut ok = true;
+        for to in [ZERO, succ_p] {
+            let f = |n: u32| if n == p { Some(to) } else { None };
+            let a2 = self.subst(a, &f, &mut FxHashMap::default());
+            let b2 = self.subst(b, &f, &mut FxHashMap::default());
+            if !self.geq_cases(a2, b2, split) {
+                ok = false;
+                break;
+            }
+        }
+        split.pop();
+        ok
     }
 
     fn geq_core(&mut self, l1: u32, l2: u32) -> bool {
@@ -280,17 +382,17 @@ impl<'e> Levels<'e> {
         }
         let (k2, a2, b2) = self.get(l2);
         if k2 == K_MAX {
-            return self.geq(l1, a2) && self.geq(l1, b2);
+            return self.geq_fast(l1, a2) && self.geq_fast(l1, b2);
         }
         let (k1, a1, b1) = self.get(l1);
-        if k1 == K_MAX && (self.geq(a1, l2) || self.geq(b1, l2)) {
+        if k1 == K_MAX && (self.geq_fast(a1, l2) || self.geq_fast(b1, l2)) {
             return true;
         }
         if k2 == K_IMAX {
-            return self.geq(l1, a2) && self.geq(l1, b2);
+            return self.geq_fast(l1, a2) && self.geq_fast(l1, b2);
         }
         if k1 == K_IMAX {
-            return self.geq(b1, l2);
+            return self.geq_fast(b1, l2);
         }
         let p1 = self.to_offset(l1);
         let p2 = self.to_offset(l2);
@@ -301,7 +403,7 @@ impl<'e> Levels<'e> {
             return p1.1 >= p2.1;
         }
         if p1.1 == p2.1 && p1.1 > 0 {
-            return self.geq(p1.0, p2.0);
+            return self.geq_fast(p1.0, p2.0);
         }
         false
     }
@@ -419,5 +521,57 @@ mod tests {
         for (a, b, want) in cases {
             assert_eq!(lv.geq(a, b), want, "geq({a}, {b})");
         }
+    }
+
+    /// Complete level comparison (the renovation's tests 100-116 of
+    /// lean-kernel-arena-beta): the good equations hold for every assignment,
+    /// the bad ones fail for some.
+    #[test]
+    fn equiv_complete() {
+        let g = vec![(K_ZERO, 0, 0)];
+        let gmap: FxHashMap<(u8, u32, u32), u32> = [((K_ZERO, 0, 0), 0)].into_iter().collect();
+        let mut lv = Levels::new(&g, &gmap);
+        let one = lv.succ(ZERO);
+        let u = lv.param(1);
+        let v = lv.param(2);
+        let w = lv.param(3);
+        let mx = |lv: &mut Levels, a, b| lv.mk(K_MAX, a, b);
+        let im = |lv: &mut Levels, a, b| lv.mk(K_IMAX, a, b);
+        let v1 = lv.succ(v);
+        let w1 = lv.succ(w);
+        let iuv = im(&mut lv, u, v);
+        let muv = mx(&mut lv, u, v);
+        let mvw = mx(&mut lv, v, w);
+        let mvw1 = mx(&mut lv, v, w1);
+        let iuw = im(&mut lv, u, w);
+        let ivw = im(&mut lv, v, w);
+        let ivu = im(&mut lv, v, u);
+        let good = [
+            (mx(&mut lv, u, one), im(&mut lv, u, one)),
+            (mx(&mut lv, u, v1), im(&mut lv, u, v1)),
+            (mx(&mut lv, u, mvw1), im(&mut lv, u, mvw1)),
+            (iuv, im(&mut lv, iuv, v)),
+            (iuv, im(&mut lv, v, iuv)),
+            (im(&mut lv, iuw, w), iuw),
+            (im(&mut lv, u, iuv), iuv),
+            (im(&mut lv, muv, w), { let a = im(&mut lv, u, w); let b = im(&mut lv, v, w); mx(&mut lv, a, b) }),
+            (im(&mut lv, u, mvw), { let a = im(&mut lv, u, v); let b = im(&mut lv, u, w); mx(&mut lv, a, b) }),
+            (im(&mut lv, u, ivw), im(&mut lv, muv, w)),
+        ];
+        for (a, b) in good {
+            assert!(lv.equiv(a, b), "equiv({a}, {b})");
+        }
+        assert!(lv.geq(muv, iuv), "imax u v <= max u v");
+        let bad = [
+            (iuv, muv),
+            (iuv, ivu),
+            (im(&mut lv, u, ivw), { let a = im(&mut lv, u, v); im(&mut lv, a, w) }),
+            (mx(&mut lv, iuv, v), muv),
+            (iuv, v),
+        ];
+        for (a, b) in bad {
+            assert!(!lv.equiv(a, b), "not equiv({a}, {b})");
+        }
+        assert!(!lv.geq(iuv, u), "u <= imax u v is false");
     }
 }
