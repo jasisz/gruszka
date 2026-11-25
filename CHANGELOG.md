@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.2.1
+
+Six of the seven slowest CFSG declarations of the 0.2.0 run are checked in
+well under a second. Times are for each declaration's slice of the CFSG
+export, one worker, Apple M2 Pro, release build; the 0.2.0 column is from
+the full run on r7a.16xlarge with 64 workers.
+
+| declaration | 0.2.0 (AWS, 64 workers) | 0.2.1 (M2, 1 worker) |
+| --- | ---: | ---: |
+| `bound_of` | 943 s | 0.58 s |
+| `covHA_sound` | 179 s | 0.58 s |
+| `tits_star_check_0` | 85 s | 0.58 s |
+| `piv_eq` | 82 s | 0.58 s |
+| `cnt_ok` | 68.5 s | 0.57 s |
+| `u52ne_f_normK` | 52 s | 0.57 s |
+| `e6SimpleCheck` | 196 s | 69.5 s (unchanged) |
+
+Init, Std, mathlib and the CFSG slices used as corpora stay within 1% in
+instructions and memory. The whole of CFSG has not been rerun with 0.2.1.
+
+Changes:
+
+- The meeting race (M) takes the steps of its two sides in turn, each
+  within a budget that doubles when it runs out (milestone 61). A side
+  whose first step is a whole computation (`Bool.and` over a `List.all`
+  under a binder) no longer keeps the other side, which meets it in one
+  step, from moving.
+- Delta in a round (R) gives the arguments of a pair it comes to with the
+  same head half of what is left of the round (milestone 62). Past that it
+  unfolds both sides, and the next, twice as long, round tries the
+  arguments first again. The pair the race was started on keeps Lean's
+  order.
+- In the `knobs` build only: counters for work redone after region
+  rollbacks and variants of keeping region results (`SK_REDO_CLASS`,
+  `SK_REGION_FRONT=3/4`). No rule passed the thresholds for
+  `e6SimpleCheck`; see milestone 63 in docs/architecture.md.
+
 ## 0.2.0
 
 Checks all of CFSG (`cfsg-5437cdc.susz`, 39,656,013 declarations) on
