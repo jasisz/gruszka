@@ -851,9 +851,12 @@ pub(crate) enum Att {
     Derive,
     /// milestone 61: one step of a side in M, under that side's allowance
     MStep,
+    /// milestone 62: the arguments of a common regular head in R resumed
+    /// in a round, under half of what the round has left
+    RArgs,
 }
-pub const ATT_KINDS: usize = 11;
-pub const ATT_NAMES: [&str; ATT_KINDS] = ["r0", "r", "k", "m", "kpair", "meet", "n", "refute", "args", "derive", "mstep"];
+pub const ATT_KINDS: usize = 12;
+pub const ATT_NAMES: [&str; ATT_KINDS] = ["r0", "r", "k", "m", "kpair", "meet", "n", "refute", "args", "derive", "mstep", "rargs"];
 
 pub struct Worker {
     pub env: &'static Env<'static>,
@@ -1003,6 +1006,19 @@ pub struct Worker {
     /// outermost attempt that last ended was ended so
     att_deep: bool,
     att_deep_ended: bool,
+    /// milestone 62: lazy delta's own loop is taking a step (`delta_step`
+    /// may cut the arguments of a common regular head short in a round of
+    /// R); `held_step`: it did, the arguments are still undecided
+    r_loop: bool,
+    held_step: bool,
+    /// lazy delta came out stuck past arguments it cut short (`defeq_core`
+    /// takes it: a `false` then comes from the reference alone)
+    ld_held: bool,
+    /// the reference deciding after a cut (no cuts inside it)
+    hold_off: u32,
+    /// the pair of the race whose round of R runs (K compares its
+    /// arguments; R cuts only the arguments of the pairs it comes to)
+    race_pair: (V, V),
     /// races whose reference went too deep in this declaration: compared by
     /// the reference alone when the declaration is tried again
     deep_races: std::collections::HashSet<u64>,
@@ -1436,6 +1452,11 @@ impl Worker {
             att_kind: Att::Round0,
             att_deep: false,
             att_deep_ended: false,
+            r_loop: false,
+            held_step: false,
+            ld_held: false,
+            hold_off: 0,
+            race_pair: (NONE, NONE),
             deep_races: Default::default(),
             stack_base: &x as *const u8 as usize,
             stack_limit,
@@ -1719,6 +1740,10 @@ impl Worker {
                     continue;
                 }
                 let age = self.ticks.wrapping_sub(t);
+                if a == NONE {
+                    eprintln!("DS {i:>4} {} age {age:>11} <mark>", k as char);
+                    continue;
+                }
                 let mut sa = self.vshow(a, 5);
                 sa.truncate(600);
                 if b == NONE {
@@ -1726,7 +1751,7 @@ impl Worker {
                 } else {
                     let mut sb = self.vshow(b, 5);
                     sb.truncate(600);
-                    eprintln!("DS {i:>4} {} age {age:>11} {sa}\n            =?= {sb}", k as char);
+                    eprintln!("DS {i:>4} {} age {age:>11} [{a} {b}] {sa}\n            =?= {sb}", k as char);
                 }
             }
         }
@@ -2209,7 +2234,9 @@ impl Worker {
         self.att_kind = kind;
         self.att_depth += 1;
         self.set_alarm();
+        if dstack_on() { dstack_push(b'0' + kind as u8, NONE, NONE, t0); }
         let r = f(self);
+        if dstack_on() { dstack_pop(); }
         self.att_depth -= 1;
         let mine = self.att_own;
         // an own stop, or a stop of this attempt's (`attempt_stop`), gives
@@ -6840,6 +6867,10 @@ impl Worker {
                 }
             }
         }
+        self.defeq_ne2(a, b)
+    }
+    #[inline(always)]
+    fn defeq_ne2(&mut self, a: V, b: V) -> R<bool> {
         if dstack_on() {
             dstack_push(b'D', a, b, self.ticks);
             let r = self.defeq_ne1(a, b);
@@ -7556,14 +7587,44 @@ impl Worker {
         if let Some(r) = self.proof_irrel(a1, b1)? {
             return Ok(r);
         }
+        self.ld_held = false;
         let (a2, b2) = match self.lazy_delta(a1, b1)? {
             Ok(r) => return Ok(r),
             Err(p) => p,
         };
+        if std::mem::take(&mut self.ld_held) {
+            if self.defeq_tail(a2, b2)? {
+                return Ok(true);
+            }
+            // the steps after lazy delta found nothing past arguments a
+            // round of R cut short: the reference decides, from the pair
+            // lazy delta started at
+            let mut st = (a1, b1, self.ticks);
+            self.hold_off += 1;
+            let r = self.lazy_delta_r(a1, b1, &mut st);
+            self.hold_off -= 1;
+            self.ld_held = false;
+            let (a2, b2) = match r? {
+                Ok(r) => return Ok(r),
+                Err(p) => p,
+            };
+            self.hold_off += 1;
+            let r = self.defeq_tail(a2, b2);
+            self.hold_off -= 1;
+            return r;
+        }
+        self.defeq_tail(a2, b2)
+    }
+
+    /// `defeq_core` past lazy delta, on the pair it came to.
+    fn defeq_tail(&mut self, a2: V, b2: V) -> R<bool> {
         // projections of the same field: the structures by lazy delta
         // first (Lean's lazy_delta_proj_reduction, Pestka's eqProj /
         // eqProjApp); congruence under a projection is never tried
-        let proj = match self.proj_eq(a2, b2)? {
+        if dstack_on() { dstack_push(b'J', NONE, NONE, self.ticks); }
+        let pe = self.proj_eq(a2, b2);
+        if dstack_on() { dstack_pop(); }
+        let proj = match pe? {
             Some(true) => return Ok(true),
             Some(false) => true,
             None => false,
@@ -8047,10 +8108,13 @@ impl Worker {
                 }
             }
             self.att_deep_ended = false;
+            let rp = std::mem::replace(&mut self.race_pair, (a, b));
             let r = self.attempt(Att::RaceR, budget, |s| {
                 let (x, y, _) = st;
                 s.lazy_delta_r(x, y, &mut st)
-            })?;
+            });
+            self.race_pair = rp;
+            let r = r?;
             match r {
                 Some(r) => {
                     if STATS { self.stats.race[4] += 1; }
@@ -8361,7 +8425,25 @@ impl Worker {
     /// against `true`) unfolds here a step at a time, a million steps with
     /// nothing given back.
     #[inline(always)]
-    fn lazy_delta_loop(&mut self, mut a: V, mut b: V, reg: &mut Option<region::Reg>, st: &mut (V, V, u32)) -> R<Result<bool, (V, V)>> {
+    fn lazy_delta_loop(&mut self, a: V, b: V, reg: &mut Option<region::Reg>, st: &mut (V, V, u32)) -> R<Result<bool, (V, V)>> {
+        let mut held = false;
+        let r = self.lazy_delta_loop0(a, b, reg, st, &mut held)?;
+        // milestone 62: arguments cut short on the way (`held`) may still
+        // be equal: `true` is an answer; `false` ends the round undecided,
+        // and R resumes at that pair (`st` stays there) with twice the
+        // budget, the arguments first again; stuck goes on to the rest of
+        // `defeq_core`, which takes a `false` only from the reference
+        match r {
+            Ok(false) if held => self.attempt_stop(),
+            Err(_) if held => {
+                self.ld_held = true;
+                Ok(r)
+            }
+            _ => Ok(r),
+        }
+    }
+    #[inline(always)]
+    fn lazy_delta_loop0(&mut self, mut a: V, mut b: V, reg: &mut Option<region::Reg>, st: &mut (V, V, u32), held: &mut bool) -> R<Result<bool, (V, V)>> {
         // the region's root: older than it
         let a0 = a;
         loop {
@@ -8384,7 +8466,9 @@ impl Worker {
                     }
                 }
             }
-            *st = (a, b, self.ticks);
+            if !*held {
+                *st = (a, b, self.ticks);
+            }
             self.tick()?;
             // offsets
             // milestone 23: both sides' shapes first, so a literal's
@@ -8408,7 +8492,12 @@ impl Worker {
                     return Ok(Ok(self.defeq(a, bn)?));
                 }
             }
-            match self.delta_step(a, b)? {
+            self.r_loop = true;
+            let d = self.delta_step(a, b);
+            if std::mem::take(&mut self.held_step) {
+                *held = true;
+            }
+            match d? {
                 DStep::Equal => return Ok(Ok(true)),
                 DStep::Stuck => return Ok(Err((a, b))),
                 DStep::Next(x, y) => {
@@ -8453,6 +8542,8 @@ impl Worker {
     /// unfolds, or the higher one, or both; the same regular definition
     /// first tries equal arguments.
     fn delta_step(&mut self, a: V, b: V) -> R<DStep> {
+        // lazy delta's own loop asked (not a comparison under this step)
+        let r_loop = std::mem::take(&mut self.r_loop);
         let (mut a, mut b) = (a, b);
         let da = self.delta_info(a);
         let db = self.delta_info(b);
@@ -8502,21 +8593,42 @@ impl Worker {
                         if sa != EMPTY && sb != EMPTY && !self.args_no(a, b) {
                             #[cfg(feature = "cnt")]
                             let tk0 = self.ticks;
-                            let same = if !self.levels_equiv(la, lb) || self.args_refuted(sa, sb, ra, la)? {
-                                false
-                            } else {
-                                self.spines_defeq_skip(sa, sb, ra, la, true)?
+                            if dstack_on() { dstack_push(b'A', NONE, NONE, self.ticks); }
+                            let run = |s: &mut Self| -> R<bool> {
+                                Ok(if !s.levels_equiv(la, lb) || s.args_refuted(sa, sb, ra, la)? {
+                                    false
+                                } else {
+                                    s.spines_defeq_skip(sa, sb, ra, la, true)?
+                                })
                             };
+                            // milestone 62: in R resumed in a round the
+                            // arguments get half of what the round has left;
+                            // past it R unfolds both sides as after a
+                            // failure (nothing is marked different), and the
+                            // next round, twice as long, gives them twice as
+                            // much. Showing arguments different can be a
+                            // whole computation where unfolding meets in a
+                            // few steps. Round 0 and R past the race compare
+                            // them to the end, as Lean does.
+                            let same = if r_loop && self.hold_off == 0 && self.race_pair != (a, b) && self.race_pair != (b, a) && self.attempting() && self.att_kind == Att::RaceR {
+                                let left = self.att_end.wrapping_sub(self.ticks);
+                                self.attempt(Att::RArgs, (left / 2).max(1), run)
+                            } else {
+                                run(self).map(Some)
+                            };
+                            if dstack_on() { dstack_pop(); }
+                            let same = same?;
                             #[cfg(feature = "cnt")]
                             {
                                 let d = self.ticks.wrapping_sub(tk0) as u64;
-                                THUNK_KINDS[if same { 700 } else { 701 }].fetch_add(1, Ordering::Relaxed);
-                                THUNK_KINDS[if same { 702 } else { 703 }].fetch_add(d, Ordering::Relaxed);
+                                THUNK_KINDS[if same == Some(true) { 700 } else { 701 }].fetch_add(1, Ordering::Relaxed);
+                                THUNK_KINDS[if same == Some(true) { 702 } else { 703 }].fetch_add(d, Ordering::Relaxed);
                             }
-                            if same {
-                                return Ok(DStep::Equal);
+                            match same {
+                                Some(true) => return Ok(DStep::Equal),
+                                Some(false) => self.put_args_no(a, b),
+                                None => self.held_step = true,
                             }
-                            self.put_args_no(a, b);
                         }
                     }
                     // an abbreviation's arguments first is not Lean's order
@@ -9097,7 +9209,10 @@ impl Worker {
             (Head::FVar(x), Head::FVar(y)) => x == y,
             (Head::Const(r1, l1), Head::Const(r2, l2)) => {
                 if r1 == r2 && self.levels_equiv(l1, l2) {
-                    return self.spines_defeq_skip(sa, sb, r1, l1, false);
+                    if dstack_on() { dstack_push(b'C', NONE, NONE, self.ticks); }
+                    let r = self.spines_defeq_skip(sa, sb, r1, l1, false);
+                    if dstack_on() { dstack_pop(); }
+                    return r;
                 }
                 false
             }

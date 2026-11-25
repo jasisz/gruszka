@@ -849,14 +849,48 @@ is refused, only delayed, so lazy delta's answers stay the reference's.
   3583.0 G, run124 11554 -> 11542 G, peaks within 2%; gates (small tests
   in three modes, 350 vectors plain and poisoned, `--only`, poisoned
   corpora, parity both orders): no wrong verdict.
-  Two walls of the same run have other causes and stay open:
-  u52ne_f_normK (52 s; locally 24 s, Pestka 0.8 s) is R's own work
-  (K and M off: 23 s), the probe of `Subgroup.comap e K' =?= K'` under
-  `x0 ∈ comap e K' =?= σ x0 σ⁻¹ ∈ K'`, which whnfs `u52neσ 4` and its
-  `decide` over 462 points; e6SimpleCheck_eq_true (196 s; locally 73 s,
-  Pestka 4.5 s) is regions: with regions off (`SK_REGION_AT=0`) it takes
-  8 s at 3.4 GB instead of 0.86 GB, the rolled-back work being asked for
-  again.
+  Two walls of the same run had other causes (milestone 62 below).
+- *Arguments do not block R in a round (milestone 62).* u52ne_f_normK
+  (52 s at 64 workers; locally 24 s, Pestka 0.8 s) was R's own work: with
+  K and M off it still took 23 s. R's pair `x0 ∈ comap e K' =?= σ x0 σ⁻¹ ∈
+  K'` came to `SetLike.coe (comap e K') =?= SetLike.coe K'`, a common
+  regular head, and compared its arguments first, as Lean does:
+  `comap e K' =?= K'` (false) by extensionality down to `e x =?= x`, which
+  needs `σ = u52neσ 4` in whnf, a `decide` over 462 points (past 13 M
+  ticks; each round of the race started it again). Unfolding instead
+  meets in a few steps (`e x0` is `σ * x0 * σ⁻¹`). In R resumed in a
+  round (`Att::RaceR` the innermost attempt), at a pair R came to that is
+  not the race's own (K compares the arguments of that one, with doubling
+  budgets), the arguments of a common regular head now run as an attempt
+  (`Att::RArgs`) under half of what the round has left. Past it R unfolds
+  both sides without marking the arguments different, and the pair is
+  held: R's resume point stays there, so the next round, twice as long,
+  starts with the arguments again; a `false` of the loop past a held pair
+  ends the round undecided; a stuck pair goes on to the rest of
+  `defeq_core`, and if that finds nothing the reference decides again
+  from lazy delta's first pair with no cuts (`hold_off`). So `true` may
+  come from either branch, `false` only from the reference. The race's own
+  pair keeps Lean's order inside R: cutting it too sent R into
+  `toRow`'s unfolding in run124's letter_inv_smul (1.9 s -> past 400 s and
+  11 GB) while the arguments were equal. u52ne_f_normK: 24 s -> 0.6 s
+  (3.5 GB -> 36 MB). Against milestone 61 at w4 (interleaved, medians):
+  Init 22.92 -> 22.94 G, Std 38.23 -> 38.29 G, Mathlib 423.20 -> 423.04 G
+  (2088 -> 2090 MiB), c0f 180.5 -> 180.1 G, LyOm 368.4 -> 368.3 G,
+  run349 3585 -> 3582 G, run124 11550 -> 11555 G (8672 -> 8709 MiB);
+  gates as for milestone 61, no wrong verdict. The knobs build's
+  `SK_DSTACK` now also shows the open attempts (their kind as a digit)
+  and where arguments are compared (`A` regular head, `C` congruence,
+  `J` projections), with the values' ids, and `SK_REDO_TRACE` prints the
+  roots of redone regions.
+  e6SimpleCheck_eq_true (196 s; locally 69-73 s at 0.86 GB, Pestka 4.5 s)
+  stays open: it is regions redoing rolled-back work (317 M ticks against
+  37 M with regions off, which takes 8 s at 3.4 GB; 512 K rollbacks made
+  283 M values). The redone pieces are matrix entries of lazy lists
+  (`HAdd .. (HMul (Array.getD (List.toArray (mmulL ..)) i) ..)`), each
+  first redone once (12.9 K first redos against 1.7 K second, so they are
+  pinned only at the second), and much of the work is below `GHOST_TICKS`
+  per piece and never seen as redone. Opening regions later does not fit
+  in twice the memory (2^23 values: 53 s, 1.6 GB; 2^24: 8.7 s, 2.6 GB).
 
 Vectors (`tests/adv-base/m41.lean`, Lean 4.35 + olean-export):
 good/bad_m41_natwait_sum (`[w, 1].sum = w + (1 + 0)` and `+ (2 + 0)`),

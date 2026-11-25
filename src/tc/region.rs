@@ -155,7 +155,9 @@ impl Worker {
             if self.pinned.contains(&k) {
                 pin = true;
                 self.stats.reg_redo += 1;
+                if KNOBS && std::env::var_os("SK_REDO_TRACE").is_some() && self.stats.reg_redo % 97 == 0 { eprintln!("PINHIT {k:x} {}", self.vshow(v, 3)); }
             } else if self.ghost.remove(&k) {
+                if KNOBS && std::env::var_os("SK_REDO_TRACE").is_some() { eprintln!("GHOST {k:x} {}", self.vshow(v, 3)); }
                 // milestone 46: a pin keeps the work and its result through
                 // every enclosing rollback for the rest of the session.
                 // Pinned at its first redo it pays when redone work is
