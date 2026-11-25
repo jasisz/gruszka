@@ -6,9 +6,11 @@ Passes lean-kernel-arena-beta: all 213 good and 137 bad tests, exported by
 Lean `pr-release-16595-55bd690` (the kernel renovation, lean4#16595), Init
 and Std included. 0.2.1 could not read most of them: their inductive types
 no longer carry `isReflexive`, and susz 0.4.0 refused to pack them. The
-renovation tests that are ahead of that toolchain pass too. On Init and
-mathlib at 4 workers, instructions are within 0.4% of 0.2.1 and peak
-memory within 1%.
+renovation tests that are ahead of that toolchain pass too. At 4 workers
+on Init, Std, mathlib and the CFSG slices LyOm, run349 and run124, the
+verdicts are the same as 0.2.1's, instructions and ticks are within +0.5%
+(mathlib +0.36% instructions, +0.73% ticks), and peak memory differs by
+less than the spread between two runs of the same build.
 
 Changes:
 
