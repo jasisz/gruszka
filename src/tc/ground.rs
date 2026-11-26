@@ -86,7 +86,7 @@ enum Fr {
     Rec { row: u32, llr: u32, pre: Vec<O>, major: O, base: usize },
     /// casesOn `row` read directly (its recursor `rrow`): all its arguments
     Cases { row: u32, llr: u32, rrow: u32, args: Vec<O>, base: usize },
-    /// unary Nat operation (`SUCC` or `LOG2`) waiting for its operand
+    /// unary Nat operation (`SUCC`) waiting for its operand
     Nat1 { row: u32, llr: u32, op: u8, x: O, base: usize },
     NatA { row: u32, llr: u32, op: u8, x: O, y: O, base: usize },
     NatB { row: u32, llr: u32, op: u8, a: O, x: O, y: O, base: usize },
@@ -109,7 +109,6 @@ enum C {
 }
 
 const SUCC: u8 = 100;
-const LOG2: u8 = 101;
 
 /// Milestone 40: a part of a delayed term's key (`g_memo_key`): the term
 /// and level substitution, a small literal by value, a value of the kernel
@@ -1601,12 +1600,6 @@ impl Worker {
                     return Ok(self.g_stuck(m, row, llr, false));
                 }
                 let op = env.nat_op[row as usize];
-                if op == LOG2 && napp == 1 {
-                    let x = Self::g_take_apps(m, 1).pop().unwrap();
-                    m.fr.push(Fr::Nat1 { row, llr, op, x: x.clone(), base: m.base });
-                    m.base = m.el.len();
-                    return Ok(C::Ob(x));
-                }
                 if (1..=14).contains(&op) && napp == 2 {
                     let mut xs = Self::g_take_apps(m, 2);
                     let y = xs.pop().unwrap();
@@ -1618,7 +1611,7 @@ impl Worker {
                 if let Some(c) = self.g_cases(m, row, llr, napp)? {
                     return Ok(c);
                 }
-                if napp == 0 && !(1..=14).contains(&op) && op != LOG2 {
+                if napp == 0 && !(1..=14).contains(&op) {
                     if let Some(o) = m.caf.get(&(row, llr)) {
                         return Ok(C::Ob(o.clone()));
                     }
@@ -1636,7 +1629,7 @@ impl Worker {
                 // applied later, after a thunk's whnf): kept whole, so that it
                 // is computed on literals once it has them, as the kernel's
                 // whnf of the whole application does
-                if (op == LOG2 && napp < 1) || ((1..=14).contains(&op) && napp < 2) {
+                if (1..=14).contains(&op) && napp < 2 {
                     return Ok(self.g_stuck(m, row, llr, true));
                 }
                 self.g_unfold(m, row, llr)
@@ -2023,7 +2016,6 @@ impl Worker {
                         Ok(r) => C::Ob(mk(Obj::Nat(r))),
                         Err(why) => return gstop(why),
                     },
-                    (Obj::Nat(n), _) => C::Ob(mk(Obj::Nat(if n.is_zero() { BigUint::zero() } else { BigUint::from(n.bits() - 1) }))),
                     (_, SUCC) => C::Ob(mk(Obj::Con { row, llr, args: vec![x], ctor: true, part: false })),
                     _ => {
                         Self::g_push_args(m, &[x]);
