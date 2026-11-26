@@ -115,7 +115,8 @@ file, but the earlier declarations are handled differently:
   theorem or opaque constant that was not requested, is admitted as the file
   states it: its type and value are not checked, and a theorem's proof is
   not examined.
-- Unsafe and partial declarations are skipped. A target that is unsafe or
+- Unsafe and partial declarations are skipped (a full check type-checks
+  them, see [What it checks](#what-it-checks)). A target that is unsafe or
   partial is declined.
 
 So a subset verdict holds only if the declarations admitted
@@ -179,7 +180,13 @@ The last output line and the exit code give the result:
 | `declined: <why>` | `2` | The input needs something Gruszka does not support. |
 
 Axioms remain assumptions: Gruszka checks their types, but not proofs of
-them. Unsafe and partial declarations stay outside the logical environment.
+them. Unsafe and partial declarations stay outside the logical environment:
+no safe declaration may use them. A full check still type-checks them, as
+Lean's kernel does when they are added (unsafe ones may use unsafe
+constants, and an unsafe definition itself), so an ill-typed unsafe or
+partial declaration rejects the file even when nothing uses it. The
+official replay (`leanchecker`) and Pestka skip such declarations instead
+and accept that file.
 
 **The whole file is untrusted, including the prelude.** A file can define
 its own `Quot`, `Nat` or `Eq`, or state its own recursor rules. Gruszka
