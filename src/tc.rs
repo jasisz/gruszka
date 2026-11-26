@@ -8588,6 +8588,18 @@ impl Worker {
     fn delta_step(&mut self, a: V, b: V) -> R<DStep> {
         // lazy delta's own loop asked (not a comparison under this step)
         let r_loop = std::mem::take(&mut self.r_loop);
+        // the cut is this step's: it is handed to the loop only once the
+        // step is over, so a loop nested in the step's unfolding (whnf_core
+        // under a K recursor compares types) takes only its own
+        let mut held = false;
+        let r = self.delta_step0(a, b, r_loop, &mut held);
+        if held {
+            self.held_step = true;
+        }
+        r
+    }
+    #[inline(always)]
+    fn delta_step0(&mut self, a: V, b: V, r_loop: bool, held: &mut bool) -> R<DStep> {
         let (mut a, mut b) = (a, b);
         let da = self.delta_info(a);
         let db = self.delta_info(b);
@@ -8671,7 +8683,7 @@ impl Worker {
                             match same {
                                 Some(true) => return Ok(DStep::Equal),
                                 Some(false) => self.put_args_no(a, b),
-                                None => self.held_step = true,
+                                None => *held = true,
                             }
                         }
                     }
