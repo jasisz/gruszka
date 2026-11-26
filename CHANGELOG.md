@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.2.3
+
+Soundness fixes, found by our own conformance testing against the official
+Lean kernel (pre-release 55bd690). Two hand-made exports could get a closed
+proof of `False`, without axioms, accepted by 0.2.2; Lean's own kernel
+rejects both, so no export of a real Lean build can contain them, and no
+result checked from one is affected. Verdicts, instructions, time and
+memory on Init are unchanged.
+
+- A definition is taken as a `casesOn` only when each minor wrapper binds
+  exactly the arguments the recursor's rule passes it: the fields and one
+  induction hypothesis per recursive field. Before, at least as many
+  lambdas as fields were enough, so a wrapper that left the hypotheses to
+  the minor (`fun motive t z s => Nat.rec motive z (fun n => s n) t`) was
+  reduced as if they were dropped, which proved `0 = 1` with the standard
+  prelude. Valid exports of that shape, rejected before, are accepted.
+- `Nat.log2` unfolds from its definition. It was computed natively by its
+  name, which the official kernel does not do (its built-ins are
+  `Nat.succ` and the 14 binary operations), so with `Nat.log2` defined
+  otherwise in the export a proof of `False` was accepted.
+- A nested inductive whose container's parameter is a function type
+  (`inductive T | mk : List (Nat → T) → T`) is reflexive, as Lean computes
+  it on the auxiliary constructors after instantiating them; it was
+  rejected with "isRec / isReflexive do not match the declaration".
+- Undeclared universe parameters are looked for once per level node: on a
+  level built as a DAG the walk was exponential (a 2.8 KB export took more
+  than 20 s).
+- README: a full check type-checks unsafe and partial declarations in an
+  arena of their own; the sentence saying they are skipped was about
+  `--only`.
+
 ## 0.2.2
 
 Passes lean-kernel-arena-beta: all 213 good and 137 bad tests, exported by
