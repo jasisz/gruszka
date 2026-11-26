@@ -251,6 +251,21 @@ impl Worker {
         }
     }
 
+    /// Is the value a Pi, syntactically (following bound variables through
+    /// environments, never evaluating)?
+    fn syn_pi_val(&self, mut v: V) -> bool {
+        loop {
+            match self.val(v) {
+                Val::Thunk { term, env, .. } if self.tk(term) == BVAR => match self.env_get(env, self.tp(term)) {
+                    Ok(w) => v = w,
+                    Err(_) => return false,
+                },
+                Val::Clo { term, .. } | Val::CloI { term, .. } | Val::Thunk { term, .. } => return is_pi(self.tk(term)),
+                _ => return false,
+            }
+        }
+    }
+
     /// The free variable a value is, syntactically (following bound
     /// variables through environments, never evaluating).
     fn as_fvar(&self, mut v: V) -> Option<u32> {
@@ -798,7 +813,18 @@ impl Worker {
                     if (!aux || i >= npj) && self.occ_term(dom, e, 0, &canon)? {
                         // Lean's is_rec looks at every binder domain
                         is_rec = true;
-                        if is_pi(self.tk(dom)) {
+                        // Lean's is_reflexive asks whether the domain is a
+                        // Pi, syntactically, in the auxiliary constructor's
+                        // type, where the container's parameters are
+                        // replaced by the nested arguments: a domain that is
+                        // a parameter is a Pi when its argument is one
+                        let pi_dom = if aux && self.tk(dom) == BVAR {
+                            let v = self.env_get(e, self.tp(dom))?;
+                            self.syn_pi_val(v)
+                        } else {
+                            is_pi(self.tk(dom))
+                        };
+                        if pi_dom {
                             is_reflexive = true;
                         }
                     }
