@@ -3,7 +3,7 @@
 //! `is_geq`. Equal structure means equal id, in both tables. The worker
 //! table is never cleared, so memos keyed by level ids stay valid.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 pub const ZERO: u32 = 0;
 pub const K_ZERO: u8 = 0;
@@ -500,14 +500,23 @@ impl<'e> Levels<'e> {
         r
     }
 
-    /// Calls `f` on every parameter name in `l`.
+    /// Calls `f` on every parameter name in `l` while it holds; true when
+    /// it held for all. A level is a DAG (interned: a shared part has one
+    /// id), so each max or imax node is walked once: as a tree, a closed
+    /// level `l(i+1) = max (imax l(i) 1) (succ l(i))` of depth 36 has 2^36
+    /// leaves (conformance hunt 2026-11-26, F1).
     pub fn params_in(&self, l: u32, f: &mut dyn FnMut(u32) -> bool) -> bool {
+        let mut seen: FxHashSet<u32> = FxHashSet::default();
+        self.params_in_go(l, f, &mut seen)
+    }
+    fn params_in_go(&self, l: u32, f: &mut dyn FnMut(u32) -> bool, seen: &mut FxHashSet<u32>) -> bool {
         let (k, a, b) = self.get(l);
         match k {
             K_ZERO => true,
             K_PARAM => f(a),
-            K_SUCC => self.params_in(a, f),
-            _ => self.params_in(a, f) && self.params_in(b, f),
+            K_SUCC => self.params_in_go(a, f, seen),
+            // a node seen before held already (a failure ends the walk)
+            _ => !seen.insert(l) || (self.params_in_go(a, f, seen) && self.params_in_go(b, f, seen)),
         }
     }
 }
