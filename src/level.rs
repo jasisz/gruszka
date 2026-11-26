@@ -323,44 +323,92 @@ impl<'e> Levels<'e> {
         }
     }
 
-    /// A parameter that decides whether `l` is zero: dec(p) = {p},
-    /// dec(succ _) = {}, dec(max c d) = dec(c) ∪ dec(d) (or {} when a side is
-    /// never zero), dec(imax c d) = dec(d). The first one found.
-    fn deciding(&self, l: u32) -> Option<u32> {
+    /// The parameters that decide whether `l` is zero: `None` when it never
+    /// is (`is_not_zero`), else a set D with `l = 0` exactly when every
+    /// parameter in D is 0 (empty: always zero). dec(p) = {p},
+    /// dec(succ _) = never, dec(max c d) = dec(c) ∪ dec(d) (never when a
+    /// side is), dec(imax c d) = dec(d), dec(0) = {}.
+    fn dec_set(&self, l: u32, memo: &mut FxHashMap<u32, Option<Vec<u32>>>) -> Option<Vec<u32>> {
+        if let Some(r) = memo.get(&l) {
+            return r.clone();
+        }
         let (k, a, b) = self.get(l);
-        match k {
-            K_PARAM => Some(a),
-            K_MAX => {
-                if self.is_not_zero(a) || self.is_not_zero(b) {
-                    None
-                } else {
-                    self.deciding(a).or_else(|| self.deciding(b))
+        let r = match k {
+            K_ZERO => Some(Vec::new()),
+            K_PARAM => Some(vec![a]),
+            K_SUCC => None,
+            K_IMAX => self.dec_set(b, memo),
+            _ => match (self.dec_set(a, memo), self.dec_set(b, memo)) {
+                (Some(mut x), Some(y)) => {
+                    x.extend(y);
+                    x.sort_unstable();
+                    x.dedup();
+                    Some(x)
                 }
-            }
-            K_IMAX => self.deciding(b),
-            _ => None,
-        }
+                _ => None,
+            },
+        };
+        memo.insert(l, r.clone());
+        r
     }
 
-    /// A parameter deciding the right side of some `imax` in `l`.
-    fn split_param(&self, l: u32) -> Option<u32> {
+    /// `l` as a max of guarded terms (`GTerm`): its value under every
+    /// assignment is the largest term's (0 for none). p is the term p;
+    /// succ l is 1 and every term of l one higher; max joins; imax c d is d's
+    /// terms and c's with the clause dec(d) added (c counts only when d is
+    /// not zero, and then imax is max); with dec(d) empty imax c d is 0.
+    /// `None` on a tick's stop.
+    fn gterms(&self, l: u32, memo: &mut FxHashMap<u32, Vec<GTerm>>, dm: &mut FxHashMap<u32, Option<Vec<u32>>>, tick: &mut dyn FnMut() -> bool) -> Option<Vec<GTerm>> {
+        if let Some(r) = memo.get(&l) {
+            return Some(r.clone());
+        }
+        if !tick() {
+            return None;
+        }
         let (k, a, b) = self.get(l);
-        match k {
-            K_SUCC => self.split_param(a),
-            K_MAX => self.split_param(a).or_else(|| self.split_param(b)),
-            K_IMAX => self.deciding(b).or_else(|| self.split_param(a)).or_else(|| self.split_param(b)),
-            _ => None,
-        }
+        let r = match k {
+            K_ZERO => Vec::new(),
+            K_PARAM => vec![GTerm { guard: Vec::new(), base: Some(a), k: 0 }],
+            K_SUCC => {
+                let mut r = vec![GTerm { guard: Vec::new(), base: None, k: 1 }];
+                for mut t in self.gterms(a, memo, dm, tick)? {
+                    t.k += 1;
+                    r.push(t);
+                }
+                gterms_simplify(r)
+            }
+            K_MAX => {
+                let mut r = self.gterms(a, memo, dm, tick)?;
+                r.extend(self.gterms(b, memo, dm, tick)?);
+                gterms_simplify(r)
+            }
+            _ => match self.dec_set(b, dm) {
+                Some(d) if d.is_empty() => Vec::new(),
+                d => {
+                    let mut r = self.gterms(b, memo, dm, tick)?;
+                    for mut t in self.gterms(a, memo, dm, tick)? {
+                        if let Some(d) = &d {
+                            t.guard.push(d.clone());
+                        }
+                        r.push(t);
+                    }
+                    gterms_simplify(r)
+                }
+            },
+        };
+        memo.insert(l, r.clone());
+        Some(r)
     }
 
-    /// `a >= b` for every assignment of the parameters, by cases on a
-    /// parameter p that decides an `imax`: `p = 0`, and `p = p' + 1` (the
-    /// same name standing for p'). Either way p no longer decides anything
-    /// (it is gone, or only under `succ`), so each step removes one deciding
-    /// parameter, and once none is left every `imax` is gone and `geq_core`
-    /// is complete. `tick` is called at every step; when it says stop, the
-    /// answer is `None` (the caller declines), never a "no". Results are
-    /// memoized per pair of normal forms.
+    /// `a >= b` for every assignment of the parameters (complete). Both
+    /// sides as guarded terms (`gterms`); `a >= b` exactly when `a` is at
+    /// least each term of `b`, and that is decided by cases only on the
+    /// parameters of that term's guard and base (`covers`): the parameters
+    /// that decide `imax`es elsewhere, in other terms of `b`, are never split
+    /// on, so independent `imax`es cost a sum, not a product (conformance
+    /// hunt 2026-11-26, F2). `tick` is called at every step; when it says
+    /// stop, the answer is `None` (the caller declines), never a "no".
+    /// Results are memoized per pair of normal forms.
     pub fn geq_cases(&mut self, a: u32, b: u32, tick: &mut dyn FnMut() -> bool) -> Option<bool> {
         if !tick() {
             return None;
@@ -372,22 +420,19 @@ impl<'e> Levels<'e> {
         }
         let r = if self.geq_core(a, b) {
             true
-        } else if let Some(p) = self.split_param(a).or_else(|| self.split_param(b)) {
-            let pl = self.param(p);
-            let succ_p = self.succ(pl);
+        } else {
+            let mut memo = FxHashMap::default();
+            let mut dm = FxHashMap::default();
+            let ta = self.gterms(a, &mut memo, &mut dm, tick)?;
+            let tb = self.gterms(b, &mut memo, &mut dm, tick)?;
             let mut ok = true;
-            for to in [ZERO, succ_p] {
-                let f = |n: u32| if n == p { Some(to) } else { None };
-                let a2 = self.subst(a, &f, &mut FxHashMap::default());
-                let b2 = self.subst(b, &f, &mut FxHashMap::default());
-                if !self.geq_cases(a2, b2, tick)? {
+            for t in &tb {
+                if !covers(&ta, t, &mut Vec::new(), &mut Vec::new(), tick)? {
                     ok = false;
                     break;
                 }
             }
             ok
-        } else {
-            false
         };
         self.cases_memo.insert((a, b), r);
         Some(r)
@@ -519,6 +564,120 @@ impl<'e> Levels<'e> {
             _ => !seen.insert(l) || (self.params_in_go(a, f, seen) && self.params_in_go(b, f, seen)),
         }
     }
+}
+
+/// A guarded term of a level: `base + k` (base a parameter, or 0 for
+/// `None`) when every clause of `guard` holds, else 0. A clause holds when
+/// one of its parameters is not zero.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct GTerm {
+    guard: Vec<Vec<u32>>,
+    base: Option<u32>,
+    k: u32,
+}
+
+/// Clause `c` follows from `guard` when it contains one of guard's clauses.
+fn implied(guard: &[Vec<u32>], c: &[u32]) -> bool {
+    guard.iter().any(|g| g.iter().all(|x| c.contains(x)))
+}
+
+/// Terms with sorted guards without clauses implied by others, no zero
+/// terms, and none at most another one everywhere: `s` is at least `t`
+/// when `t`'s guard implies `s`'s and `s` is as high on the same base (or
+/// `t` is a constant).
+fn gterms_simplify(mut ts: Vec<GTerm>) -> Vec<GTerm> {
+    for t in ts.iter_mut() {
+        let mut g = std::mem::take(&mut t.guard);
+        for c in g.iter_mut() {
+            c.sort_unstable();
+            c.dedup();
+        }
+        g.sort_unstable_by(|x, y| x.len().cmp(&y.len()).then_with(|| x.cmp(y)));
+        g.dedup();
+        let mut kept: Vec<Vec<u32>> = Vec::new();
+        for c in g {
+            if !implied(&kept, &c) {
+                kept.push(c);
+            }
+        }
+        kept.sort_unstable();
+        t.guard = kept;
+    }
+    ts.retain(|t| t.base.is_some() || t.k > 0);
+    ts.sort_unstable();
+    ts.dedup();
+    let at_least = |s: &GTerm, t: &GTerm| {
+        (s.base == t.base || t.base.is_none()) && s.k >= t.k && s.guard.iter().all(|c| implied(&t.guard, c))
+    };
+    let mut out: Vec<GTerm> = Vec::new();
+    for (i, t) in ts.iter().enumerate() {
+        // of two equal-strength terms the first is kept
+        let beaten = ts.iter().enumerate().any(|(j, s)| j != i && at_least(s, t) && (!at_least(t, s) || j < i));
+        if !beaten {
+            out.push(t.clone());
+        }
+    }
+    out
+}
+
+/// Whether the terms `a` are at least `t` for every assignment in which the
+/// parameters `nz` are not zero and `z` are zero. Cases are taken only on a
+/// parameter of `t`'s guard (an open clause) or base: `p = 0` or not. Once
+/// `t`'s guard holds and its base is decided, `t` has one value (base + k,
+/// the base unbounded when not zero) and `a`, which only grows with every
+/// parameter (levels are monotone), is least with every other parameter 0
+/// and the non-zero ones 1: `a` wins when a term alive there (every clause
+/// meets `nz`) is on the same base at least as high, or, for a constant
+/// `k`, is at least `k` there (its base, when in `nz`, counts as 1).
+fn covers(a: &[GTerm], t: &GTerm, nz: &mut Vec<u32>, z: &mut Vec<u32>, tick: &mut dyn FnMut() -> bool) -> Option<bool> {
+    if !tick() {
+        return None;
+    }
+    let mut split = None;
+    for c in &t.guard {
+        if c.iter().any(|x| nz.contains(x)) {
+            continue;
+        }
+        match c.iter().find(|x| !z.contains(x)) {
+            // a clause with every parameter zero: `t` is 0 here
+            None => return Some(true),
+            Some(&x) => {
+                if split.is_none() {
+                    split = Some(x);
+                }
+            }
+        }
+    }
+    if split.is_none()
+        && let Some(p) = t.base
+        && !nz.contains(&p)
+        && !z.contains(&p)
+    {
+        split = Some(p);
+    }
+    if let Some(x) = split {
+        nz.push(x);
+        let r = covers(a, t, nz, z, tick);
+        nz.pop();
+        if !r? {
+            return Some(false);
+        }
+        z.push(x);
+        let r = covers(a, t, nz, z, tick);
+        z.pop();
+        return r;
+    }
+    let base = t.base.filter(|p| nz.contains(p));
+    if base.is_none() && t.k == 0 {
+        return Some(true);
+    }
+    Some(a.iter().any(|s| {
+        s.guard.iter().all(|c| c.iter().any(|x| nz.contains(x)))
+            && match base {
+                Some(p) => s.base == Some(p) && s.k >= t.k,
+                None => s.k >= t.k || (s.k + 1 >= t.k && s.base.is_some_and(|q| nz.contains(&q))),
+            }
+    }))
 }
 
 #[cfg(test)]
@@ -679,5 +838,104 @@ mod tests {
         }
         let mut n = 0;
         assert_eq!(lv2.geq_cases(left, right, &mut || { n += 1; n < 3 }), None);
+    }
+
+    fn value(lv: &Levels, l: u32, asg: &[u32]) -> u32 {
+        let (k, a, b) = lv.get(l);
+        match k {
+            K_ZERO => 0,
+            K_PARAM => asg[a as usize],
+            K_SUCC => value(lv, a, asg) + 1,
+            K_MAX => value(lv, a, asg).max(value(lv, b, asg)),
+            _ => {
+                let y = value(lv, b, asg);
+                if y == 0 { 0 } else { value(lv, a, asg).max(y) }
+            }
+        }
+    }
+
+    fn random_level(lv: &mut Levels, np: u32, seed: &mut u64, depth: u32) -> u32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let r = (*seed >> 33) % if depth == 0 { 3 } else { 6 };
+        match r {
+            0 => ZERO,
+            1 | 2 => lv.param((((*seed >> 40) % np as u64) + 1) as u32),
+            3 => {
+                let a = random_level(lv, np, seed, depth - 1);
+                lv.succ(a)
+            }
+            4 => {
+                let a = random_level(lv, np, seed, depth - 1);
+                let b = random_level(lv, np, seed, depth - 1);
+                lv.mk(K_MAX, a, b)
+            }
+            _ => {
+                let a = random_level(lv, np, seed, depth - 1);
+                let b = random_level(lv, np, seed, depth - 1);
+                lv.mk(K_IMAX, a, b)
+            }
+        }
+    }
+
+    /// The complete comparison against evaluation on every assignment of
+    /// 0..=6 to three parameters (enough: offsets stay below 5 at depth 4).
+    #[test]
+    fn geq_against_evaluation() {
+        let g = vec![(K_ZERO, 0, 0)];
+        let gmap: FxHashMap<(u8, u32, u32), u32> = [((K_ZERO, 0, 0), 0)].into_iter().collect();
+        let mut lv = Levels::new(&g, &gmap);
+        let mut seed = 11u64;
+        let (mut yes, mut no) = (0, 0);
+        for _ in 0..30000 {
+            let a = random_level(&mut lv, 3, &mut seed, 4);
+            let b = random_level(&mut lv, 3, &mut seed, 4);
+            let mut want = true;
+            'all: for x in 0..=6u32 {
+                for y in 0..=6u32 {
+                    for z in 0..=6u32 {
+                        let asg = [0, x, y, z];
+                        if value(&lv, a, &asg) < value(&lv, b, &asg) {
+                            want = false;
+                            break 'all;
+                        }
+                    }
+                }
+            }
+            assert_eq!(geq(&mut lv, a, b), want, "geq({a}, {b})");
+            if want { yes += 1 } else { no += 1 }
+        }
+        assert!(yes > 3000 && no > 3000, "{yes} {no}");
+    }
+
+    /// Conformance hunt 2026-11-26, F2: n independent triples
+    /// imax u (imax v w) = imax (max u v) w under one max; the cases on
+    /// one triple's parameters never multiply with another's.
+    #[test]
+    fn independent_imaxes_add_up() {
+        let g = vec![(K_ZERO, 0, 0)];
+        let gmap: FxHashMap<(u8, u32, u32), u32> = [((K_ZERO, 0, 0), 0)].into_iter().collect();
+        let mut lv = Levels::new(&g, &gmap);
+        let n = 40;
+        let (mut l, mut r, mut bad) = (ZERO, ZERO, ZERO);
+        for i in 0..n {
+            let u = lv.param(3 * i + 1);
+            let v = lv.param(3 * i + 2);
+            let w = lv.param(3 * i + 3);
+            let ivw = lv.mk(K_IMAX, v, w);
+            let a = lv.mk(K_IMAX, u, ivw);
+            let muv = lv.mk(K_MAX, u, v);
+            let b = lv.mk(K_IMAX, muv, w);
+            let iuv = lv.mk(K_IMAX, u, v);
+            let c = lv.mk(K_IMAX, iuv, w);
+            l = if i == 0 { a } else { lv.mk(K_MAX, l, a) };
+            r = if i == 0 { b } else { lv.mk(K_MAX, r, b) };
+            // the last triple is imax (imax u v) w: not equal (v = 0)
+            bad = if i == 0 { a } else if i + 1 == n { lv.mk(K_MAX, bad, c) } else { lv.mk(K_MAX, bad, a) };
+        }
+        let mut steps = 0;
+        assert_eq!(lv.geq_cases(l, r, &mut || { steps += 1; true }), Some(true));
+        assert_eq!(lv.geq_cases(r, l, &mut || { steps += 1; true }), Some(true));
+        assert!(!equiv(&mut lv, l, bad));
+        assert!(steps < 100_000, "{steps} steps");
     }
 }
