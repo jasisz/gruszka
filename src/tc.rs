@@ -4088,7 +4088,7 @@ impl Worker {
                 LitVal::Nat(n) => Some(n),
                 _ => None,
             },
-            Val::Neu { head: Head::Const(r, _), spine: EMPTY } if self.canon_of_row(r) == self.env.known.nat_zero => {
+            Val::Neu { head: Head::Const(r, _), spine: EMPTY } if self.canon_of_row(r) == self.env.known.nat_zero_lit => {
                 Some(&BIG_ZERO)
             }
             _ => None,
@@ -4100,7 +4100,7 @@ impl Worker {
                 LitVal::Nat(n) => Some(n.clone()),
                 _ => None,
             },
-            Val::Neu { head: Head::Const(r, _), spine: EMPTY } if self.canon_of_row(r) == self.env.known.nat_zero => {
+            Val::Neu { head: Head::Const(r, _), spine: EMPTY } if self.canon_of_row(r) == self.env.known.nat_zero_lit => {
                 Some(BigUint::zero())
             }
             _ => None,
@@ -4447,7 +4447,7 @@ impl Worker {
         let k = self.env.known;
         let Some(args) = self.app_args(spine) else { return Ok(None) };
         if args.len() == 1 {
-            if c == k.nat_succ {
+            if c == k.nat_succ_lit {
                 let a = self.whnf(args[0])?;
                 let Some(n) = self.nat_of(a) else { return Ok(None) };
                 let r = match nat_sized(n + 1u32) {
@@ -7924,7 +7924,7 @@ impl Worker {
         match self.val(v) {
             Val::Lit(i) => matches!(self.lit(i), LitVal::Nat(n) if !n.is_zero()),
             Val::Neu { head: Head::Const(r, _), spine } if spine != EMPTY => {
-                self.canon_of_row(r) == self.env.known.nat_succ && self.sp.len(spine) == 1 && self.sp.args(spine)[0] & PROJ_BIT == 0
+                self.canon_of_row(r) == self.env.known.nat_succ_lit && self.sp.len(spine) == 1 && self.sp.args(spine)[0] & PROJ_BIT == 0
             }
             _ => false,
         }
@@ -7941,7 +7941,7 @@ impl Worker {
                 Ok(None)
             }
             Val::Neu { head: Head::Const(r, _), spine } if spine != EMPTY => {
-                if self.canon_of_row(r) == self.env.known.nat_succ && self.sp.len(spine) == 1 {
+                if self.canon_of_row(r) == self.env.known.nat_succ_lit && self.sp.len(spine) == 1 {
                     let e = self.sp.args(spine)[0];
                     if e & PROJ_BIT == 0 {
                         return Ok(Some(e));
@@ -7955,7 +7955,7 @@ impl Worker {
     fn is_nat_zero(&self, v: V) -> bool {
         match self.val(v) {
             Val::Lit(i) => matches!(self.lit(i), LitVal::Nat(n) if n.is_zero()),
-            Val::Neu { head: Head::Const(r, _), spine: EMPTY } => self.canon_of_row(r) == self.env.known.nat_zero,
+            Val::Neu { head: Head::Const(r, _), spine: EMPTY } => self.canon_of_row(r) == self.env.known.nat_zero_lit,
             _ => false,
         }
     }

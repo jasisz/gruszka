@@ -1104,8 +1104,8 @@ impl Worker {
                     let c = self.canon_of_row(*row);
                     let k = self.env.known;
                     if n.is_zero() {
-                        c == k.nat_zero && args.is_empty()
-                    } else if c == k.nat_succ && args.len() == 1 {
+                        c == k.nat_zero_lit && args.is_empty()
+                    } else if c == k.nat_succ_lit && args.len() == 1 {
                         let p = mk(Obj::Nat(n - 1u32));
                         st.push((p, args[0].clone()));
                         true
@@ -1528,13 +1528,13 @@ impl Worker {
             CKind::Ctor { .. } => {
                 // Nat.zero is the literal 0 (the kernel's Nat operations read
                 // it as one: `nat_ref`)
-                if napp == 0 && self.canon_of_row(row) == env.known.nat_zero {
+                if napp == 0 && self.canon_of_row(row) == env.known.nat_zero_lit {
                     return Ok(C::Ob(mk(Obj::Nat(BigUint::zero()))));
                 }
-                if napp == 0 && self.canon_of_row(row) == env.known.nat_succ {
+                if napp == 0 && self.canon_of_row(row) == env.known.nat_succ_lit {
                     return Ok(self.g_stuck(m, row, llr, true));
                 }
-                if napp >= 1 && self.canon_of_row(row) == env.known.nat_succ {
+                if napp >= 1 && self.canon_of_row(row) == env.known.nat_succ_lit {
                     let x = Self::g_take_apps(m, 1).pop().unwrap();
                     m.fr.push(Fr::Nat1 { row, llr, op: SUCC, x: x.clone(), base: m.base });
                     m.base = m.el.len();
@@ -1837,7 +1837,7 @@ impl Worker {
                 C::Ev(body, Self::g_push_env(env.clone(), r, a), *ls)
             }
             Obj::Con { row, llr, args, ctor: true, .. } if app => {
-                if self.canon_of_row(*row) == self.env.known.nat_succ {
+                if self.canon_of_row(*row) == self.env.known.nat_succ_lit {
                     return self.g_delegate(m, &o).map(Ok);
                 }
                 let mut xs = args.clone();

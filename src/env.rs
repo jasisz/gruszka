@@ -730,6 +730,11 @@ pub struct Known {
     pub nat: u32,
     pub nat_zero: u32,
     pub nat_succ: u32,
+    /// `nat_zero` / `nat_succ` when declared with no universe parameters,
+    /// else NONE: only then is the constant read as a literal (`0`, `n+1`)
+    /// by the kernel's Nat rules (Lean's `e == mk_constant(Nat.zero)`)
+    pub nat_zero_lit: u32,
+    pub nat_succ_lit: u32,
     pub string: u32,
     pub string_of_list: u32,
     pub list: u32,
@@ -1247,6 +1252,8 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
         nat: find(&["Nat"]),
         nat_zero: find(&["Nat", "zero"]),
         nat_succ: find(&["Nat", "succ"]),
+        nat_zero_lit: NONE,
+        nat_succ_lit: NONE,
         string: find(&["String"]),
         string_of_list: find(&["String", "ofList"]),
         list: find(&["List"]),
@@ -1330,6 +1337,14 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
     // constant with no universe levels: a `Nat.add.{u}` is a definition
     // like any other and unfolds (an occurrence carries as many levels as
     // its declaration has parameters, `infer_const`)
+    let unlevelled = |c: u32| -> u32 {
+        match row_of_canon.get(c as usize) {
+            Some(&r) if r != NONE && ld.consts[r as usize].lparams.is_empty() => c,
+            _ => NONE,
+        }
+    };
+    known.nat_zero_lit = unlevelled(known.nat_zero);
+    known.nat_succ_lit = unlevelled(known.nat_succ);
     let mut nat_op = vec![0u8; ld.consts.len()];
     for (i, c) in ld.consts.iter().enumerate() {
         if !c.lparams.is_empty() {
