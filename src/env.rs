@@ -747,7 +747,6 @@ pub struct Known {
     pub quot_ind: u32,
     /// Nat binary operations, in `NatOp` order.
     pub nat_ops: [u32; 14],
-    pub nat_log2: u32,
 }
 
 pub const NONE: u32 = u32::MAX;
@@ -785,7 +784,9 @@ pub struct Env<'f> {
     pub row_of_canon: Vec<u32>,
     /// Recursor rows: the inductive of the major premise (canonical name), if found.
     pub rec_major: FxHashMap<u32, u32>,
-    /// Per row: 1 + index into NAT_OPS, 100 Nat.succ, 101 Nat.log2, 0 other.
+    /// Per row: 1 + index into NAT_OPS, 100 Nat.succ, 0 other (Lean's
+    /// kernel computes these on literals and nothing else: Nat.log2 and the
+    /// rest unfold from their definitions).
     pub nat_op: Vec<u8>,
     /// The file's inductive types carry the flags of lean4export 3.2
     /// (every one of them: the reader rejects a file mixing flagged and
@@ -1262,7 +1263,6 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
         quot_lift: find(&["Quot", "lift"]),
         quot_ind: find(&["Quot", "ind"]),
         nat_ops: [NONE; 14],
-        nat_log2: find(&["Nat", "log2"]),
     };
     for (i, op) in NAT_OPS.iter().enumerate() {
         known.nat_ops[i] = find(&["Nat", op]);
@@ -1333,8 +1333,6 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
             nat_op[i] = 1 + j as u8;
         } else if cn == known.nat_succ && cn != NONE {
             nat_op[i] = 100;
-        } else if cn == known.nat_log2 && cn != NONE {
-            nat_op[i] = 101;
         }
     }
     // milestone 24s: the quotient package's names are reserved. Lean's

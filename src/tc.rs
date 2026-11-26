@@ -4447,18 +4447,12 @@ impl Worker {
         let k = self.env.known;
         let Some(args) = self.app_args(spine) else { return Ok(None) };
         if args.len() == 1 {
-            if c == k.nat_succ || c == k.nat_log2 {
+            if c == k.nat_succ {
                 let a = self.whnf(args[0])?;
                 let Some(n) = self.nat_of(a) else { return Ok(None) };
-                let r = if c == k.nat_succ {
-                    match nat_sized(n + 1u32) {
-                        Ok(r) => r,
-                        Err(why) => return reject(why),
-                    }
-                } else if n.is_zero() {
-                    BigUint::zero()
-                } else {
-                    BigUint::from(n.bits() - 1)
+                let r = match nat_sized(n + 1u32) {
+                    Ok(r) => r,
+                    Err(why) => return reject(why),
                 };
                 return Ok(Some(self.mk_nat(r)?));
             }
