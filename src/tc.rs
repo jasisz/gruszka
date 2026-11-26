@@ -4938,8 +4938,35 @@ impl Worker {
             return None;
         }
         let rules: Vec<u32> = rules.iter().map(|r| r.1).collect();
+        // the minor premises' arities: the Pi binders of each minor's domain
+        // in the recursor's type, which the inductive check has matched
+        // binder by binder (fields, then one induction hypothesis per
+        // recursive field, then the motive applied: no Pi)
+        let mut rt = self.consts[rrow as usize].ty;
+        if rt >= self.mlen {
+            return None;
+        }
+        for _ in 0..np + 1 {
+            if !is_pi(self.tk(rt)) {
+                return None;
+            }
+            rt = self.tb(rt);
+        }
         for j in 0..nm {
-            // λ fields ihs. minor_j fields
+            if !is_pi(self.tk(rt)) {
+                return None;
+            }
+            let mut d = self.ta(rt);
+            rt = self.tb(rt);
+            let mut arity = 0u32;
+            while is_pi(self.tk(d)) {
+                d = self.tb(d);
+                arity += 1;
+            }
+            // λ fields ihs. minor_j fields: the wrapper binds exactly what
+            // the recursor's rule passes the minor, so that after the rule
+            // and beta the induction hypotheses are the ones dropped (with
+            // fewer lambdas, the hypotheses would go to minor_j's body)
             let mut a = args[(np + 1 + j) as usize];
             let mut k = 0u32;
             while is_lam(self.tk(a)) {
@@ -4947,7 +4974,7 @@ impl Worker {
                 k += 1;
             }
             let nf = rules[j as usize];
-            if k < nf {
+            if k != arity || k < nf {
                 return None;
             }
             let mut g = a;
