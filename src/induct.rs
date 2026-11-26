@@ -55,6 +55,10 @@ pub struct Ind {
     ann: [u32; 4],
     /// Renovation: the block's flags once checked (`None` in a 3.1 export).
     fl: Option<BlockFlags>,
+    /// Nested: per type of the enlarged block, the variable standing for
+    /// an auxiliary type applied to the parameters (Lean's `Jaux As`),
+    /// NONE for the block's own types; empty without auxiliary types.
+    marks: Vec<V>,
 }
 
 /// What the recursors of a flagged block follow (lean4#16595): large
@@ -76,6 +80,42 @@ pub enum Sx {
     V(V),
 }
 
+/// A constructor field as Lean's positivity check sees it: the nested
+/// occurrences replaced before anything is reduced. `T`: a term under an
+/// environment (`PEnv`) and a level substitution; `S`: a value that stands
+/// for syntax (an argument of an auxiliary type, which Lean puts in with
+/// `instantiate_pi_params`), read as the term it was made from.
+#[derive(Clone, Copy)]
+pub enum Cl {
+    T(u32, PEnv, u32),
+    S(V),
+}
+
+/// The environment of a `Cl::T`: a Gruszka environment of syntax (the
+/// constructor's parameters, the auxiliary type's arguments, its fields)
+/// under `ntop` entries this pass pushed itself (`pe` list from `top`):
+/// arguments put in by a beta or zeta step, and variables of opened binders.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PEnv {
+    base: u32,
+    top: u32,
+    ntop: u32,
+}
+
+/// What `lean_head` found: a Pi at the head (as syntax), or the value.
+enum Rh {
+    Pi(u32, PEnv, u32),
+    Val(V),
+}
+
+/// An entry pushed above the syntax: a closure put in by beta or zeta
+/// (Lean's replacement ran on it before the step), or a value.
+#[derive(Clone, Copy)]
+pub enum Ent {
+    Beta(Cl),
+    Val(V),
+}
+
 /// Milestone 28: what the walks of one inductive block found, so that a
 /// term shared many times in the block's types (MAIN is a DAG) is walked
 /// once per environment: occurrence tests by (term, environment, depth) and
@@ -92,6 +132,17 @@ pub struct IndMemo {
     on: bool,
     /// steps walked unmemoized; u32::MAX: memo disabled
     n: u32,
+    /// Lean's view of a nested block's fields: the entries pushed above
+    /// syntax (entry, the entry below), variables that are occurrences of
+    /// the enlarged block (an auxiliary type `Jaux As`, a binder abstracted
+    /// with an occurrence inside), the abstracted binders, the Gruszka
+    /// environments made for an environment, and which closures hold a
+    /// nested occurrence
+    pe: Vec<(Ent, u32)>,
+    fvs: Vec<u32>,
+    abs: Vec<(u32, Cl)>,
+    genv: rustc_hash::FxHashMap<(u32, u32), u32>,
+    site: rustc_hash::FxHashMap<(u32, u32, u32, u32, u32), bool>,
 }
 impl IndMemo {
     /// Milestone 37: bytes held (room included)
@@ -105,7 +156,19 @@ impl IndMemo {
 const IND_MEMO_AFTER: u32 = if cfg!(debug_assertions) { 0 } else { 4096 };
 impl Default for IndMemo {
     fn default() -> Self {
-        IndMemo { occ: Default::default(), occv: Default::default(), scan: Default::default(), eq: Default::default(), on: false, n: u32::MAX }
+        IndMemo {
+            occ: Default::default(),
+            occv: Default::default(),
+            scan: Default::default(),
+            eq: Default::default(),
+            on: false,
+            n: u32::MAX,
+            pe: Vec::new(),
+            fvs: Vec::new(),
+            abs: Vec::new(),
+            genv: Default::default(),
+            site: Default::default(),
+        }
     }
 }
 impl IndMemo {
@@ -123,6 +186,11 @@ impl IndMemo {
         self.occv = Default::default();
         self.scan = Default::default();
         self.eq = Default::default();
+        self.pe = Vec::new();
+        self.fvs = Vec::new();
+        self.abs = Vec::new();
+        self.genv = Default::default();
+        self.site = Default::default();
     }
 }
 
@@ -239,7 +307,12 @@ impl Worker {
                             return Ok(true);
                         }
                     }
-                    Head::FVar(_) => {}
+                    Head::FVar(i) => {
+                        // an auxiliary type or an abstracted binder holding one
+                        if self.ind_memo.fvs.contains(&i) {
+                            return Ok(true);
+                        }
+                    }
                 }
                 for e in self.spine(spine) {
                     if e & 0x8000_0000 == 0 && self.occ_val(e, set)? {
@@ -281,13 +354,16 @@ impl Worker {
     }
 
     /// `T pargs indices` with `T` a type of the enlarged block and no type
-    /// of the block in the indices. Returns the type's index.
-    fn valid_ind_app_val(&mut self, ind: &Ind, v: V) -> R<Option<usize>> {
+    /// of the block in the indices. Returns the type's index. `aux`: an
+    /// auxiliary type may be the application `J Ds is` (else only the
+    /// block's own types, as in Lean's view where an auxiliary type is a
+    /// variable of its own).
+    fn valid_ind_app_val(&mut self, ind: &Ind, v: V, aux: bool) -> R<Option<usize>> {
         let Some((row, llr, spine)) = self.const_head(v) else { return Ok(None) };
         let Some(args) = self.app_args(spine) else { return Ok(None) };
         'types: for j in 0..ind.types.len() {
             let ti = &ind.types[j];
-            if ti.row != row || args.len() != ti.pargs.len() + ti.nidx as usize {
+            if (ti.aux && !aux) || ti.row != row || args.len() != ti.pargs.len() + ti.nidx as usize {
                 continue;
             }
             if self.ll_get(llr) != self.ll_get(ti.llr) {
@@ -365,7 +441,7 @@ impl Worker {
             let b = self.bind_body(t, x)?;
             return self.positivity(ind, b);
         }
-        if self.valid_ind_app_val(ind, t)?.is_some() {
+        if self.valid_ind_app_val(ind, t, true)?.is_some() {
             return Ok(());
         }
         reject("invalid occurrence of the inductive type in a constructor argument")
@@ -384,7 +460,551 @@ impl Worker {
             let b = self.bind_body(t, x)?;
             t = self.whnf(b)?;
         }
-        Ok(self.valid_ind_app_val(ind, t)?.map(|j| (j, xs, t)))
+        Ok(self.valid_ind_app_val(ind, t, true)?.map(|j| (j, xs, t)))
+    }
+
+    // ---- Lean's view of a nested block's fields. elim_nested_inductive
+    // replaces every nested occurrence `J Ds is` in the syntax of the
+    // constructor types (the auxiliary constructors' with J's parameters
+    // put in by instantiate_pi_params) by `Jaux As is` before
+    // check_positivity and is_rec_argument whnf anything; an occurrence a
+    // reduction reveals (`(fun x => L x) T`, a definition unfolding to
+    // `L x`) stays `J Ds`, whose head is no type of the block: rejected.
+    // Here the replaced field is made as a value: `Jaux As` is a variable of
+    // its own (`marks`), the rest the field's syntax, the beta and zeta
+    // steps at its head taken on the syntax (an argument put in is no part
+    // of an occurrence's syntax), a binder with an occurrence inside an
+    // argument a variable standing for it (`abs`), opened when a reduction
+    // brings it to the head.
+
+    fn pe_push(&mut self, e: PEnv, x: Ent) -> PEnv {
+        self.ind_memo.pe.push((x, e.top));
+        PEnv { base: e.base, top: self.ind_memo.pe.len() as u32 - 1, ntop: e.ntop + 1 }
+    }
+
+    /// Entry `i` of `e`: one pushed above the syntax, or (Err) a value of
+    /// the syntax below.
+    fn pe_get(&self, e: PEnv, i: u32) -> R<Result<Ent, V>> {
+        if i < e.ntop {
+            let mut k = e.top;
+            for _ in 0..i {
+                k = self.ind_memo.pe[k as usize].1;
+            }
+            Ok(Ok(self.ind_memo.pe[k as usize].0))
+        } else {
+            Ok(Err(self.env_get(e.base, i - e.ntop)?))
+        }
+    }
+
+    /// The Gruszka environment for `e`, its closures made plain values.
+    fn genv(&mut self, e: PEnv) -> R<u32> {
+        if e.ntop == 0 {
+            return Ok(e.base);
+        }
+        if let Some(&g) = self.ind_memo.genv.get(&(e.base, e.top)) {
+            return Ok(g);
+        }
+        self.tick()?;
+        let (x, below) = self.ind_memo.pe[e.top as usize];
+        let g0 = self.genv(PEnv { base: e.base, top: below, ntop: e.ntop - 1 })?;
+        let v = match x {
+            Ent::Val(v) => v,
+            Ent::Beta(c) => self.cl_plain(c)?,
+        };
+        let g = self.push_env(v, g0);
+        self.ind_memo.genv.insert((e.base, e.top), g);
+        Ok(g)
+    }
+
+    /// The closure as a value, nothing replaced (for a closure without a
+    /// nested occurrence, or where only the mention of the block counts).
+    fn cl_plain(&mut self, c: Cl) -> R<V> {
+        match c {
+            Cl::T(t, e, ls) => {
+                let g = self.genv(e)?;
+                self.thunk(t, g, ls)
+            }
+            Cl::S(v) => Ok(v),
+        }
+    }
+
+    /// The auxiliary type that `J ps...` (J at row `jrow`, levels `jllr`)
+    /// is: equal parameters as terms, as Lean looks the occurrence up.
+    fn aux_of(&mut self, ind: &Ind, jrow: u32, jllr: u32, ps: &[V]) -> R<Option<usize>> {
+        for j in 0..ind.types.len() {
+            let ti = &ind.types[j];
+            if !ti.aux || ti.row != jrow || ti.pargs.len() != ps.len() || self.ll_get(ti.llr) != self.ll_get(jllr) {
+                continue;
+            }
+            let pargs = ti.pargs.clone();
+            let mut same = true;
+            for i in 0..ps.len() {
+                if !self.sx_eq(Sx::V(ps[i]), Sx::V(pargs[i]))? {
+                    same = false;
+                    break;
+                }
+            }
+            if same {
+                return Ok(Some(j));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The application of constant term `f` to `args` (under `e`, `depth`
+    /// binders deep) is a nested occurrence: J an inductive type declared
+    /// before, its parameters mentioning the block in the syntax (through
+    /// the auxiliary types' arguments, not through what a beta step put
+    /// in). Returns its auxiliary type.
+    fn site_t(&mut self, ind: &Ind, f: u32, args: &[u32], e: PEnv, ls: u32, depth: u32) -> R<Option<usize>> {
+        let jrow = self.env.row(self.ta(f));
+        if jrow == NONE || !self.visible(jrow) || ind.canon.contains(&self.canon_of_row(jrow)) {
+            return Ok(None);
+        }
+        let CKind::Induct { nparams: jnp, .. } = &self.env.consts[jrow as usize].kind else { return Ok(None) };
+        let jnp = *jnp as usize;
+        if args.len() < jnp {
+            return Ok(None);
+        }
+        let mut nested = false;
+        for &a in &args[..jnp] {
+            if self.occ_term(a, e.base, depth + e.ntop, &ind.canon)? {
+                nested = true;
+                break;
+            }
+        }
+        if !nested {
+            return Ok(None);
+        }
+        // the parameters read nothing bound below the occurrence (the scan
+        // rejected that), so the binders stand for anything
+        let mut g = self.genv(e)?;
+        if depth > 0 {
+            let dummy = self.intern(Val::Sort(crate::level::ZERO))?;
+            for _ in 0..depth {
+                g = self.push_env(dummy, g);
+            }
+        }
+        let mut ps = Vec::with_capacity(jnp);
+        for &a in &args[..jnp] {
+            ps.push(self.thunk(a, g, ls)?);
+        }
+        let jllr = self.lsub_ll(f, ls);
+        match self.aux_of(ind, jrow, jllr, &ps)? {
+            Some(j) => Ok(Some(j)),
+            None => decline("nested occurrence without its auxiliary type"),
+        }
+    }
+
+    /// `site_t` for a value standing for syntax: `J sp...`.
+    fn site_s(&mut self, ind: &Ind, r: u32, l: u32, sp: &[V]) -> R<Option<usize>> {
+        if ind.canon.contains(&self.canon_of_row(r)) {
+            return Ok(None);
+        }
+        let CKind::Induct { nparams: jnp, .. } = &self.env.consts[r as usize].kind else { return Ok(None) };
+        let jnp = *jnp as usize;
+        if sp.len() < jnp {
+            return Ok(None);
+        }
+        let mut nested = false;
+        for &a in &sp[..jnp] {
+            if self.occ_val(a, &ind.canon)? {
+                nested = true;
+                break;
+            }
+        }
+        if !nested {
+            return Ok(None);
+        }
+        match self.aux_of(ind, r, l, &sp[..jnp])? {
+            Some(j) => Ok(Some(j)),
+            None => decline("nested occurrence without its auxiliary type"),
+        }
+    }
+
+    /// Does the closure (`depth` binders deep) hold a nested occurrence?
+    fn has_site(&mut self, ind: &Ind, c: Cl, depth: u32) -> R<bool> {
+        self.tick()?;
+        let key = match c {
+            Cl::T(t, e, ls) => {
+                if matches!(self.tk(t), SORT | CONST | NAT | STR) {
+                    return Ok(false);
+                }
+                (t, e.base, e.top, ls, depth)
+            }
+            Cl::S(v) => (v, u32::MAX - 1, 0, 0, 0),
+        };
+        if let Some(&b) = self.ind_memo.site.get(&key) {
+            return Ok(b);
+        }
+        let b = self.has_site_go(ind, c, depth)?;
+        self.ind_memo.site.insert(key, b);
+        Ok(b)
+    }
+
+    fn has_site_go(&mut self, ind: &Ind, c: Cl, depth: u32) -> R<bool> {
+        match c {
+            Cl::S(v) => match self.val(v) {
+                Val::Thunk { term, env, ls } | Val::Clo { term, env, ls } => {
+                    self.has_site(ind, Cl::T(term, PEnv { base: env, top: NONE, ntop: 0 }, ls), 0)
+                }
+                Val::Neu { head, spine } => {
+                    let Some(sp) = self.app_args(spine) else { return Ok(false) };
+                    let sp = sp.to_vec();
+                    match head {
+                        Head::Const(r, l) => {
+                            if self.site_s(ind, r, l, &sp)?.is_some() {
+                                return Ok(true);
+                            }
+                        }
+                        Head::Stuck(x) => {
+                            if self.has_site(ind, Cl::S(x), 0)? {
+                                return Ok(true);
+                            }
+                        }
+                        Head::FVar(_) => {}
+                    }
+                    for a in sp {
+                        if self.has_site(ind, Cl::S(a), 0)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                _ => Ok(false),
+            },
+            Cl::T(t, e, ls) => match self.tk(t) {
+                APP => {
+                    let mut args = Vec::new();
+                    let mut f = t;
+                    while self.tk(f) == APP {
+                        args.push(self.tb(f));
+                        f = self.ta(f);
+                    }
+                    args.reverse();
+                    if self.tk(f) == CONST {
+                        if self.site_t(ind, f, &args, e, ls, depth)?.is_some() {
+                            return Ok(true);
+                        }
+                    } else if self.has_site(ind, Cl::T(f, e, ls), depth)? {
+                        return Ok(true);
+                    }
+                    for a in args {
+                        if self.has_site(ind, Cl::T(a, e, ls), depth)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
+                }
+                BVAR => {
+                    let i = self.tp(t);
+                    if i < depth {
+                        return Ok(false);
+                    }
+                    match self.pe_get(e, i - depth)? {
+                        Ok(Ent::Beta(c2)) => self.has_site(ind, c2, 0),
+                        Ok(Ent::Val(_)) => Ok(false),
+                        Err(v) => self.has_site(ind, Cl::S(v), 0),
+                    }
+                }
+                LET => {
+                    let b = self.let_body(t);
+                    Ok(self.has_site(ind, Cl::T(self.ta(t), e, ls), depth)?
+                        || self.has_site(ind, Cl::T(self.tb(t), e, ls), depth)?
+                        || self.has_site(ind, Cl::T(b, e, ls), depth + 1)?)
+                }
+                PROJ => self.has_site(ind, Cl::T(self.ta(t), e, ls), depth),
+                k if is_lam(k) || is_pi(k) => Ok(self.has_site(ind, Cl::T(self.ta(t), e, ls), depth)?
+                    || self.has_site(ind, Cl::T(self.tb(t), e, ls), depth + 1)?),
+                _ => Ok(false),
+            },
+        }
+    }
+
+    /// `Jaux As` (block type `j`) applied to `idx`.
+    fn mark_app(&mut self, ind: &Ind, j: usize, idx: &[V]) -> R<V> {
+        self.mk_app(ind.marks[j], idx)
+    }
+
+    /// The marked auxiliary type of variable `i`, if it is one.
+    fn mark_of(&self, ind: &Ind, i: u32) -> Option<usize> {
+        ind.marks.iter().position(|&m| m != NONE && matches!(self.val(m), Val::Neu { head: Head::FVar(k), .. } if k == i))
+    }
+
+    /// The abstracted binder variable `i` stands for, if it is one.
+    fn abs_of(&self, i: u32) -> Option<Cl> {
+        self.ind_memo.abs.iter().find(|&&(k, _)| k == i).map(|&(_, c)| c)
+    }
+
+    /// `Jaux As is` is a valid occurrence (Lean's is_valid_ind_app on an
+    /// auxiliary type): all indices given, none mentioning the block.
+    fn mark_ok(&mut self, ind: &Ind, j: usize, spine: u32) -> R<bool> {
+        let Some(args) = self.app_args(spine) else { return Ok(false) };
+        if args.len() != ind.types[j].nidx as usize {
+            return Ok(false);
+        }
+        for a in args.to_vec() {
+            if self.occ_val(a, &ind.canon)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// A closure argument as its replaced value.
+    fn r_arg(&mut self, ind: &Ind, a: Ent) -> R<V> {
+        match a {
+            Ent::Val(v) => Ok(v),
+            Ent::Beta(c) => {
+                if self.has_site(ind, c, 0)? {
+                    match self.lean_head(ind, c, Vec::new(), false)? {
+                        Rh::Val(v) => Ok(v),
+                        Rh::Pi(..) => unreachable!(),
+                    }
+                } else {
+                    self.cl_plain(c)
+                }
+            }
+        }
+    }
+
+    /// `h` applied to the pending arguments (the last pushed first).
+    fn rh_apply(&mut self, ind: &Ind, h: V, pend: Vec<Ent>) -> R<Rh> {
+        if pend.is_empty() {
+            return Ok(Rh::Val(h));
+        }
+        let mut args = Vec::with_capacity(pend.len());
+        for &a in pend.iter().rev() {
+            args.push(self.r_arg(ind, a)?);
+        }
+        Ok(Rh::Val(self.mk_app(h, &args)?))
+    }
+
+    /// The replaced value of closure `c` applied to `pend` (the last pushed
+    /// applied first), beta and zeta steps at the head taken on the
+    /// syntax; with `stop_pi`, a Pi at the head is returned as syntax.
+    fn lean_head(&mut self, ind: &Ind, mut c: Cl, mut pend: Vec<Ent>, stop_pi: bool) -> R<Rh> {
+        loop {
+            self.tick()?;
+            match c {
+                Cl::S(v) => match self.val(v) {
+                    Val::Thunk { term, env, ls } | Val::Clo { term, env, ls } => {
+                        c = Cl::T(term, PEnv { base: env, top: NONE, ntop: 0 }, ls);
+                    }
+                    Val::Neu { head, spine } => {
+                        let Some(sp) = self.app_args(spine) else { return self.rh_apply(ind, v, pend) };
+                        let sp = sp.to_vec();
+                        if let Head::Const(r, l) = head {
+                            if let Some(j) = self.site_s(ind, r, l, &sp)? {
+                                let jnp = ind.types[j].pargs.len();
+                                let m = self.mark_app(ind, j, &sp[jnp..])?;
+                                return self.rh_apply(ind, m, pend);
+                            }
+                        }
+                        let mut any = false;
+                        if !matches!(head, Head::Stuck(_)) {
+                            for &a in &sp {
+                                if self.has_site(ind, Cl::S(a), 0)? {
+                                    any = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !any {
+                            return self.rh_apply(ind, v, pend);
+                        }
+                        let h = self.intern(Val::Neu { head, spine: EMPTY })?;
+                        for &a in sp.iter().rev() {
+                            pend.push(Ent::Beta(Cl::S(a)));
+                        }
+                        return self.rh_apply(ind, h, pend);
+                    }
+                    _ => return self.rh_apply(ind, v, pend),
+                },
+                Cl::T(t, e, ls) => match self.tk(t) {
+                    APP => {
+                        let mut args = Vec::new();
+                        let mut f = t;
+                        while self.tk(f) == APP {
+                            args.push(self.tb(f));
+                            f = self.ta(f);
+                        }
+                        args.reverse();
+                        if self.tk(f) == CONST {
+                            if let Some(j) = self.site_t(ind, f, &args, e, ls, 0)? {
+                                // the indices as they are (Lean's replacement
+                                // does not enter the occurrence it replaced)
+                                let jnp = ind.types[j].pargs.len();
+                                let g = self.genv(e)?;
+                                let mut idx = Vec::with_capacity(args.len() - jnp);
+                                for &a in &args[jnp..] {
+                                    idx.push(self.thunk(a, g, ls)?);
+                                }
+                                let m = self.mark_app(ind, j, &idx)?;
+                                return self.rh_apply(ind, m, pend);
+                            }
+                        }
+                        for &a in args.iter().rev() {
+                            pend.push(Ent::Beta(Cl::T(a, e, ls)));
+                        }
+                        c = Cl::T(f, e, ls);
+                    }
+                    BVAR => match self.pe_get(e, self.tp(t))? {
+                        Ok(Ent::Beta(c2)) => c = c2,
+                        Ok(Ent::Val(v)) => return self.rh_apply(ind, v, pend),
+                        Err(v) => c = Cl::S(v),
+                    },
+                    LET => {
+                        let b = self.let_body(t);
+                        let e2 = self.pe_push(e, Ent::Beta(Cl::T(self.tb(t), e, ls)));
+                        c = Cl::T(b, e2, ls);
+                    }
+                    k if is_lam(k) && !pend.is_empty() => {
+                        let a = pend.pop().unwrap();
+                        let e2 = self.pe_push(e, a);
+                        c = Cl::T(self.tb(t), e2, ls);
+                    }
+                    k if is_pi(k) && !pend.is_empty() => {
+                        return reject("invalid occurrence of the inductive type in a constructor argument");
+                    }
+                    k if is_pi(k) && stop_pi => return Ok(Rh::Pi(t, e, ls)),
+                    k if is_lam(k) || is_pi(k) => {
+                        let v = if self.has_site(ind, c, 0)? {
+                            let dummy = self.intern(Val::Sort(crate::level::ZERO))?;
+                            let y = self.fresh(dummy)?;
+                            let Val::Neu { head: Head::FVar(i), .. } = self.val(y) else { unreachable!() };
+                            self.ind_memo.abs.push((i, c));
+                            self.ind_memo.fvs.push(i);
+                            y
+                        } else {
+                            self.cl_plain(c)?
+                        };
+                        return self.rh_apply(ind, v, pend);
+                    }
+                    PROJ => {
+                        let s = match self.lean_head(ind, Cl::T(self.ta(t), e, ls), Vec::new(), false)? {
+                            Rh::Val(s) => s,
+                            Rh::Pi(..) => unreachable!(),
+                        };
+                        let p = self.proj_val(s, self.tb(t), self.tp(t))?;
+                        return self.rh_apply(ind, p, pend);
+                    }
+                    _ => {
+                        let v = self.cl_plain(c)?;
+                        return self.rh_apply(ind, v, pend);
+                    }
+                },
+            }
+        }
+    }
+
+    /// Lean's check_positivity on the replaced field `c` applied to `pend`.
+    fn lean_pos(&mut self, ind: &Ind, c: Cl, pend: Vec<Ent>) -> R<()> {
+        if pend.is_empty() {
+            let v = self.cl_plain(c)?;
+            if !self.occ_val(v, &ind.canon)? {
+                return Ok(());
+            }
+        }
+        match self.lean_head(ind, c, pend, true)? {
+            Rh::Pi(t, e, ls) => {
+                let dv = self.cl_plain(Cl::T(self.ta(t), e, ls))?;
+                if self.occ_val(dv, &ind.canon)? {
+                    return reject("non-positive occurrence of the inductive type in a constructor argument");
+                }
+                let x = self.fresh(dv)?;
+                let e2 = self.pe_push(e, Ent::Val(x));
+                self.lean_pos(ind, Cl::T(self.tb(t), e2, ls), Vec::new())
+            }
+            Rh::Val(v) => self.value_pos(ind, v),
+        }
+    }
+
+    /// check_positivity on a replaced value.
+    fn value_pos(&mut self, ind: &Ind, v: V) -> R<()> {
+        let t = self.whnf(v)?;
+        if !self.occ_val(t, &ind.canon)? {
+            return Ok(());
+        }
+        if self.is_pi_val(t) {
+            let d = self.bind_dom(t)?;
+            if self.occ_val(d, &ind.canon)? {
+                return reject("non-positive occurrence of the inductive type in a constructor argument");
+            }
+            let x = self.fresh(d)?;
+            let b = self.bind_body(t, x)?;
+            return self.value_pos(ind, b);
+        }
+        if let Val::Neu { head: Head::FVar(i), spine } = self.val(t) {
+            if let Some(c) = self.abs_of(i) {
+                if let Some(pend) = self.abs_pend(c, spine)? {
+                    return self.lean_pos(ind, c, pend);
+                }
+            } else if let Some(j) = self.mark_of(ind, i) {
+                if self.mark_ok(ind, j, spine)? {
+                    return Ok(());
+                }
+            }
+        } else if self.valid_ind_app_val(ind, t, false)?.is_some() {
+            return Ok(());
+        }
+        reject("invalid occurrence of the inductive type in a constructor argument")
+    }
+
+    /// An abstracted binder brought to the head applied to `spine`: the
+    /// arguments to apply it to, None when it is not a function applied
+    /// or a type alone.
+    fn abs_pend(&mut self, c: Cl, spine: u32) -> R<Option<Vec<Ent>>> {
+        let Some(args) = self.app_args(spine) else { return Ok(None) };
+        let pi = match c {
+            Cl::T(t, ..) => is_pi(self.tk(t)),
+            Cl::S(_) => false,
+        };
+        if args.is_empty() != pi {
+            return Ok(None);
+        }
+        Ok(Some(args.iter().rev().map(|&a| Ent::Val(a)).collect()))
+    }
+
+    /// Lean's is_rec_argument on the replaced field `c` applied to `pend`.
+    fn lean_rec(&mut self, ind: &Ind, c: Cl, pend: Vec<Ent>) -> R<bool> {
+        match self.lean_head(ind, c, pend, true)? {
+            Rh::Pi(t, e, ls) => {
+                let dv = self.cl_plain(Cl::T(self.ta(t), e, ls))?;
+                let x = self.fresh(dv)?;
+                let e2 = self.pe_push(e, Ent::Val(x));
+                self.lean_rec(ind, Cl::T(self.tb(t), e2, ls), Vec::new())
+            }
+            Rh::Val(v) => {
+                let mut t = self.whnf(v)?;
+                while self.is_pi_val(t) {
+                    let d = self.bind_dom(t)?;
+                    let x = self.fresh(d)?;
+                    let b = self.bind_body(t, x)?;
+                    t = self.whnf(b)?;
+                }
+                if let Val::Neu { head: Head::FVar(i), spine } = self.val(t) {
+                    if let Some(c) = self.abs_of(i) {
+                        if let Some(pend) = self.abs_pend(c, spine)? {
+                            return self.lean_rec(ind, c, pend);
+                        }
+                    } else if let Some(j) = self.mark_of(ind, i) {
+                        return self.mark_ok(ind, j, spine);
+                    }
+                    return Ok(false);
+                }
+                Ok(self.valid_ind_app_val(ind, t, false)?.is_some())
+            }
+        }
+    }
+
+    /// Lean's is_rec_argument on a field's domain `dom` (under `e`, `ls`).
+    fn is_rec_field(&mut self, ind: &Ind, dom: u32, e: u32, ls: u32) -> R<bool> {
+        if ind.marks.is_empty() {
+            let stated = self.thunk(dom, e, ls)?;
+            return Ok(self.rec_argument(ind, stated)?.is_some());
+        }
+        self.lean_rec(ind, Cl::T(dom, PEnv { base: e, top: NONE, ntop: 0 }, ls), Vec::new())
     }
 
     /// Level substitution for a row of block type `j` (its own type or a
@@ -672,7 +1292,7 @@ impl Worker {
             self.find_name(&["optParam"]),
             self.find_name(&["autoParam"]),
         ];
-        let mut ind = Ind { types: vec![], canon: canon.clone(), np, params: vec![], llr, lvls, result: 0, unsafe_, ann, fl: None };
+        let mut ind = Ind { types: vec![], canon: canon.clone(), np, params: vec![], llr, lvls, result: 0, unsafe_, ann, fl: None, marks: vec![] };
         // renovation: the flags of lean4export 3.2, one set per type (a file
         // has them on every inductive type or on none, env.rs)
         let tflags: Option<Vec<IndFlags>> = types.iter().map(|&r| self.ind_flags(r)).collect();
@@ -796,6 +1416,24 @@ impl Worker {
             }
         }
 
+        // Lean's `Jaux As` for each auxiliary type: a variable of J's type
+        // at the nested arguments, an occurrence of the block
+        if ind.types.len() > types.len() {
+            let mut marks = Vec::with_capacity(ind.types.len());
+            for j in 0..ind.types.len() {
+                if !ind.types[j].aux {
+                    marks.push(NONE);
+                    continue;
+                }
+                let ty = self.open_params_val(&ind, j, ind.types[j].row)?;
+                let m = self.fresh(ty)?;
+                let Val::Neu { head: Head::FVar(i), .. } = self.val(m) else { unreachable!() };
+                self.ind_memo.fvs.push(i);
+                marks.push(m);
+            }
+            ind.marks = marks;
+        }
+
         // ---- constructors of the enlarged block
         let mut is_rec = false;
         let mut is_reflexive = false;
@@ -856,7 +1494,11 @@ impl Worker {
                             ));
                         }
                         if !unsafe_ {
-                            self.positivity(&ind, dv)?;
+                            if ind.marks.is_empty() {
+                                self.positivity(&ind, dv)?;
+                            } else {
+                                self.lean_pos(&ind, Cl::T(dom, PEnv { base: e, top: NONE, ntop: 0 }, ls), Vec::new())?;
+                            }
                         }
                         let x = self.fresh(dv)?;
                         e = self.push_env(x, e);
@@ -1305,8 +1947,7 @@ impl Worker {
             // is_rec_argument looks at the domain as stated
             let dv = self.sx_value(want)?;
             let x = self.fresh(dv)?;
-            let stated = self.thunk(self.ta(ct), ce, ls)?;
-            if self.rec_argument(ind, stated)?.is_some() {
+            if self.is_rec_field(ind, self.ta(ct), ce, ls)? {
                 recf.push(x);
             }
             fields.push(x);
@@ -1393,7 +2034,7 @@ impl Worker {
             let ub = self.bind_body(ut, y)?;
             ut = self.whnf(ub)?;
         }
-        let Some(it) = self.valid_ind_app_val(ind, ut)? else { return reject("recursive field") };
+        let Some(it) = self.valid_ind_app_val(ind, ut, true)? else { return reject("recursive field") };
         let (_, _, usp) = self.const_head(ut).unwrap();
         let uargs = self.app_args(usp).unwrap();
         let uidx: Vec<V> = uargs[ind.types[it].pargs.len()..].to_vec();

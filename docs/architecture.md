@@ -1114,7 +1114,12 @@ until no new type appears. Gruszka never builds this auxiliary type: it *is*
 the triple (J, levels, Ds), its constructors are J's at those parameters,
 and every later check runs on the enlarged group in the restored form used
 by the file. Constructor checks then cover the parameters, the universe of
-every field, strict positivity and the return type. The resulting facts are
+every field, strict positivity and the return type. Strict positivity and
+the recursive fields of a nested group look at a field as Lean does, after
+the replacement and before any reduction: an occurrence `J Ds` there is a
+variable of its own (Lean's `Jaux As`), and a `J Ds` that only a reduction
+reveals (`(fun x => L x) T`, a definition unfolding to `L T`) is no type of
+the group, so it is rejected. The resulting facts are
 compared with the record's: isRec, isReflexive (when the file carries it: a
 Susz kind-8 block, from a Lean after lean4#16595, does not), numNested, the
 K flag, large elimination and the recursor's universe parameters. Finally, the type of
