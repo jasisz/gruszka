@@ -1326,8 +1326,15 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
             }
         }
     }
+    // Lean's reduce_nat compares the head with `mk_constant(Nat.add)`, a
+    // constant with no universe levels: a `Nat.add.{u}` is a definition
+    // like any other and unfolds (an occurrence carries as many levels as
+    // its declaration has parameters, `infer_const`)
     let mut nat_op = vec![0u8; ld.consts.len()];
     for (i, c) in ld.consts.iter().enumerate() {
+        if !c.lparams.is_empty() {
+            continue;
+        }
         let cn = st.name_canon[c.name as usize];
         if let Some(j) = known.nat_ops.iter().position(|&x| x == cn && x != NONE) {
             nat_op[i] = 1 + j as u8;
