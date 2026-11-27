@@ -425,12 +425,64 @@ fn nat_sized(n: BigUint) -> Result<BigUint, &'static str> {
 /// digits and went through bytes to build its result. The scalar product
 /// on a copy (`clone() * d`) was tried: its carry digit grew the copy's
 /// buffer to twice its size (run349 footprint +5%).
+///
+/// A long factor (64 digits or more) is multiplied by its nonzero digits
+/// (`nat_mul_sparse`), each times all of the short one, when that is less
+/// work than the library's product: the library's long multiplication of a
+/// short factor of 3 to 32 digits goes over all of the long factor's digits
+/// once per short digit, zeros included, so the rows are never slower and
+/// skip the zeros (CFSG's bit-sliced tables: 609 kbit numbers with ~200
+/// nonzero digits times 16-digit ones, 10x); past 32 digits it is
+/// Karatsuba's, which the rows beat only on a long factor at most a
+/// quarter of whose digits are nonzero. Two digits: the library's own path
+/// is faster (M2, 9500-digit long factor: rows 0.5x at full density).
 fn nat_mul(x: &BigUint, y: &BigUint) -> BigUint {
-    let r = x * y;
+    let r = nat_mul_any(x, y);
     if KNOBS && nat_check() {
-        assert!(r == nat_mul_m37(x, y), "SK_NAT_CHECK: nat_mul");
+        assert!(r == x * y, "SK_NAT_CHECK: nat_mul");
     }
     r
+}
+fn nat_mul_any(x: &BigUint, y: &BigUint) -> BigUint {
+    let (l, s) = if x.bits() >= y.bits() { (x, y) } else { (y, x) };
+    let (ln, sn) = (l.iter_u64_digits().len(), s.iter_u64_digits().len());
+    if sn < 3 || ln < 64 {
+        return x * y;
+    }
+    if sn > 32 && l.iter_u64_digits().filter(|&d| d != 0).count() * 4 > ln {
+        return x * y;
+    }
+    nat_mul_sparse(l, s, ln, sn)
+}
+/// `l * s` by the nonzero digits of `l`, each times all of `s`.
+fn nat_mul_sparse(l: &BigUint, s: &BigUint, ln: usize, sn: usize) -> BigUint {
+    let sd: smallvec::SmallVec<[u64; 16]> = s.iter_u64_digits().collect();
+    debug_assert_eq!(sd.len(), sn);
+    let mut out = vec![0u64; ln + sn + 1];
+    for (j, b) in l.iter_u64_digits().enumerate() {
+        if b == 0 {
+            continue;
+        }
+        let mut carry = 0u128;
+        for (i, &a) in sd.iter().enumerate() {
+            let t = a as u128 * b as u128 + out[i + j] as u128 + carry;
+            out[i + j] = t as u64;
+            carry = t >> 64;
+        }
+        let mut k = j + sn;
+        while carry != 0 {
+            let t = out[k] as u128 + carry;
+            out[k] = t as u64;
+            carry = t >> 64;
+            k += 1;
+        }
+    }
+    let mut d = Vec::with_capacity(out.len() * 2);
+    for w in out {
+        d.push(w as u32);
+        d.push((w >> 32) as u32);
+    }
+    BigUint::new(d)
 }
 /// knobs: SK_NAT_IDENT=1 turns `ground::nat_ident` on (off by default:
 /// its checks cost more than the copies they save, run349 +0.8%, c0f
@@ -9934,6 +9986,21 @@ mod nat_tests {
             assert_eq!(nat_mul(&x, &y), &x * &y);
             assert_eq!(nat_mul(&y, &x), &x * &y);
             assert_eq!(nat_mul_m37(&x, &y), &x * &y);
+        }
+        // long factors with few nonzero digits (the digit-by-digit path) and
+        // dense ones (the library's), short factors of 2 to 40 digits
+        for _ in 0..400 {
+            let nl = 64 + (rnd() % 512) as usize;
+            let ns = 2 + (rnd() % 39) as usize;
+            let dens = 1 + rnd() % 6;
+            let mut a: Vec<u32> = (0..2 * nl).map(|_| if rnd() % (2 * dens * dens) == 0 { rnd() as u32 } else { 0 }).collect();
+            a.push(1);
+            let b: Vec<u32> = (0..2 * ns).map(|_| if rnd() % 5 == 0 { u32::MAX } else { rnd() as u32 }).collect();
+            let (x, y) = (BigUint::new(a), BigUint::new(b));
+            assert_eq!(nat_mul(&x, &y), &x * &y);
+            assert_eq!(nat_mul(&y, &x), &x * &y);
+            let m = BigUint::new(vec![u32::MAX; 2 * ns]);
+            assert_eq!(nat_mul(&x, &m), &x * &m);
         }
     }
 }
