@@ -3856,12 +3856,15 @@ impl Worker {
 
     pub fn proj_val(&mut self, s: V, idx: u32, sname: u32) -> R<V> {
         let s = self.force(s)?;
-        let e = match self.proj_map.get(&(sname, idx)) {
+        // Equal name records denote one structure.  Keep a raw representative
+        // in `projs`, but do not create distinct projection eliminators for it.
+        let key = (self.env.canon(sname), idx);
+        let e = match self.proj_map.get(&key) {
             Some(&e) => e,
             None => {
                 self.projs.push((sname, idx));
                 let e = PROJ_BIT | (self.projs.len() as u32 - 1);
-                self.proj_map.insert((sname, idx), e);
+                self.proj_map.insert(key, e);
                 e
             }
         };
