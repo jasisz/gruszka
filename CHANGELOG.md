@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.4
+
+Soundness fixes, found by an audit of the premises of every shortcut
+against the official Lean kernel (4.35 and pre-release 55bd690). Two
+hand-made exports could get a closed proof of `False`, without axioms,
+accepted by 0.2.3; Lean's own kernel rejects both, so no export of a
+real Lean build can contain them, and no result checked from one is
+affected. Verdicts on both Arenas' tests are unchanged; on mathlib at
+4 workers instructions (+0.05%), time and memory are unchanged.
+
+- Nat operations with universe levels unfold. The kernel computes on
+  literals only `Nat.add`, `Nat.sub`, ... as constants with no levels
+  (`mk_constant(Nat.add)`); Gruszka recognised them by name, so with a
+  `Nat.add.{u}` defined otherwise `Nat.add.{0} 0 0` was computed natively
+  and `False` was proved. This covered whnf, lazy delta, the bits fusion
+  of `shiftRight` and the ground machine; a row gets a native operation
+  now only when its declaration has no universe parameters.
+- `Nat.zero` and `Nat.succ` with universe levels are constructors, not
+  literals: with `inductive Nat.{v}`, `Nat.zero.{0}` was read as the
+  literal 0, which proved `False` together with an unlevelled `Nat.add`.
+- A nested occurrence counts only where it is in the syntax, as Lean's
+  `elim_nested_inductive` replaces it before checking positivity: a
+  field whose whnf only reveals the nested type (`(fun x => L x) T`,
+  through a definition or a `let`) is rejected. It was accepted.
+- Levels are compared term by term (a max of guarded terms): the cases
+  of independent `imax`es add up instead of multiplying. Twenty
+  independent triples (the beta's `109_levelImaxNested` twenty times
+  under one `max`) ran past 20 s; they take milliseconds.
+- A cut made in a round of the R strategy belongs to the step that made
+  it: a lazy delta loop nested in the unfolding (through a K recursor's
+  check) took it, and a valid file was rejected.
+
 ## 0.2.3
 
 Soundness fixes, found by our own conformance testing against the official
