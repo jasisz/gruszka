@@ -74,8 +74,8 @@ impl Worker {
     fn matches(&mut self, t: u32, p: &P, params: &[u32]) -> bool {
         let k = self.tk(t);
         match p {
-            P::B(i) => k == BVAR && self.tp(t) == *i,
-            P::Sort(l) => k == SORT && self.lp_level(*l, params) == Some(self.tp(t)),
+            P::B(i) => k == BVAR && self.ta(t) == *i,
+            P::Sort(l) => k == SORT && self.lp_level(*l, params) == Some(self.ta(t)),
             P::Const(path, ls) => {
                 if k != CONST || self.env.canon(self.ta(t)) != self.find_name(path) {
                     return false;

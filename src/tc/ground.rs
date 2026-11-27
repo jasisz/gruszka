@@ -859,7 +859,7 @@ impl Worker {
         }
         let n = self.node(t);
         match n.kind {
-            BVAR => format!("#{}", n.p),
+            BVAR => format!("#{}", n.a),
             CONST => self.env.name_str(n.a).to_string(),
             APP => {
                 let mut f = t;
@@ -876,7 +876,7 @@ impl Worker {
                 s.push(')');
                 s
             }
-            NAT => format!("{}", match self.lit(n.p) { LitVal::Nat(x) => x.to_string(), _ => "?".into() }),
+            NAT => format!("{}", match self.lit(n.a) { LitVal::Nat(x) => x.to_string(), _ => "?".into() }),
             k if is_lam(k) => format!("(λ {})", self.g_term_str(n.b, d - 1)),
             k if is_pi(k) => format!("(Π {})", self.g_term_str(n.b, d - 1)),
             LET => format!("(let {})", self.g_term_str(self.let_body(t), d - 1)),
@@ -1226,8 +1226,8 @@ impl Worker {
     fn g_arg(&mut self, m: &mut Gm, t: u32, env: &Env, ls: u32) -> R<O> {
         let n = self.node(t);
         Ok(match n.kind {
-            BVAR => return self.g_var(m, env, n.p),
-            NAT | STR => self.g_lit(m, n.p),
+            BVAR => return self.g_var(m, env, n.a),
+            NAT | STR => self.g_lit(m, n.a),
             k if is_lam(k) => mk(Obj::Clo { term: t, env: self.g_trim(m, t, env), ls }),
             _ => mk(Obj::Th(RefCell::new(Th::Delay(t, self.g_trim(m, t, env), ls)))),
         })
@@ -1433,7 +1433,7 @@ impl Worker {
         }
         let n = self.node(t);
         Ok(match n.kind {
-            BVAR => C::Ob(self.g_var(m, &env, n.p)?),
+            BVAR => C::Ob(self.g_var(m, &env, n.a)?),
             APP => {
                 let mut f = t;
                 loop {
@@ -1474,9 +1474,9 @@ impl Worker {
                 let llr = self.const_ll(t, ls);
                 C::Hd(row, llr)
             }
-            NAT | STR => C::Ob(self.g_lit(m, n.p)),
+            NAT | STR => C::Ob(self.g_lit(m, n.a)),
             PROJ => {
-                m.el.push(El::Proj(n.b, n.p));
+                m.el.push(El::Proj(n.b, self.proj_name(t)));
                 C::Ev(n.a, env, ls)
             }
             _ => {

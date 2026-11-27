@@ -250,7 +250,7 @@ impl Worker {
     fn occ_term_go(&mut self, t: u32, env: u32, depth: u32, set: &[u32], k: u8) -> R<bool> {
         Ok(match k {
             BVAR => {
-                let i = self.tp(t);
+                let i = self.ta(t);
                 if i >= depth {
                     let v = self.env_get(env, i - depth)?;
                     self.occ_val(v, set)?
@@ -329,7 +329,7 @@ impl Worker {
     fn syn_pi_val(&self, mut v: V) -> bool {
         loop {
             match self.val(v) {
-                Val::Thunk { term, env, .. } if self.tk(term) == BVAR => match self.env_get(env, self.tp(term)) {
+                Val::Thunk { term, env, .. } if self.tk(term) == BVAR => match self.env_get(env, self.ta(term)) {
                     Ok(w) => v = w,
                     Err(_) => return false,
                 },
@@ -346,7 +346,7 @@ impl Worker {
             match self.val(v) {
                 Val::Neu { head: Head::FVar(i), spine: EMPTY } => return Some(i),
                 Val::Thunk { term, env, .. } if self.tk(term) == BVAR => {
-                    v = self.env_get(env, self.tp(term)).ok()?;
+                    v = self.env_get(env, self.ta(term)).ok()?;
                 }
                 _ => return None,
             }
@@ -415,7 +415,7 @@ impl Worker {
         }
         for i in 0..ind.np as usize {
             let a = args[i];
-            if self.tk(a) != BVAR || self.tp(a) != depth - 1 - i as u32 {
+            if self.tk(a) != BVAR || self.ta(a) != depth - 1 - i as u32 {
                 return Ok(false);
             }
         }
@@ -697,7 +697,7 @@ impl Worker {
                     Ok(false)
                 }
                 BVAR => {
-                    let i = self.tp(t);
+                    let i = self.ta(t);
                     if i < depth {
                         return Ok(false);
                     }
@@ -849,7 +849,7 @@ impl Worker {
                         }
                         c = Cl::T(f, e, ls);
                     }
-                    BVAR => match self.pe_get(e, self.tp(t))? {
+                    BVAR => match self.pe_get(e, self.ta(t))? {
                         Ok(Ent::Beta(c2)) => c = c2,
                         Ok(Ent::Val(v)) => return self.rh_apply(ind, v, pend),
                         Err(v) => c = Cl::S(v),
@@ -886,7 +886,7 @@ impl Worker {
                             Rh::Val(s) => s,
                             Rh::Pi(..) => unreachable!(),
                         };
-                        let p = self.proj_val(s, self.tb(t), self.tp(t))?;
+                        let p = self.proj_val(s, self.tb(t), self.proj_name(t))?;
                         return self.rh_apply(ind, p, pend);
                     }
                     _ => {
@@ -1102,7 +1102,7 @@ impl Worker {
             // scans the constructor types with the parameters put in): the
             // argument is scanned where the variable stands
             BVAR => {
-                let i = self.tp(t);
+                let i = self.ta(t);
                 if i >= depth {
                     let v = self.env_get(env, i - depth)?;
                     if let Val::Thunk { term, env: e2, ls: l2 } = self.val(v) {
@@ -1457,7 +1457,7 @@ impl Worker {
                         // replaced by the nested arguments: a domain that is
                         // a parameter is a Pi when its argument is one
                         let pi_dom = if aux && self.tk(dom) == BVAR {
-                            let v = self.env_get(e, self.tp(dom))?;
+                            let v = self.env_get(e, self.ta(dom))?;
                             self.syn_pi_val(v)
                         } else {
                             is_pi(self.tk(dom))
@@ -1652,7 +1652,7 @@ impl Worker {
             f = self.ta(f);
         }
         for j in to_check {
-            let found = args.iter().any(|&a| self.tk(a) == BVAR && self.tp(a) == depth - 1 - j);
+            let found = args.iter().any(|&a| self.tk(a) == BVAR && self.ta(a) == depth - 1 - j);
             if !found {
                 return Ok(true);
             }
@@ -2143,7 +2143,7 @@ impl Worker {
     fn sx_norm(&mut self, mut x: Sx) -> R<Sx> {
         loop {
             match x {
-                Sx::T(t, e, _) if self.tk(t) == BVAR => x = Sx::V(self.env_get(e, self.tp(t))?),
+                Sx::T(t, e, _) if self.tk(t) == BVAR => x = Sx::V(self.env_get(e, self.ta(t))?),
                 Sx::V(v) => match self.val(v) {
                     Val::Thunk { term, env, ls } => x = Sx::T(term, env, ls),
                     _ => return Ok(x),
@@ -2208,9 +2208,9 @@ impl Worker {
                         let llr = self.lsub_ll(t, ls);
                         Atom::Const(self.env.canon(n.a), smallvec::SmallVec::from_slice(self.ll_get(llr)))
                     }
-                    SORT => Atom::Sort(self.lsub(n.p, ls)),
-                    NAT | STR => Atom::Lit(n.p),
-                    PROJ => Atom::Proj(self.env.canon(n.p), n.b, Sx::T(n.a, e, ls)),
+                    SORT => Atom::Sort(self.lsub(n.a, ls)),
+                    NAT | STR => Atom::Lit(n.a),
+                    PROJ => Atom::Proj(self.env.canon(self.proj_name(t)), n.b, Sx::T(n.a, e, ls)),
                     LET => Atom::Let(t, e, ls),
                     k if is_lam(k) || is_pi(k) => Atom::Bind(t, e, ls),
                     _ => Atom::None,

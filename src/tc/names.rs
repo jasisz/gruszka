@@ -320,7 +320,7 @@ impl Worker {
         self.nm.fuel -= 1;
         let n = match self.tk(t) {
             BVAR => {
-                let i = self.tp(t);
+                let i = self.ta(t);
                 if i < depth {
                     self.nm_node(T_BV, i, 0)
                 } else {
@@ -336,10 +336,10 @@ impl Worker {
                 self.nm_node(T_CONST, c, l)
             }
             SORT => {
-                let l = self.lsub(self.tp(t), ls);
+                let l = self.lsub(self.ta(t), ls);
                 self.nm_node(T_SORT, l, 0)
             }
-            NAT | STR => self.nm_lit(self.tp(t)),
+            NAT | STR => self.nm_lit(self.ta(t)),
             APP => {
                 let f = self.nt(self.ta(t), env, ls, depth);
                 let a = if f == NONE { NONE } else { self.nt(self.tb(t), env, ls, depth) };
@@ -350,7 +350,7 @@ impl Worker {
                 if s == NONE {
                     NONE
                 } else {
-                    let pj = self.nm_node(T_PJ, self.tp(t), self.tb(t));
+                    let pj = self.nm_node(T_PJ, self.proj_name(t), self.tb(t));
                     self.nm_node(T_PROJ, pj, s)
                 }
             }

@@ -36,16 +36,26 @@ pub fn is_pi(k: u8) -> bool {
 
 /// Expression columns.
 ///
-/// | kind  | a          | b            | p                       |
+/// | kind  | a          | b            | u                       |
 /// |-------|------------|--------------|-------------------------|
-/// | BVAR  | -          | -            | de Bruijn index         |
-/// | SORT  | -          | -            | global level id         |
-/// | CONST | name id    | -            | level-list offset       |
-/// | APP   | fn         | arg          | -                       |
-/// | LAM/PI| type       | body         | binder name id          |
-/// | LET   | type       | value        | index into `lets`       |
-/// | NAT/STR| -         | -            | index into `Env::lits`  |
-/// | PROJ  | struct expr| field index  | structure name id       |
+/// | BVAR  | de Bruijn index | -       | used mask               |
+/// | SORT  | global level id | -       | 0                       |
+/// | CONST | name id    | level-list offset | 0                  |
+/// | APP   | fn         | arg          | used mask               |
+/// | LAM/PI| type       | body         | used mask               |
+/// | LET   | type       | value        | U_SIDE + index into `lets` |
+/// | NAT/STR| index into `Env::lits` | - | 0                    |
+/// | PROJ  | struct expr| field index  | U_SIDE + index into `projs` |
+///
+/// Night 11-27: the used mask (see `Used`) lives in the node, not in a
+/// column of its own (8 bytes per node: Mathlib's MAIN 289 MiB). `u` is
+/// the mask when it has no bit past 30, and then reading it is one load,
+/// whatever the kind. Else `u` has bit 31 (`U_SIDE`): an APP, LAM or PI
+/// has the index of its whole mask in `Cols::wide`, a BVAR's mask is its
+/// index's, a LET's is in `Side::let_used`, a PROJ's its struct's. The
+/// third payload that kinds had (`p`) went into `a` or `b`, which they did
+/// not use, or for LET and PROJ into the side. Binder names are not kept:
+/// nothing read them.
 /// One term node (16 bytes: what a walk reads at a node is in one cache
 /// line; milestone 11, the columns were separate arrays before).
 #[derive(Default, Clone, Copy)]
@@ -53,7 +63,7 @@ pub fn is_pi(k: u8) -> bool {
 pub struct Node {
     pub a: u32,
     pub b: u32,
-    pub p: u32,
+    pub u: u32,
     /// Loose bvar range (1 + largest loose index), exact below 65535; a
     /// larger range sets `too_deep` and the file or block is declined.
     pub rng: u16,
@@ -80,10 +90,6 @@ pub struct Node {
 /// arena's pushed nodes (`Worker::term_live`, asserted in release-da).
 pub struct Region {
     nodes: *mut Node,
-    used: *mut u64,
-    /// the used mask's high word (`used_hi`), written only for nodes whose
-    /// range is past 63
-    hi: *mut u64,
     first: std::sync::atomic::AtomicU32,
     slab: std::sync::atomic::AtomicU32,
     next: std::sync::atomic::AtomicU32,
@@ -140,16 +146,6 @@ mod vm {
             madvise(_p, _bytes, MADV_HUGEPAGE);
         }
     }
-    /// Linux: [p, p + bytes) keeps 4 KiB pages even when the system gives
-    /// huge pages without being asked (THP `always`). Elsewhere: no-op.
-    #[inline]
-    pub fn small(_p: *mut u8, _bytes: usize) {
-        #[cfg(target_os = "linux")]
-        unsafe {
-            const MADV_NOHUGEPAGE: i32 = 15;
-            madvise(_p, _bytes, MADV_NOHUGEPAGE);
-        }
-    }
     /// Gives the pages of [p, p + bytes) back (fresh zero pages on next use).
     pub fn release(p: *mut u8, bytes: usize) {
         if bytes == 0 {
@@ -167,17 +163,8 @@ static REGION: std::sync::OnceLock<Region> = std::sync::OnceLock::new();
 pub fn region() -> &'static Region {
     REGION.get_or_init(|| {
         let nodes = vm::reserve(ID_SPACE * 16) as *mut Node;
-        let used = vm::reserve(ID_SPACE * 8) as *mut u64;
-        let hi = vm::reserve(ID_SPACE * 8) as *mut u64;
-        // the high mask words are written only for terms of range past 63,
-        // a few scattered ids: with huge pages each one written made 2 MiB
-        // resident (Mathlib w4, Linux x86: peak RSS 2431 -> 2170 MiB, the
-        // column 251 -> 8 MiB); their reads are rare, so no TLB cost
-        if !hi.is_null() {
-            vm::small(hi as *mut u8, ID_SPACE * 8);
-        }
-        assert!(!nodes.is_null() && !used.is_null() && !hi.is_null(), "cannot reserve the term address range");
-        Region { nodes, used, hi, first: 0.into(), slab: 0.into(), next: 0.into(), big: std::sync::Mutex::new(None) }
+        assert!(!nodes.is_null(), "cannot reserve the term address range");
+        Region { nodes, first: 0.into(), slab: 0.into(), next: 0.into(), big: std::sync::Mutex::new(None) }
     })
 }
 
@@ -185,15 +172,6 @@ impl Region {
     #[inline(always)]
     pub fn nodes(&self) -> *const Node {
         self.nodes
-    }
-    #[inline(always)]
-    pub fn used(&self) -> *const u64 {
-        self.used
-    }
-    /// The used masks' high words (see `Used`; written past range 63 only).
-    #[inline(always)]
-    pub fn used_hi(&self) -> *const u64 {
-        self.hi
     }
     /// MAIN's arena (ids from 0), room for `cap` nodes.
     pub fn main_cols(&self, cap: usize) -> Cols {
@@ -391,8 +369,9 @@ pub struct Cols {
     /// id of node 0
     pub base: u32,
     n_ptr: *mut Node,
-    u_ptr: *mut u64,
-    h_ptr: *mut u64,
+    /// the used masks of APP, LAM and PI nodes with bits past 30 (the
+    /// node's `u` is `U_SIDE` and the index here)
+    pub wide: Vec<Used>,
     len: usize,
     cap: usize,
     /// largest length since pages were last given back
@@ -406,25 +385,24 @@ unsafe impl Sync for Cols {}
 
 impl Default for Cols {
     fn default() -> Cols {
-        let (n_ptr, u_ptr, h_ptr) = (std::ptr::NonNull::dangling().as_ptr(), std::ptr::NonNull::dangling().as_ptr(), std::ptr::NonNull::dangling().as_ptr());
-        Cols { base: 0, n_ptr, u_ptr, h_ptr, len: 0, cap: 0, hw: 0, too_deep: false, full: false }
+        let n_ptr = std::ptr::NonNull::dangling().as_ptr();
+        Cols { base: 0, n_ptr, wide: Vec::new(), len: 0, cap: 0, hw: 0, too_deep: false, full: false }
     }
 }
 
 impl Cols {
     fn at(r: &Region, base: u32, cap: usize) -> Cols {
         let n_ptr = unsafe { r.nodes.add(base as usize) };
-        let u_ptr = unsafe { r.used.add(base as usize) };
-        let h_ptr = unsafe { r.hi.add(base as usize) };
-        Cols { base, n_ptr, u_ptr, h_ptr, len: 0, cap, hw: 0, too_deep: false, full: false }
+        Cols { base, n_ptr, wide: Vec::new(), len: 0, cap, hw: 0, too_deep: false, full: false }
     }
     #[inline(always)]
     pub fn push(&mut self, k: u8, a: u32, b: u32, p: u32, r: u32, u: u64) {
         self.push_h(k, a, b, p, r, (u, 0))
     }
-    /// `push` with the used mask's high word (kept only past range 63).
+    /// `push` with the whole used mask (kept in the node, see `Node`); `x`
+    /// is a LET's or PROJ's side index.
     #[inline(always)]
-    pub fn push_h(&mut self, k: u8, a: u32, b: u32, p: u32, r: u32, (u, h): (u64, u64)) {
+    pub fn push_h(&mut self, k: u8, a: u32, b: u32, x: u32, r: u32, (u, h): (u64, u64)) {
         if r >= u16::MAX as u32 {
             self.too_deep = true;
         }
@@ -432,12 +410,20 @@ impl Cols {
             self.full = true;
             return;
         }
-        unsafe {
-            self.u_ptr.add(self.len).write(u);
-            if r > 63 {
-                self.h_ptr.add(self.len).write(h);
+        // by the mask, not the range: a mask may claim more than the range
+        // reads (a binder shifts "63 or more" down)
+        let narrow = u >> 31 == 0 && h == 0;
+        let w = match k {
+            LET | PROJ => U_SIDE | x,
+            _ if narrow => u as u32,
+            BVAR => U_SIDE,
+            _ => {
+                self.wide.push((u, h));
+                U_SIDE | (self.wide.len() as u32 - 1)
             }
-            self.n_ptr.add(self.len).write(Node { a, b, p, rng: r.min(u16::MAX as u32) as u16, kind: k, _pad: 0 });
+        };
+        unsafe {
+            self.n_ptr.add(self.len).write(Node { a, b, u: w, rng: r.min(u16::MAX as u32) as u16, kind: k, _pad: 0 });
         }
         self.len += 1;
     }
@@ -453,11 +439,8 @@ impl Cols {
     pub fn n_mut(&mut self) -> &mut [Node] {
         unsafe { std::slice::from_raw_parts_mut(self.n_ptr, self.len) }
     }
-    #[inline(always)]
-    pub fn used(&self) -> &[u64] {
-        unsafe { std::slice::from_raw_parts(self.u_ptr, self.len) }
-    }
     pub fn clear(&mut self) {
+        self.wide.clear();
         self.hw = self.hw.max(self.len);
         self.len = 0;
         self.too_deep = false;
@@ -467,21 +450,21 @@ impl Cols {
     /// past that go back to the system.
     pub fn shrink(&mut self, max: usize) {
         if self.bytes() > max {
-            // whole pages of both columns (4096 nodes: 64 KiB / 32 KiB)
-            let keep = (max / 2 / 23 + 4095) & !4095;
+            // whole pages (4096 nodes: 64 KiB)
+            let keep = (max / 16 + 4095) & !4095;
             if keep < self.hw {
                 #[cfg(unix)]
                 unsafe {
                     vm::release(self.n_ptr.add(keep) as *mut u8, (self.hw - keep) * 16);
-                    vm::release(self.u_ptr.add(keep) as *mut u8, (self.hw - keep) * 8);
                 }
                 self.hw = keep;
+                self.wide = Vec::new();
             }
         }
     }
-    /// Bytes of pages possibly held (high water of both columns).
+    /// Bytes of pages possibly held (high water), and the wide masks.
     pub fn bytes(&self) -> usize {
-        24 * self.hw.max(self.len)
+        16 * self.hw.max(self.len) + self.wide.capacity() * 16
     }
 }
 
@@ -490,16 +473,22 @@ impl Cols {
 pub struct Side {
     /// LET: (binder name id, body expr id).
     pub lets: Vec<(u32, u32)>,
+    /// LET: the used mask, by the same index
+    pub let_used: Vec<Used>,
+    /// PROJ: the structure name id (the node's `u` is `U_SIDE` and the index)
+    pub projs: Vec<u32>,
     /// Level lists, length-prefixed, global level ids; offset 0 is the empty list.
     pub lvls: Vec<u32>,
 }
 
 impl Side {
     pub fn new() -> Side {
-        Side { lets: Vec::new(), lvls: vec![0] }
+        Side { lets: Vec::new(), let_used: Vec::new(), projs: Vec::new(), lvls: vec![0] }
     }
     pub fn clear(&mut self) {
         self.lets.clear();
+        self.let_used.clear();
+        self.projs.clear();
         self.lvls.truncate(1);
     }
 }
@@ -536,8 +525,32 @@ pub fn used_bind((lo, hi): Used) -> Used {
 fn used_or(a: Used, b: Used) -> Used {
     (a.0 | b.0, a.1 | b.1)
 }
+/// Bit 31 of a node's `u`: the mask (or a LET's, PROJ's payload) is not
+/// in the node (see `Node`).
+pub const U_SIDE: u32 = 1 << 31;
+/// The used mask of term `id`: in `cols` (ids from `cols.base`, with
+/// `side`), below that in `main` (MAIN's columns and side, or `cols` itself
+/// when it is MAIN).
+pub fn used_of(mut id: u32, cols: &Cols, side: &Side, main: Option<(&Cols, &Side)>) -> Used {
+    loop {
+        let (c, sd) = if id >= cols.base { (cols, side) } else { main.unwrap_or((cols, side)) };
+        let n = c.n()[(id - c.base) as usize];
+        if n.u & U_SIDE == 0 {
+            return (n.u as u64, 0);
+        }
+        return match n.kind {
+            BVAR => used_var(n.a),
+            LET => sd.let_used[(n.u & !U_SIDE) as usize],
+            PROJ => {
+                id = n.a;
+                continue;
+            }
+            _ => c.wide[(n.u & !U_SIDE) as usize],
+        };
+    }
+}
 #[inline(always)]
-fn used_var(i: u32) -> Used {
+pub fn used_var(i: u32) -> Used {
     if i < 63 {
         (1u64 << i, 0)
     } else if i < 126 {
@@ -563,10 +576,10 @@ pub fn push_expr(
     cols_base: u32,
     base: u32,
     lvl_map: &[u32],
-    main_rng: Option<&[Node]>,
-    main_used: Option<&[u64]>,
+    main: Option<(&Cols, &Side)>,
     e: &Expr<'_>,
 ) {
+    debug_assert_eq!(cols.base, cols_base, "push_expr: columns at another base");
     let r = |x: Ref| match x {
         Ref::Main(i) => i,
         Ref::Block(k) => base + k,
@@ -575,33 +588,30 @@ pub fn push_expr(
         if id >= cols_base {
             cols.n()[(id - cols_base) as usize].rng as u32
         } else {
-            match main_rng {
-                Some(m) => m[id as usize].rng as u32,
+            match main {
+                Some((m, _)) => m.n()[id as usize].rng as u32,
                 None => cols.n()[id as usize].rng as u32,
             }
         }
     };
-    let us = |cols: &Cols, id: u32| -> Used {
-        let lo = if id >= cols_base {
-            cols.used()[(id - cols_base) as usize]
+    let us = |cols: &Cols, side: &Side, id: u32| -> Used {
+        let u = if id >= cols_base {
+            cols.n()[(id - cols_base) as usize].u
         } else {
-            match main_used {
-                Some(m) => m[id as usize],
-                None => cols.used()[id as usize],
+            match main {
+                Some((m, _)) => m.n()[id as usize].u,
+                None => cols.n()[id as usize].u,
             }
         };
-        // the high word is written only past range 63, which is when the
-        // low word's bit 63 is set (ids are global)
-        let hi = if lo >> 63 != 0 { unsafe { *region().hi.add(id as usize) } } else { 0 };
-        (lo, hi)
+        if u & U_SIDE == 0 { (u as u64, 0) } else { used_of(id, cols, side, main) }
     };
     let lmap = |l: u32| -> u32 { if lvl_map.is_empty() { l } else { lvl_map[l as usize] } };
     match *e {
         Expr::BVar(i) => {
             let i = u32::try_from(i).unwrap_or(u32::MAX - 1);
-            cols.push_h(BVAR, 0, 0, i, i.saturating_add(1), used_var(i))
+            cols.push_h(BVAR, i, 0, 0, i.saturating_add(1), used_var(i))
         }
-        Expr::Sort(l) => cols.push(SORT, 0, 0, lmap(l), 0, 0),
+        Expr::Sort(l) => cols.push(SORT, lmap(l), 0, 0, 0, 0),
         Expr::Const(n, ls) => {
             let off = if ls.is_empty() {
                 0
@@ -611,49 +621,54 @@ pub fn push_expr(
                 side.lvls.extend(ls.iter().map(lmap));
                 off
             };
-            cols.push(CONST, n, 0, off, 0, 0)
+            cols.push(CONST, n, off, 0, 0, 0)
         }
         Expr::App(f, x) => {
             let (f, x) = (r(f), r(x));
             let rr = rg(cols, f).max(rg(cols, x));
-            let uu = used_or(us(cols, f), us(cols, x));
+            let uu = used_or(us(cols, side, f), us(cols, side, x));
             cols.push_h(APP, f, x, 0, rr, uu)
         }
         Expr::Lam(bi, n, t, b) => {
             let (t, b) = (r(t), r(b));
             let rr = rg(cols, t).max(rng_bind(rg(cols, b)));
-            let uu = used_or(us(cols, t), used_bind(us(cols, b)));
-            cols.push_h(LAM + bi, t, b, n, rr, uu)
+            let uu = used_or(us(cols, side, t), used_bind(us(cols, side, b)));
+            let _ = n;
+            cols.push_h(LAM + bi, t, b, 0, rr, uu)
         }
         Expr::Pi(bi, n, t, b) => {
             let (t, b) = (r(t), r(b));
             let rr = rg(cols, t).max(rng_bind(rg(cols, b)));
-            let uu = used_or(us(cols, t), used_bind(us(cols, b)));
-            cols.push_h(PI + bi, t, b, n, rr, uu)
+            let uu = used_or(us(cols, side, t), used_bind(us(cols, side, b)));
+            let _ = n;
+            cols.push_h(PI + bi, t, b, 0, rr, uu)
         }
         Expr::Let(n, t, v, b) => {
             let (t, v, b) = (r(t), r(v), r(b));
             let rr = rg(cols, t).max(rg(cols, v)).max(rng_bind(rg(cols, b)));
-            let uu = used_or(used_or(us(cols, t), us(cols, v)), used_bind(us(cols, b)));
+            let uu = used_or(used_or(us(cols, side, t), us(cols, side, v)), used_bind(us(cols, side, b)));
             let i = side.lets.len() as u32;
             side.lets.push((n, b));
+            side.let_used.push(uu);
             cols.push_h(LET, t, v, i, rr, uu)
         }
         Expr::Nat(bytes) => {
             let i = lit_base + lits.len() as u32;
             lits.push(LitVal::Nat(<BigUint as NatExt>::from_bytes_le(bytes)));
-            cols.push(NAT, 0, 0, i, 0, 0)
+            cols.push(NAT, i, 0, 0, 0, 0)
         }
         Expr::Str(s) => {
             let i = lit_base + lits.len() as u32;
             lits.push(LitVal::Str(s.into()));
-            cols.push(STR, 0, 0, i, 0, 0)
+            cols.push(STR, i, 0, 0, 0, 0)
         }
         Expr::Proj(s, f, x) => {
             let x = r(x);
             let rr = rg(cols, x);
-            let uu = us(cols, x);
-            cols.push_h(PROJ, x, u32::try_from(f).unwrap_or(u32::MAX), s, rr, uu)
+            let uu = us(cols, side, x);
+            let j = side.projs.len() as u32;
+            side.projs.push(s);
+            cols.push_h(PROJ, x, u32::try_from(f).unwrap_or(u32::MAX), j, rr, uu)
         }
     }
 }
@@ -869,7 +884,7 @@ impl<'a> Visit<'a> for Loader {
     }
     #[inline(always)]
     fn expr(&mut self, _id: u32, x: &Expr<'a>) -> Result<(), ()> {
-        push_expr(&mut self.main, &mut self.side, &mut self.lits, 0, 0, 0, &[], None, None, x);
+        push_expr(&mut self.main, &mut self.side, &mut self.lits, 0, 0, 0, &[], None, x);
         Ok(())
     }
     fn open_block(&mut self, b: &BlockRef) -> bool {
@@ -1213,9 +1228,9 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
         par_chunks(main.n_mut(), |ns| {
             for n in ns.iter_mut() {
                 if n.kind == SORT {
-                    n.p = lm[n.p as usize];
-                } else if n.kind == CONST && n.p != 0 {
-                    n.p = rm[n.p as usize];
+                    n.a = lm[n.a as usize];
+                } else if n.kind == CONST && n.b != 0 {
+                    n.b = rm[n.b as usize];
                 }
             }
         });

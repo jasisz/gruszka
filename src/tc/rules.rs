@@ -287,7 +287,7 @@ impl Worker {
             match self.tk(f) {
                 APP => {
                     let a = self.tb(f);
-                    if self.tk(a) == BVAR && self.tp(a) < n {
+                    if self.tk(a) == BVAR && self.ta(a) < n {
                         var = true;
                     }
                     f = self.ta(f);

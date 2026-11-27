@@ -913,14 +913,10 @@ pub const ATT_NAMES: [&str; ATT_KINDS] = ["r0", "r", "k", "m", "kpair", "meet", 
 pub struct Worker {
     pub env: &'static Env<'static>,
     pub m: u32,
-    /// milestone 18: every term node at `nb + t`, its used mask at `ub + t`
-    /// (`env::Region`); MAIN is ids [0, mlen), the current arena's block
-    /// nodes ids [m, m + blk.len()) (m = blk.base, mlen <= m)
+    /// milestone 18: every term node at `nb + t` (`env::Region`); MAIN is
+    /// ids [0, mlen), the current arena's block nodes ids [m, m + blk.len())
+    /// (m = blk.base, mlen <= m)
     nb: *const crate::env::Node,
-    ub: *const u64,
-    /// milestone 51: the used masks' high words (#63 to #125), at `hb + t`
-    /// for terms of range past 63
-    hb: *const u64,
     mlen: u32,
     /// `env.consts`, `env.row_of_name` without going through `env`
     consts: &'static [ConstInfo],
@@ -1440,8 +1436,6 @@ impl Worker {
             env,
             m: blk.base,
             nb: crate::env::region().nodes(),
-            ub: crate::env::region().used(),
-            hb: crate::env::region().used_hi(),
             mlen: env.main.len() as u32,
             consts: &env.consts,
             rows: &env.row_of_name,
@@ -1702,6 +1696,9 @@ impl Worker {
         fn sb<K, S>(m: &std::collections::HashSet<K, S>) -> usize {
             m.len() * (std::mem::size_of::<K>() + 1) * 8 / 7
         }
+        // 23 bytes per block node, as when the used masks had a column of
+        // their own (16 now, plus `blk.wide` and the side's `let_used` and
+        // `projs`): the session budget stays where it was measured
         self.blk.len() * 23
             + self.wlit_bytes
             + self.rl.bytes()
@@ -1917,6 +1914,8 @@ impl Worker {
         self.blk.shrink(keep_bytes());
         self.blk_side.clear();
         clear_vec(&mut self.blk_side.lets);
+        clear_vec(&mut self.blk_side.let_used);
+        clear_vec(&mut self.blk_side.projs);
         clear_vec(&mut self.blk_side.lvls);
         self.blk_side.lvls.push(0);
         clear_vec(&mut self.wlits);
@@ -1964,7 +1963,7 @@ impl Worker {
                 self.sp.poison();
                 self.fv_ty.push(0);
                 self.fv_busy.push(true);
-                self.blk.push(SORT, 0, 0, ZERO, 0, 0);
+                self.blk.push(SORT, ZERO, 0, 0, 0, 0);
                 self.wlits.push(LitVal::Nat(BigUint::zero()));
                 self.blits.push(LitVal::Nat(BigUint::zero()));
             }
@@ -2402,9 +2401,16 @@ impl Worker {
     pub fn tb(&self, t: u32) -> u32 {
         self.node(t).b
     }
+    /// A LET's index into the side's `lets` and `let_used`.
     #[inline(always)]
-    pub fn tp(&self, t: u32) -> u32 {
-        self.node(t).p
+    pub fn let_index(&self, t: u32) -> u32 {
+        self.node(t).u & !crate::env::U_SIDE
+    }
+    /// A PROJ's structure name id.
+    #[inline(always)]
+    pub fn proj_name(&self, t: u32) -> u32 {
+        let i = (self.node(t).u & !crate::env::U_SIDE) as usize;
+        if t < self.mlen { self.env.side.projs[i] } else { self.blk_side.projs[i] }
     }
     #[inline(always)]
     pub fn trng(&self, t: u32) -> u32 {
@@ -2418,7 +2424,7 @@ impl Worker {
     }
     /// LET body.
     pub fn let_body(&self, t: u32) -> u32 {
-        let i = self.tp(t) as usize;
+        let i = self.let_index(t) as usize;
         if t < self.mlen { self.env.side.lets[i].1 } else { self.blk_side.lets[i].1 }
     }
 
@@ -2435,7 +2441,7 @@ impl Worker {
             let n = self.ll[o] as usize;
             &self.ll[o + 1..o + 1 + n]
         } else {
-            let o = self.tp(r) as usize;
+            let o = self.tb(r) as usize;
             let side = if r < self.mlen { &self.env.side.lvls } else { &self.blk_side.lvls };
             let n = side[o] as usize;
             if o == 0 { &[] } else { &side[o + 1..o + 1 + n] }
@@ -2832,11 +2838,42 @@ impl Worker {
     fn env_run(&self, env: u32) -> Option<(u32, u32)> {
         if env == EMPTY { None } else { Some(self.eloc_of(env)) }
     }
+    /// The used mask's low word (see `env::Used`): the node's `u`, else
+    /// (`U_SIDE`) `used_full`.
     #[inline(always)]
     fn used_mask(&self, t: u32) -> u64 {
+        let n = self.node(t);
+        if n.u & crate::env::U_SIDE == 0 {
+            return n.u as u64;
+        }
+        self.used_side(t, n)
+    }
+    /// `used_mask` of a node whose mask is not in it.
+    #[inline(always)]
+    fn used_side(&self, mut t: u32, mut n: crate::env::Node) -> u64 {
+        loop {
+            let i = (n.u & !crate::env::U_SIDE) as usize;
+            let main = t < self.mlen;
+            return match n.kind {
+                // a projection reads what its struct reads
+                PROJ => {
+                    t = n.a;
+                    n = self.node(t);
+                    if n.u & crate::env::U_SIDE == 0 {
+                        return n.u as u64;
+                    }
+                    continue;
+                }
+                BVAR => crate::env::used_var(n.a).0,
+                LET => if main { self.env.side.let_used[i].0 } else { self.blk_side.let_used[i].0 },
+                _ => if main { self.env.main.wide[i].0 } else { self.blk.wide[i].0 },
+            };
+        }
+    }
+    #[inline(never)]
+    fn used_full(&self, t: u32) -> crate::env::Used {
         debug_assert!(self.term_live(t), "term {t} read outside MAIN and the current arena");
-        // SAFETY: the region maps 8 bytes at every u32 id
-        unsafe { *self.ub.add(t as usize) }
+        crate::env::used_of(t, &self.blk, &self.blk_side, Some((&self.env.main, &self.env.side)))
     }
     /// Milestone 51: the used mask's high word of a term of range past 63:
     /// bit j for #(63 + j), j < 63 (exact), bit 63 for any index of 126 or
@@ -2844,8 +2881,7 @@ impl Worker {
     #[inline(always)]
     fn used_hi(&self, t: u32) -> u64 {
         debug_assert!(self.term_live(t) && self.trng(t) > 63, "high mask word of term {t}");
-        // SAFETY: as used_mask; written for every term of range past 63
-        unsafe { *self.hb.add(t as usize) }
+        self.used_full(t).1
     }
     /// Milestone 13: environment `env` cut to the entries term `t` reads,
     /// as a frame hash-consed by content (unread entries HOLE, ending at
@@ -3020,18 +3056,18 @@ impl Worker {
             let l = self.lsub_ll(t, ls);
             return self.canon_ll(l);
         }
-        if self.tp(t) == 0 {
+        if self.tb(t) == 0 {
             return LL_EMPTY;
         }
         if ls == 0 {
             // milestone 16: MAIN's lists are canonical by side offset
-            return self.tp(t) | LL_SIDE;
+            return self.tb(t) | LL_SIDE;
         }
         #[cfg(feature = "cnt")]
         THUNK_KINDS[1010].fetch_add(1, Ordering::Relaxed);
         // milestone 19: a direct-mapped table stamped with the level epoch
         // (the pool and substitution ids it names are reset together)
-        let off = self.tp(t);
+        let off = self.tb(t);
         let i = (hmix(off as u64, ls as u64) >> 20) as usize & CLL_MASK;
         let e = self.cll_dm[i];
         if e[0] == off && e[1] == ls && e[2] == self.lvl_epoch {
@@ -3051,7 +3087,7 @@ impl Worker {
             return t;
         }
         if t < self.mlen {
-            return if self.tp(t) == 0 { LL_EMPTY } else { self.tp(t) | LL_SIDE };
+            return if self.tb(t) == 0 { LL_EMPTY } else { self.tb(t) | LL_SIDE };
         }
         // a block term's list, by content
         let xs: smallvec::SmallVec<[u32; 8]> = smallvec::SmallVec::from_slice(self.ll_get(t));
@@ -3199,7 +3235,7 @@ impl Worker {
         *fuel -= 1;
         match self.tk(t) {
             BVAR => {
-                let i = self.tp(t);
+                let i = self.ta(t);
                 if i < depth {
                     hmix(29, i as u64)
                 } else {
@@ -3209,7 +3245,7 @@ impl Worker {
                     }
                 }
             }
-            SORT => hmix(17, self.lsub(self.tp(t), ls) as u64),
+            SORT => hmix(17, self.lsub(self.ta(t), ls) as u64),
             CONST => {
                 let c = self.env.canon(self.ta(t));
                 let l = self.const_ll(t, ls);
@@ -3220,7 +3256,7 @@ impl Worker {
                 let a = self.shash_term(self.tb(t), env, ls, depth, fuel);
                 hmix(hmix(f, 13), a)
             }
-            NAT | STR => match self.lit(self.tp(t)) {
+            NAT | STR => match self.lit(self.ta(t)) {
                 LitVal::Nat(n) => hmix(19, n.to_u64().unwrap_or(u64::MAX)),
                 LitVal::Str(st) => hmix(23, st.len() as u64),
             },
@@ -3371,7 +3407,7 @@ impl Worker {
     pub fn eval(&mut self, t: u32, env: u32, ls: u32) -> R<V> {
         let n = self.node(t);
         if n.kind == BVAR {
-            return self.env_get(env, n.p);
+            return self.env_get(env, n.a);
         }
         self.eval_loop(t, env, ls)
     }
@@ -3462,7 +3498,7 @@ impl Worker {
                         None => return Ok(fv),
                     }
                 }
-                BVAR => return self.env_get(env, self.tp(t)),
+                BVAR => return self.env_get(env, self.ta(t)),
                 _ => return self.eval_node(t, env, ls),
             }
         }
@@ -3472,9 +3508,9 @@ impl Worker {
         let nd = self.node(t);
         let k = nd.kind;
         match k {
-            BVAR => self.env_get(env, nd.p),
+            BVAR => self.env_get(env, nd.a),
             SORT => {
-                let l = self.lsub(nd.p, ls);
+                let l = self.lsub(nd.a, ls);
                 self.intern(Val::Sort(l))
             }
             CONST => {
@@ -3511,10 +3547,10 @@ impl Worker {
                 let e = self.push_arg(self.tb(t), env, ls, env, lb)?;
                 self.eval(lb, e, ls)
             }
-            NAT | STR => self.lit_value(self.tp(t)),
+            NAT | STR => self.lit_value(self.ta(t)),
             PROJ => {
                 let s = self.eval(self.ta(t), env, ls)?;
-                self.proj_val(s, self.tb(t), self.tp(t))
+                self.proj_val(s, self.tb(t), self.proj_name(t))
             }
             _ => {
                 // LAM / PI
@@ -3531,7 +3567,7 @@ impl Worker {
         let n = self.node(t);
         let k = n.kind;
         if k == BVAR {
-            return self.env_get(env, n.p);
+            return self.env_get(env, n.a);
         }
         if k == APP && self.p1_active {
             // the canonical-application memo probed inline (see canon_app)
@@ -3554,7 +3590,7 @@ impl Worker {
         let nd = self.node(t);
         match nd.kind {
             // leaves and binders: eval is eval_node (no loop, no recursion)
-            BVAR => self.env_get(env, nd.p),
+            BVAR => self.env_get(env, nd.a),
             SORT | CONST | NAT | STR => self.eval_node(t, env, ls),
             k if is_lam(k) || is_pi(k) => self.eval_node(t, env, ls),
             _ => {
@@ -3580,7 +3616,7 @@ impl Worker {
                     while self.tk(f) == APP { f = self.ta(f); }
                     let hk = self.tk(f) as usize;
                     let extra = if self.tk(f) == BVAR {
-                        match self.env_get(env, self.tp(f)).map(|x| self.val(x)) {
+                        match self.env_get(env, self.ta(f)).map(|x| self.val(x)) {
                             Ok(Val::Thunk { .. }) => 1, Ok(Val::Clo { .. } | Val::CloI { .. }) => 2, Ok(Val::Neu { .. }) => 3, _ => 4,
                         }
                     } else { 0 };
@@ -3666,7 +3702,7 @@ impl Worker {
                 }
                 (Head::Const(row, self.const_ll(f, ls)), EMPTY)
             }
-            BVAR => match self.env_get(env, self.tp(f)) {
+            BVAR => match self.env_get(env, self.ta(f)) {
                 Ok(x) => match self.val(x) {
                     Val::Neu { head, spine } => (head, spine),
                     _ => {
@@ -3692,7 +3728,7 @@ impl Worker {
             let a = self.argstack[base + j];
             let na = self.node(a);
             let av = match na.kind {
-                BVAR => self.env_get(env, na.p).ok(),
+                BVAR => self.env_get(env, na.a).ok(),
                 CONST => {
                     let r = self.row_of(na.a);
                     if r == NONE || !self.visible(r) {
@@ -3743,7 +3779,7 @@ impl Worker {
             let a = self.tb(f);
             match self.tk(a) {
                 BVAR => {
-                    if self.env_get(env, self.tp(a)).is_err() {
+                    if self.env_get(env, self.ta(a)).is_err() {
                         return Ok(None);
                     }
                 }
@@ -3771,7 +3807,7 @@ impl Worker {
                 (Head::Const(row, self.const_ll(f, ls)), EMPTY)
             }
             BVAR => {
-                let Ok(x) = self.env_get(env, self.tp(f)) else { return Ok(None) };
+                let Ok(x) = self.env_get(env, self.ta(f)) else { return Ok(None) };
                 match self.val(x) {
                     Val::Neu { head, spine } => (head, spine),
                     _ => return Ok(None),
@@ -4967,7 +5003,7 @@ impl Worker {
                 return None;
             }
         }
-        let bv = |w: &Self, t: u32, i: u32| w.tk(t) == BVAR && w.tp(t) == i;
+        let bv = |w: &Self, t: u32, i: u32| w.tk(t) == BVAR && w.ta(t) == i;
         // binder positions (outermost 0): params, motive, indices, major, minors
         let var = |pos: u32| l - 1 - pos;
         for i in 0..np {
@@ -5360,7 +5396,7 @@ impl Worker {
             if blk.full {
                 return Err(());
             }
-            push_expr(blk, side, lits, lit_base, cols_base, base, &env.lvl_map, Some(env.main.n()), Some(env.main.used()), e);
+            push_expr(blk, side, lits, lit_base, cols_base, base, &env.lvl_map, Some((&env.main, &env.side)), e);
             Ok(())
         });
         if self.blk.too_deep {
@@ -5988,7 +6024,7 @@ impl Worker {
     #[inline(always)]
     pub fn infer(&mut self, t: u32, env: u32, ls: u32, check: bool) -> R<V> {
         if self.tk(t) == BVAR {
-            if let Ok(v) = self.env_get(env, self.tp(t)) {
+            if let Ok(v) = self.env_get(env, self.ta(t)) {
                 let m = self.memo_at(v).infer;
                 if m != NONE {
                     #[cfg(feature = "cnt")]
@@ -6030,7 +6066,7 @@ impl Worker {
         if self.tk(t) == BVAR {
             // milestone 14: a variable's type is its value's (memoized in
             // the value's record), what infer_core returns: no table probes
-            let v = self.env_get(env, self.tp(t))?;
+            let v = self.env_get(env, self.ta(t))?;
             return self.infer_val(v);
         }
         let env = if self.trng(t) == 0 { EMPTY } else { env };
@@ -6173,7 +6209,7 @@ impl Worker {
                 return false;
             }
             let (g, m) = s.app_head(u);
-            m == n && s.tk(g) == CONST && (g == h || (s.ta(g) == s.ta(h) && s.tp(g) == s.tp(h)))
+            m == n && s.tk(g) == CONST && (g == h || (s.ta(g) == s.ta(h) && s.tb(g) == s.tb(h)))
         };
         let mut links: Vec<u32> = Vec::new();
         let mut u = self.tb(t);
@@ -6195,11 +6231,11 @@ impl Worker {
         let k = self.tk(t);
         match k {
             BVAR => {
-                let v = self.env_get(env, self.tp(t))?;
+                let v = self.env_get(env, self.ta(t))?;
                 self.infer_val(v)
             }
             SORT => {
-                let l = self.tp(t);
+                let l = self.ta(t);
                 if check {
                     self.check_levels(l)?;
                 }
@@ -6376,7 +6412,7 @@ impl Worker {
             }
             NAT | STR => {
                 // Lean's infer_lit: literals entering the kernel are bounded too
-                if let LitVal::Nat(n) = self.lit(self.tp(t)) {
+                if let LitVal::Nat(n) = self.lit(self.ta(t)) {
                     if nat_bytes(n) > NAT_MAX_BYTES {
                         return reject(NAT_SIZE_MSG);
                     }
@@ -6387,7 +6423,7 @@ impl Worker {
                 let s = self.ta(t);
                 let st = self.infer(s, env, ls, check)?;
                 let sv = self.thunk(s, env, ls)?;
-                self.proj_type(sv, st, self.tb(t), self.tp(t))
+                self.proj_type(sv, st, self.tb(t), self.proj_name(t))
             }
             _ => reject("unknown expression kind"),
         }
@@ -6553,7 +6589,7 @@ impl Worker {
         let k = self.tk(t);
         match k {
             BVAR => {
-                let i = self.tp(t) - depth;
+                let i = self.ta(t) - depth;
                 if !out.contains(&i) {
                     if out.len() >= WIDE_K {
                         return false;
@@ -6597,7 +6633,7 @@ impl Worker {
         }
         let k = self.tk(t);
         let x = match k {
-            BVAR => self.tp(t) == d,
+            BVAR => self.ta(t) == d,
             APP => self.uses_var(self.ta(t), d) || self.uses_var(self.tb(t), d),
             LET => {
                 let lb = self.let_body(t);
@@ -6650,7 +6686,7 @@ impl Worker {
             }
             match self.tk(t) {
                 BVAR => {
-                    if self.tp(t) == d {
+                    if self.ta(t) == d {
                         return true;
                     }
                 }
@@ -7356,7 +7392,7 @@ impl Worker {
         *fuel -= 1;
         let k = self.tk(t);
         if k == BVAR {
-            let Ok(y) = self.env_get(e, self.tp(t)) else { return false };
+            let Ok(y) = self.env_get(e, self.ta(t)) else { return false };
             return self.same_val(v, y, fuel);
         }
         if let Val::Neu { head: Head::Const(..), .. } = self.val(v) {
@@ -7391,10 +7427,10 @@ impl Worker {
             Val::Thunk { term, env, ls: l } => self.same_term(term, env, l, t, e, ls, 0, fuel),
             Val::Clo { term, env, ls: l } => self.same_term(term, env, l, t, e, ls, 0, fuel),
             Val::Sort(l) => k == SORT && {
-                let y = self.lsub(self.tp(t), ls);
+                let y = self.lsub(self.ta(t), ls);
                 l == y || self.lv.equiv_fast(l, y)
             },
-            Val::Lit(i) => (k == NAT || k == STR) && self.lit(i) == self.lit(self.tp(t)),
+            Val::Lit(i) => (k == NAT || k == STR) && self.lit(i) == self.lit(self.ta(t)),
             _ => false,
         }
     }
@@ -7534,11 +7570,11 @@ impl Worker {
             // a variable standing for a value, against a term
             if depth == 0 {
                 if k == BVAR {
-                    let Ok(x) = self.env_get(ea, na.p) else { return false };
+                    let Ok(x) = self.env_get(ea, na.a) else { return false };
                     return self.same_vt(x, tb, eb, lb, fuel);
                 }
                 if nb.kind == BVAR {
-                    let Ok(y) = self.env_get(eb, nb.p) else { return false };
+                    let Ok(y) = self.env_get(eb, nb.a) else { return false };
                     return self.same_vt(y, ta, ea, la, fuel);
                 }
                 return false;
@@ -7550,13 +7586,13 @@ impl Worker {
             // `λ k _, (λ i, body) (0 + k)` against `λ k _, p (lo + k)`, `p`
             // and `lo` standing for those values; before, the two loops
             // were compared step by step, 1 140 000 nested comparisons)
-            if k == BVAR && na.p >= depth && self.reads_none_below(tb, depth) {
-                let Ok(x) = self.env_get(ea, na.p - depth) else { return false };
+            if k == BVAR && na.a >= depth && self.reads_none_below(tb, depth) {
+                let Ok(x) = self.env_get(ea, na.a - depth) else { return false };
                 let e2 = self.pad_env(x, eb, depth);
                 return self.same_vt(x, tb, e2, lb, fuel);
             }
-            if nb.kind == BVAR && nb.p >= depth && self.reads_none_below(ta, depth) {
-                let Ok(y) = self.env_get(eb, nb.p - depth) else { return false };
+            if nb.kind == BVAR && nb.a >= depth && self.reads_none_below(ta, depth) {
+                let Ok(y) = self.env_get(eb, nb.a - depth) else { return false };
                 let e2 = self.pad_env(y, ea, depth);
                 return self.same_vt(y, ta, e2, la, fuel);
             }
@@ -7564,7 +7600,7 @@ impl Worker {
         }
         match k {
             BVAR => {
-                let (i, j) = (na.p, nb.p);
+                let (i, j) = (na.a, nb.a);
                 if i < depth || j < depth {
                     return i == j;
                 }
@@ -7572,7 +7608,7 @@ impl Worker {
                 self.same_val(x, y, fuel)
             }
             SORT => {
-                let (x, y) = (self.lsub(na.p, la), self.lsub(nb.p, lb));
+                let (x, y) = (self.lsub(na.a, la), self.lsub(nb.a, lb));
                 x == y || self.lv.equiv_fast(x, y)
             }
             CONST => {
@@ -7586,7 +7622,7 @@ impl Worker {
                 self.same_term(na.a, ea, la, nb.a, eb, lb, depth, fuel)
                     && self.same_term(na.b, ea, la, nb.b, eb, lb, depth, fuel)
             }
-            NAT | STR => self.lit(na.p) == self.lit(nb.p),
+            NAT | STR => self.lit(na.a) == self.lit(nb.a),
             PROJ => {
                 na.b == nb.b
                     && self.same_term(na.a, ea, la, nb.a, eb, lb, depth, fuel)
@@ -7804,7 +7840,7 @@ impl Worker {
             }
             u = self.tb(u);
         }
-        self.tk(u) == SORT && self.lv.is_not_zero(self.tp(u))
+        self.tk(u) == SORT && self.lv.is_not_zero(self.ta(u))
     }
     /// A head of type `ty` (a term under binders whose domains are `ctx`,
     /// outermost first) applied to `n` arguments is surely not a proof:
@@ -7844,7 +7880,7 @@ impl Worker {
                 }
                 u = w.tb(u);
             }
-            w.tk(u) == SORT && w.lv.is_not_zero(w.tp(u))
+            w.tk(u) == SORT && w.lv.is_not_zero(w.ta(u))
         };
         match self.tk(h) {
             CONST => {
@@ -7852,7 +7888,7 @@ impl Worker {
                 r != NONE && sort_end(self, self.consts[r as usize].ty)
             }
             BVAR => {
-                let j = self.tp(h) as usize;
+                let j = self.ta(h) as usize;
                 j < doms.len() && sort_end(self, doms[doms.len() - 1 - j])
             }
             _ => false,
@@ -7943,7 +7979,7 @@ impl Worker {
         if self.tk(h) != BVAR {
             return NONE;
         }
-        let j = self.tp(h) as usize;
+        let j = self.ta(h) as usize;
         if j >= doms.len() {
             return NONE;
         }
@@ -7954,7 +7990,7 @@ impl Worker {
             }
             u = self.tb(u);
         }
-        if self.tk(u) == SORT { self.tp(u) } else { NONE }
+        if self.tk(u) == SORT { self.ta(u) } else { NONE }
     }
 
     fn proof_irrel(&mut self, a: V, b: V) -> R<Option<bool>> {
@@ -9224,11 +9260,11 @@ impl Worker {
                 }
                 x = w.tb(x);
             }
-            if w.tk(x) == SORT { Some(w.tp(x)) } else { None }
+            if w.tk(x) == SORT { Some(w.ta(x)) } else { None }
         };
         match self.tk(f) {
             BVAR => {
-                let j = self.tp(f) as usize;
+                let j = self.ta(f) as usize;
                 if j >= ctx.len() {
                     return false;
                 }
