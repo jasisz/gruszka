@@ -140,6 +140,16 @@ mod vm {
             madvise(_p, _bytes, MADV_HUGEPAGE);
         }
     }
+    /// Linux: [p, p + bytes) keeps 4 KiB pages even when the system gives
+    /// huge pages without being asked (THP `always`). Elsewhere: no-op.
+    #[inline]
+    pub fn small(_p: *mut u8, _bytes: usize) {
+        #[cfg(target_os = "linux")]
+        unsafe {
+            const MADV_NOHUGEPAGE: i32 = 15;
+            madvise(_p, _bytes, MADV_NOHUGEPAGE);
+        }
+    }
     /// Gives the pages of [p, p + bytes) back (fresh zero pages on next use).
     pub fn release(p: *mut u8, bytes: usize) {
         if bytes == 0 {
@@ -159,6 +169,13 @@ pub fn region() -> &'static Region {
         let nodes = vm::reserve(ID_SPACE * 16) as *mut Node;
         let used = vm::reserve(ID_SPACE * 8) as *mut u64;
         let hi = vm::reserve(ID_SPACE * 8) as *mut u64;
+        // the high mask words are written only for terms of range past 63,
+        // a few scattered ids: with huge pages each one written made 2 MiB
+        // resident (Mathlib w4, Linux x86: peak RSS 2431 -> 2170 MiB, the
+        // column 251 -> 8 MiB); their reads are rare, so no TLB cost
+        if !hi.is_null() {
+            vm::small(hi as *mut u8, ID_SPACE * 8);
+        }
         assert!(!nodes.is_null() && !used.is_null() && !hi.is_null(), "cannot reserve the term address range");
         Region { nodes, used, hi, first: 0.into(), slab: 0.into(), next: 0.into(), big: std::sync::Mutex::new(None) }
     })
