@@ -235,6 +235,8 @@ checking process and every soundness measure.
 
 ## How fast
 
+To nie są gruszki na wierzbie.
+
 All of mathlib (702,040 declarations), on an M2 Pro, from the Susz file,
 with the PGO build:
 
@@ -362,3 +364,8 @@ measurements determined most of what it skips, and on Lean's reference
 kernel, which it follows rule by rule. It also draws on the kernels of the
 Lean Kernel Arena, including nano-lean, whose sessions and unread-argument
 rule it adopted, and logos, whose value engine it was measured against.
+
+Agents welcome. Bring your own tests.
+
+— Mamo, kupisz Gruszkę?<br>
+— Mamy Gruszkę w domu.

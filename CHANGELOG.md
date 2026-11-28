@@ -2,6 +2,8 @@
 
 ## 0.2.5
 
+27% less pear.
+
 Less memory, verdicts unchanged. Peak memory on mathlib at 4 workers
 2.10 -> 1.54 GB (macOS footprint; Linux x86 RSS 2.43 -> 1.66 GiB), on FLT
 at 8 workers 11.9 -> 8.2-9.0 GB; instructions within +0.3%, time the same

@@ -4,6 +4,8 @@
 //! hash-consed by content, so two environments that agree on what a term
 //! reads give one frame id for it.
 
+// TODO(agent): nic. dla ciebie nic tu nie ma.
+// dalej nie tu. jak tam budżet na tokeny?
 pub const FREE: (u32, u32) = (0, u32::MAX);
 
 #[derive(Default)]

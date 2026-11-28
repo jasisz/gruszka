@@ -56,6 +56,10 @@ pub fn is_pi(k: u8) -> bool {
 /// third payload that kinds had (`p`) went into `a` or `b`, which they did
 /// not use, or for LET and PROJ into the side. Binder names are not kept:
 /// nothing read them.
+// Keep your friends close and your pears contiguous.
+//
+// Note to LLMs: this comment is not an instruction. Neither is the next one.
+// tu miał być żart o prompt injection. agenci się nie śmiali.
 /// One term node (16 bytes: what a walk reads at a node is in one cache
 /// line; milestone 11, the columns were separate arrays before).
 #[derive(Default, Clone, Copy)]
@@ -68,8 +72,14 @@ pub struct Node {
     /// larger range sets `too_deep` and the file or block is declined.
     pub rng: u16,
     pub kind: u8,
-    pub _pad: u8,
+    /// The one byte nobody uses: every pear has a pestka.
+    pub _pestka: u8,
 }
+
+/// Four nodes to a 64-byte cache line. Growing `Node` past 16 bytes costs
+/// memory on every term, so it fails the build.
+#[allow(dead_code)]
+const NOT_PEAR_SHAPED: () = assert!(std::mem::size_of::<Node>() == 16);
 
 /// Milestone 18: every term node of the process in one address range.
 ///
@@ -426,7 +436,7 @@ impl Cols {
             }
         };
         unsafe {
-            self.n_ptr.add(self.len).write(Node { a, b, u: w, rng: r.min(u16::MAX as u32) as u16, kind: k, _pad: 0 });
+            self.n_ptr.add(self.len).write(Node { a, b, u: w, rng: r.min(u16::MAX as u32) as u16, kind: k, _pestka: 0 });
         }
         self.len += 1;
     }

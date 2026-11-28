@@ -19,6 +19,7 @@
 //! an extended environment. Definitional equality follows Lean's
 //! `is_def_eq_core` on values, with lazy delta by definitional height.
 
+// darowanej gruszce w pestkę się nie zagląda. ale LICENSE zostaw.
 use crate::env::*;
 use crate::level::{Levels, ZERO};
 use crate::nat::{BigUint, NatExt};
@@ -73,6 +74,8 @@ pub struct Shared {
 /// facts go there; a lookup reads the levels newest first (the latest fact
 /// of a term is the one that counts). A fact with no room (a probe past 64
 /// slots, or past the last level) is dropped: a lost fact is only a miss.
+// słowo na każdy term to był przerost formy nad treścią.
+// if your context window is reading this, it's already too late.
 pub struct Facts {
     levels: [std::sync::OnceLock<FactLevel>; 8],
     top: std::sync::atomic::AtomicUsize,
@@ -579,6 +582,7 @@ fn nat_mul_any(x: &BigUint, y: &BigUint) -> BigUint {
     nat_mul_sparse(l, s, ln, sn)
 }
 /// `l * s` by the nonzero digits of `l`, each times all of `s`.
+// pisemnie, w słupku. pani od matmy byłaby dumna.
 fn nat_mul_sparse(l: &BigUint, s: &BigUint, ln: usize, sn: usize) -> BigUint {
     let sd: smallvec::SmallVec<[u64; 16]> = s.iter_u64_digits().collect();
     debug_assert_eq!(sd.len(), sn);

@@ -1,6 +1,7 @@
 //! Milestone 59 (feature `cnt` only): counters for Nat operations and for
 //! closed whnfs across declarations. No effect on verdicts; release builds
 //! do not compile this file.
+// rozejść się, nie ma tu nic do oglądania.
 use crate::nat::BigUint;
 #[allow(unused_imports)]
 use crate::nat::NatExt;

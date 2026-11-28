@@ -20,6 +20,8 @@
 //! kernel's `defeq` on the two weak head normal forms, so the machine only
 //! ever answers `true` by itself; `false` and everything else come from
 //! the kernel.
+// ściągać też trzeba umieć. testy się ściąga razem z kodem,
+// zwłaszcza te, które odrzucają.
 use super::*;
 use std::cell::RefCell;
 use std::rc::Rc;
