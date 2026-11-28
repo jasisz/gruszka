@@ -372,6 +372,10 @@ pub struct Cols {
     /// the used masks of APP, LAM and PI nodes with bits past 30 (the
     /// node's `u` is `U_SIDE` and the index here)
     pub wide: Vec<Used>,
+    /// a direct-mapped memo of `wide`'s masks (slot by the mask's hash, then
+    /// index + 1): equal masks of nearby nodes share an entry (FLT: 67.8 M
+    /// wide masks, 5.9 M distinct); a miss only adds an entry
+    wide_dm: Vec<u32>,
     len: usize,
     cap: usize,
     /// largest length since pages were last given back
@@ -386,14 +390,14 @@ unsafe impl Sync for Cols {}
 impl Default for Cols {
     fn default() -> Cols {
         let n_ptr = std::ptr::NonNull::dangling().as_ptr();
-        Cols { base: 0, n_ptr, wide: Vec::new(), len: 0, cap: 0, hw: 0, too_deep: false, full: false }
+        Cols { base: 0, n_ptr, wide: Vec::new(), wide_dm: Vec::new(), len: 0, cap: 0, hw: 0, too_deep: false, full: false }
     }
 }
 
 impl Cols {
     fn at(r: &Region, base: u32, cap: usize) -> Cols {
         let n_ptr = unsafe { r.nodes.add(base as usize) };
-        Cols { base, n_ptr, wide: Vec::new(), len: 0, cap, hw: 0, too_deep: false, full: false }
+        Cols { base, n_ptr, wide: Vec::new(), wide_dm: Vec::new(), len: 0, cap, hw: 0, too_deep: false, full: false }
     }
     #[inline(always)]
     pub fn push(&mut self, k: u8, a: u32, b: u32, p: u32, r: u32, u: u64) {
@@ -418,8 +422,7 @@ impl Cols {
             _ if narrow => u as u32,
             BVAR => U_SIDE,
             _ => {
-                self.wide.push((u, h));
-                U_SIDE | (self.wide.len() as u32 - 1)
+                U_SIDE | self.wide_index((u, h))
             }
         };
         unsafe {
@@ -431,6 +434,24 @@ impl Cols {
     pub fn len(&self) -> usize {
         self.len
     }
+    /// The index of mask `m` in `wide`: an equal one the memo still holds,
+    /// else a new entry.
+    #[inline(never)]
+    fn wide_index(&mut self, m: Used) -> u32 {
+        if self.wide_dm.is_empty() {
+            self.wide_dm = vec![0; WIDE_DM];
+        }
+        let h = (m.0 ^ m.1.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let s = (h >> 48) as usize & (WIDE_DM - 1);
+        let e = self.wide_dm[s];
+        if e != 0 && (e as usize) <= self.wide.len() && self.wide[e as usize - 1] == m {
+            return e - 1;
+        }
+        self.wide.push(m);
+        let i = self.wide.len() as u32 - 1;
+        self.wide_dm[s] = i + 1;
+        i
+    }
     /// The nodes (index = id - base).
     #[inline(always)]
     pub fn n(&self) -> &[Node] {
@@ -440,6 +461,7 @@ impl Cols {
         unsafe { std::slice::from_raw_parts_mut(self.n_ptr, self.len) }
     }
     pub fn clear(&mut self) {
+        // (`wide_dm` keeps its slots: an index past `wide` is a miss)
         self.wide.clear();
         self.hw = self.hw.max(self.len);
         self.len = 0;
@@ -459,6 +481,7 @@ impl Cols {
                 }
                 self.hw = keep;
                 self.wide = Vec::new();
+                self.wide_dm = Vec::new();
             }
         }
     }
@@ -528,6 +551,8 @@ fn used_or(a: Used, b: Used) -> Used {
 /// Bit 31 of a node's `u`: the mask (or a LET's, PROJ's payload) is not
 /// in the node (see `Node`).
 pub const U_SIDE: u32 = 1 << 31;
+/// Slots of `Cols::wide_dm`.
+const WIDE_DM: usize = 1 << 16;
 /// The used mask of term `id`: in `cols` (ids from `cols.base`, with
 /// `side`), below that in `main` (MAIN's columns and side, or `cols` itself
 /// when it is MAIN).
