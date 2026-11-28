@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.5
+
+Less memory, verdicts unchanged. Peak memory on mathlib at 4 workers
+2.10 -> 1.54 GB (macOS footprint; Linux x86 RSS 2.43 -> 1.66 GiB), on FLT
+at 8 workers 11.9 -> 8.2-9.0 GB; instructions within +0.3%, time the same
+or lower. Nat-heavy CFSG certificates check 2.5x faster.
+
+- The used mask of a term (the loose variables it reads) lives in its
+  node. It had a column of its own, 8 bytes per term besides the 16-byte
+  node (mathlib's environment: 289 MiB). A mask with no bit past 30 is the
+  node's third word, for every kind, so reading it is still one load; a
+  wider one is kept aside, and equal wide masks of nearby terms share one
+  entry (FLT: 67.8 M wide masks, 5.9 M distinct). The payloads that word
+  held went into fields their kinds did not use. Mathlib -13%, FLT -10%.
+- The facts "this closed term was checked in an earlier declaration" are
+  kept in a table of the facts written, not in a word per environment
+  term: mathlib wrote 2.2 M of 37.9 M words but touched 99.5% of the pages
+  (303 MiB). The table is shared by the workers without locks, a slot's
+  key is claimed once and its fact is one word, so no worker can read
+  another term's fact; a fact with no room is a miss, as before.
+  Mathlib -13%, FLT -7%.
+- A long Nat with few nonzero digits is multiplied by those digits. The
+  library's long multiplication goes over every digit of the long factor
+  once per digit of the short one, zeros included; CFSG's bit-sliced
+  tables multiply 609 kbit numbers with ~200 nonzero digits by 16-digit
+  ones (LyOm 348 -> 142 G instructions, Fi24P7 206 -> 82 G).
+- Projections of one structure share one eliminator however many records
+  its name has in the export. Two records of `PProd` made `b.1` through
+  one and `b.1` through the other different, and a valid export was
+  rejected (official accepts it).
+- The unread `all` lists of definitions, theorems and opaques are not
+  kept, and the reader's second copy of the proof block list is freed.
+
 ## 0.2.4
 
 Soundness fixes, found by an audit of the premises of every shortcut
