@@ -693,9 +693,11 @@ pub enum ThmVal {
 pub enum CKind {
     Axiom { unsafe_: bool },
     /// safety: 0 safe, 1 unsafe, 2 partial
-    Defn { value: u32, hint: Hint, safety: u8, all: Box<[u32]> },
-    Thm { value: ThmVal, all: Box<[u32]> },
-    Opaque { value: u32, unsafe_: bool, all: Box<[u32]> },
+    // (the `all` lists of definitions, theorems and opaques are not kept:
+    // nothing read them, and every theorem allocated one)
+    Defn { value: u32, hint: Hint, safety: u8 },
+    Thm { value: ThmVal },
+    Opaque { value: u32, unsafe_: bool },
     Quot { kind: u8 },
     Induct {
         nparams: u32,
@@ -908,27 +910,27 @@ impl<'a> Visit<'a> for Loader {
             Decl::Axiom { head, is_unsafe } => {
                 push(head.name, params(head), head.ty, 3, CKind::Axiom { unsafe_: *is_unsafe })
             }
-            Decl::Defn { head, value, hints, safety, all: a } => {
+            Decl::Defn { head, value, hints, safety, .. } => {
                 let hint = match hints {
                     Hints::Opaque => Hint::Opaque,
                     Hints::Abbrev => Hint::Abbrev,
                     Hints::Regular(n) => Hint::Regular(u(*n)),
                 };
-                push(head.name, params(head), head.ty, 3, CKind::Defn { value: *value, hint, safety: *safety, all: all(a) })
+                push(head.name, params(head), head.ty, 3, CKind::Defn { value: *value, hint, safety: *safety })
             }
-            Decl::Thm { head, value, all: a } => {
-                push(head.name, params(head), head.ty, 3, CKind::Thm { value: ThmVal::Main(*value), all: all(a) })
+            Decl::Thm { head, value, .. } => {
+                push(head.name, params(head), head.ty, 3, CKind::Thm { value: ThmVal::Main(*value) })
             }
-            Decl::Opaque { head, value, is_unsafe, all: a } => {
-                push(head.name, params(head), head.ty, 3, CKind::Opaque { value: *value, unsafe_: *is_unsafe, all: all(a) })
+            Decl::Opaque { head, value, is_unsafe, .. } => {
+                push(head.name, params(head), head.ty, 3, CKind::Opaque { value: *value, unsafe_: *is_unsafe })
             }
             Decl::Quot { head, kind } => {
                 push(head.name, params(head), head.ty, 3, CKind::Quot { kind: *kind })
             }
-            Decl::ThmBlock { head, block, all: a } => {
+            Decl::ThmBlock { head, block, .. } => {
                 let i = self.blocks.len() as u32 - 1;
                 debug_assert_eq!(self.blocks[i as usize], *block);
-                push(head.name, params(head), head.ty, 3, CKind::Thm { value: ThmVal::Block(i), all: all(a) })
+                push(head.name, params(head), head.ty, 3, CKind::Thm { value: ThmVal::Block(i) })
             }
             Decl::Inductive(ind) => {
                 for t in &ind.types {
