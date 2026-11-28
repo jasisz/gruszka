@@ -242,23 +242,25 @@ with the PGO build:
 
 | Workers | Time | Peak memory | Instructions |
 | ---: | ---: | ---: | ---: |
-| 1 | 44 s | 2.0 GB | 369 G |
-| 4 | 13.6 s | 2.4 GB | 372 G |
-| 8 | 8.4 s | 2.8 GB | 375 G |
+| 1 | 45 s | 1.4 GB | 381 G |
+| 4 | 15 s | 1.6 GB | 385 G |
+| 8 | 9.4 s | 1.9 GB | 388 G |
 
-The full Fermat's Last Theorem environment (1.71 M declarations), four
-workers: 3 min 55 s (229 and 240 s in two runs), 11 to 12 GB, 6600 G
-instructions. This is the whole FLT project with its dependencies, every
+The full Fermat's Last Theorem environment (1.71 M declarations): four
+workers 4 min (239 s), 7.8 GB, 6910 G instructions; eight workers 2 min 12 s,
+9.5 GB, 6970 G. This is the whole FLT project with its dependencies, every
 declaration in the build, not just the cone of the two final theorems.
 
-<!-- milestone 32, PGO build (scripts/build-pgo.sh, Init at 1 worker), M2 Pro. -->
+<!-- 0.2.5, 2026-11-28, PGO build (scripts/build-pgo.sh, Init at 1 worker), M2 Pro;
+     peak memory = macOS peak footprint; mathlib two runs per row
+     (w1 43.7-46.6 s, w4 14.6-15.5 s, w8 9.3-9.5 s). -->
 
 Converting the ndjson export to Susz with `susz pack` adds 1.9 s and 35 G
 instructions on all twelve cores for mathlib, and 37 s for the FLT export.
 
 On the [Lean Kernel Arena](https://arena.lean-lang.org)'s x86 runner, with
-the conversion included and four workers, mathlib takes 25.7 s, 2.47 GB
-and 445 G instructions.
+the conversion included and four workers, mathlib takes 22.9 s, 2.07 GB
+and 464 G instructions (0.2.5, 2026-11-28).
 
 ## Large developments
 
