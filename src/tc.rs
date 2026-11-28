@@ -45,7 +45,7 @@ pub struct Shared {
     /// the term is the body of safe definition `row`'s value under its
     /// lambdas, or its type's codomain under as many Pis, and that
     /// definition was checked (`open_fact`).
-    checked: Vec<AtomicU64>,
+    checked: Facts,
     /// level parameter lists (sorted canonical names), interned
     lps: Mutex<(Vec<Box<[u32]>>, FxHashMap<Box<[u32]>, u32>)>,
     /// Milestone 37: properties of the file per constant row, found by
@@ -63,6 +63,130 @@ pub struct Shared {
     shape: Vec<std::sync::atomic::AtomicU8>,
 }
 
+/// Night 11-27: `Shared::checked` by term id, a table that holds only the
+/// facts written. It was a word per MAIN term, and the facts land all over
+/// it: Mathlib wrote 2.2 M of 37.9 M words and touched 99.5% of the pages
+/// (303 MiB resident). Open addressing on the id, shared without locks:
+/// a slot's key is claimed once by a compare-exchange and never changes,
+/// its fact is one word, so a reader never sees another term's fact. When
+/// the newest level is 70% full a level four times larger is added, and
+/// facts go there; a lookup reads the levels newest first (the latest fact
+/// of a term is the one that counts). A fact with no room (a probe past 64
+/// slots, or past the last level) is dropped: a lost fact is only a miss.
+pub struct Facts {
+    levels: [std::sync::OnceLock<FactLevel>; 8],
+    top: std::sync::atomic::AtomicUsize,
+    grow: Mutex<()>,
+}
+struct FactLevel {
+    /// term id + 1; 0 empty
+    keys: Box<[AtomicU32]>,
+    vals: Box<[AtomicU64]>,
+    mask: usize,
+    used: std::sync::atomic::AtomicUsize,
+}
+const FACT_PROBE: usize = 64;
+impl FactLevel {
+    fn new(n: usize) -> FactLevel {
+        FactLevel { keys: zeroed::<AtomicU32, u32>(n).into_boxed_slice(), vals: zeroed::<AtomicU64, u64>(n).into_boxed_slice(), mask: n - 1, used: 0.into() }
+    }
+    #[inline(always)]
+    fn home(&self, t: u32) -> usize {
+        (t as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize >> 7 & self.mask
+    }
+    /// Some(fact) when `t` has a slot here (0: claimed, not yet written).
+    #[inline(always)]
+    fn get(&self, t: u32) -> Option<u64> {
+        debug_assert!(t != u32::MAX, "a fact key past the term ids");
+        let mut i = self.home(t);
+        for _ in 0..FACT_PROBE {
+            let k = self.keys[i].load(Ordering::Acquire);
+            if k == t + 1 {
+                return Some(self.vals[i].load(Ordering::Acquire));
+            }
+            if k == 0 {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+        None
+    }
+    /// false: no room within the probe
+    fn put(&self, t: u32, x: u64) -> bool {
+        // keys are t + 1: callers pass MAIN ids (t < mlen <= u32::MAX)
+        debug_assert!(t != u32::MAX, "a fact key past the term ids");
+        let mut i = self.home(t);
+        for _ in 0..FACT_PROBE {
+            let k = self.keys[i].load(Ordering::Acquire);
+            if k == 0 {
+                match self.keys[i].compare_exchange(0, t + 1, Ordering::AcqRel, Ordering::Acquire) {
+                    Ok(_) => {
+                        self.vals[i].store(x, Ordering::Release);
+                        self.used.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
+                    Err(k2) if k2 == t + 1 => {
+                        self.vals[i].store(x, Ordering::Release);
+                        return true;
+                    }
+                    Err(_) => {}
+                }
+            } else if k == t + 1 {
+                self.vals[i].store(x, Ordering::Release);
+                return true;
+            }
+            i = (i + 1) & self.mask;
+        }
+        false
+    }
+}
+impl Facts {
+    fn new(main_len: usize) -> Facts {
+        let f = Facts { levels: Default::default(), top: 0.into(), grow: Mutex::new(()) };
+        let _ = f.levels[0].set(FactLevel::new((main_len / 16).max(4096).next_power_of_two()));
+        f
+    }
+    /// The latest fact of term `t`, 0 when none.
+    #[inline(always)]
+    pub fn get(&self, t: u32) -> u64 {
+        let top = self.top.load(Ordering::Acquire);
+        for l in (0..=top).rev() {
+            if let Some(x) = self.levels[l].get().and_then(|lv| lv.get(t)) {
+                if x != 0 {
+                    return x;
+                }
+            }
+        }
+        0
+    }
+    pub fn put(&self, t: u32, x: u64) {
+        let top = self.top.load(Ordering::Acquire);
+        let Some(lv) = self.levels[top].get() else { return };
+        let ok = lv.put(t, x);
+        if (!ok || lv.used.load(Ordering::Relaxed) * 10 > lv.mask * 7) && top + 1 < self.levels.len() {
+            self.add_level(top);
+            if !ok {
+                let top2 = self.top.load(Ordering::Acquire);
+                if top2 != top {
+                    if let Some(l2) = self.levels[top2].get() {
+                        l2.put(t, x);
+                    }
+                }
+            }
+        }
+    }
+    #[cold]
+    fn add_level(&self, top: usize) {
+        let _g = self.grow.lock().unwrap_or_else(|e| e.into_inner());
+        if self.top.load(Ordering::Acquire) != top || top + 1 >= self.levels.len() {
+            return;
+        }
+        let n = (self.levels[top].get().map_or(4096, |l| l.mask + 1)) * 4;
+        let _ = self.levels[top + 1].set(FactLevel::new(n));
+        self.top.store(top + 1, Ordering::Release);
+    }
+}
+
 /// A vector of zeroed atomics from zeroed memory (pages mapped when first
 /// written).
 fn zeroed<A, T: Copy + Default>(n: usize) -> Vec<A> {
@@ -74,7 +198,7 @@ fn zeroed<A, T: Copy + Default>(n: usize) -> Vec<A> {
 impl Shared {
     pub fn new(main_len: usize, consts: usize) -> Shared {
         Shared {
-            checked: zeroed::<AtomicU64, u64>(main_len),
+            checked: Facts::new(main_len),
             lps: Mutex::new((Vec::new(), FxHashMap::default())),
             unused_l: zeroed::<std::sync::atomic::AtomicU8, u8>(consts),
             unused_m: zeroed::<AtomicU64, u64>(consts),
@@ -2187,7 +2311,7 @@ impl Worker {
     /// declaration whose level parameters the current one has too? Typing
     /// is preserved when the environment grows, so the check is not redone.
     fn checked_before(&mut self, t: u32) -> bool {
-        let x = self.shared.checked[t as usize].load(Ordering::Relaxed);
+        let x = self.shared.checked.get(t);
         if x == 0 {
             return false;
         }
@@ -6173,7 +6297,7 @@ impl Worker {
             let x = ((u32::MAX - self.cur_decl) as u64) << 32 | l as u64;
             // the latest fact replaces the stored one (as with one worker):
             // any stored pair is a true fact, a lost one is only a miss
-            self.shared.checked[t as usize].store(x, Ordering::Relaxed);
+            self.shared.checked.put(t, x);
         }
         icache_put(&mut self.infer_cache, ikey2(t, env, ls), r, check, self.cur_lp);
             self.ulog(Undo::Infer(ikey2(t, env, ls)));
@@ -9725,7 +9849,7 @@ impl Worker {
     #[inline(never)]
     fn infer_known(&mut self, t: u32, env: u32) -> R<V> {
         if t < self.mlen && self.trng(t) != 0 {
-            let x = self.shared.checked[t as usize].load(Ordering::Relaxed);
+            let x = self.shared.checked.get(t);
             if x != 0 && x >> 32 == 0 {
                 if let Some(v) = self.open_fact(t, x as u32 - 1, env)? {
                     if STATS { self.stats.open_hits += 1; }
@@ -9798,7 +9922,7 @@ impl Worker {
         }
         for t in [a, p] {
             if t != NONE && t < self.mlen && self.trng(t) != 0 {
-                self.shared.checked[t as usize].store(row as u64 + 1, Ordering::Relaxed);
+                self.shared.checked.put(t, row as u64 + 1);
             }
         }
     }

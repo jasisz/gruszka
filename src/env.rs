@@ -1110,7 +1110,7 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
     let failed = |f: susz::read::Failure| {
         if f.class.declines() { LoadError::Decline(f.to_string()) } else { LoadError::Reject(f.to_string()) }
     };
-    let st = match part {
+    let mut st = match part {
         None => match susz::read::decode(&file, &mut ld) {
             Ok(d) => d.state,
             Err(susz::read::Stop::File(f)) => return Err(failed(f)),
@@ -1409,6 +1409,9 @@ pub fn load_part<'f>(bytes: &'f [u8], part: Option<&Part>) -> Result<Env<'f>, Lo
             }
         }
     }
+    // the reader's list of proof blocks is `ld.blocks` again (decode_block
+    // takes the block it decodes): one copy kept (Mathlib 24 MiB)
+    st.blocks = Vec::new();
     Ok(Env {
         nat_op,
         bytes,
